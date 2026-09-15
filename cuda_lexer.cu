@@ -903,6 +903,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
       volatile I* new_size,
       volatile bool* is_valid,
       state_t identity) {
+    static_assert(ITEMS_PER_THREAD <= 128, "ITEMS_PER_THREAD exceeds 128-bit is_produce_state capacity");
     using BlockScanState = cub::BlockScan<state_t, BLOCK_SIZE>;
     using BlockScanI     = cub::BlockScan<I, BLOCK_SIZE>;
     __shared__ union {
