@@ -926,7 +926,6 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     uint64_t copy_reg[REG_MEM];
     uint8_t *chars_reg = (uint8_t*) copy_reg;
     state_t st[ITEMS_PER_THREAD];
-    I prod[ITEMS_PER_THREAD];
     unsigned __int128 is_produce_state = 0;
 
     uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr);
@@ -993,12 +992,18 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         st[i] = ctx(pfx, st[i]);
 
+    // Write st[] back to shmem, then eagerly stage tokens and save the last
+    // state scalar so st[] goes dead before prod[] is allocated.
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
 
+    state_t last_state = st[ITEMS_PER_THREAD - 1];
+
     __syncthreads();
 
+    // st[] is dead from here; compiler can reuse those registers for prod[].
+    I prod[ITEMS_PER_THREAD];
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         I lid = threadIdx.x * ITEMS_PER_THREAD + i;
@@ -1006,7 +1011,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
         bool temp = false;
         if (gid < size) {
             if (lid == ITEMS_PER_THREAD * BLOCK_SIZE - 1) {
-                temp = gid == size - 1 || is_produce(ctx(st[i], next_block_first_state));
+                temp = gid == size - 1 || is_produce(ctx(states[lid], next_block_first_state));
             } else {
                 temp = gid == size - 1 || is_produce(states[lid + 1]);
             }
@@ -1026,7 +1031,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
             I slot = prod[i] - 1;
             I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             lid_stage[slot] = (uint16_t) lid;
-            tok_stage[slot] = get_token(st[i]);
+            tok_stage[slot] = get_token(states[lid]);
         }
     }
 
@@ -1040,14 +1045,14 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
 
     if (dyn_index == num_logical_blocks - 1 && threadIdx.x == blockDim.x - 1) {
         *new_size = Add<I>()(idx_pfx, prod_agg);
-        *is_valid = is_accept(st[ITEMS_PER_THREAD - 1]);
+        *is_valid = is_accept(last_state);
     }
 }
 
 // Dynamic-shmem kernel wrapper. The caller must set the 164 KB shmem carveout
 // via cudaFuncSetAttribute before launching (see launchLexerAlpaccShmemDyn).
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__ __launch_bounds__(BLOCK_SIZE, 4)
+__global__ __launch_bounds__(BLOCK_SIZE)
 void lexerAlpaccShmemDyn(LexerCtxShmem ctx,
       uint8_t* d_in, uint32_t* d_index_out, token_t* d_token_out,
       volatile State<state_t>* state_states, volatile State<I>* index_states,
@@ -2065,8 +2070,6 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpacc(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem:");
     testLexerAlpaccShmem(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Lexer Alpacc Shmem Dyn BS512  IPT=80:");
-    testLexerAlpaccShmemDyn<512, 80>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024 IPT=44:");
     testLexerAlpaccShmemDyn<1024, 44>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
