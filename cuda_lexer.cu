@@ -703,9 +703,10 @@ lexerAlpaccImpl(CTX ctx,
     const I REG_MEM = 1 + ITEMS_PER_THREAD / sizeof(uint64_t);
     uint64_t copy_reg[REG_MEM];
     uint8_t *chars_reg = (uint8_t*) copy_reg;
+    static_assert(ITEMS_PER_THREAD <= 64, "ITEMS_PER_THREAD exceeds 64-bit is_produce_state capacity");
     state_t st[ITEMS_PER_THREAD];   // blocked register tile for CUB scan
     I prod[ITEMS_PER_THREAD];       // produce flags, blocked layout
-    uint32_t is_produce_state = 0;
+    uint64_t is_produce_state = 0;
 
     uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr);
     I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD;
@@ -794,7 +795,7 @@ lexerAlpaccImpl(CTX ctx,
                 temp = gid == size - 1 || is_produce(states[lid + 1]);
             }
         }
-        is_produce_state |= (uint32_t)temp << i;
+        is_produce_state |= (unsigned __int128)temp << i;
         prod[i] = (I)temp;
     }
 
@@ -1020,7 +1021,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
                 temp = gid == size - 1 || is_produce(states[lid + 1]);
             }
         }
-        is_produce_state |= (unsigned __int128)temp << i;
+        is_produce_state |= (uint64_t)temp << i;
         prod[i] = (I)temp;
     }
 
