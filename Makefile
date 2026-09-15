@@ -10,7 +10,7 @@ DEFAULT=\033[39m
 
 default: bench
 
-.PHONY: clean bench test
+.PHONY: clean bench test devinfo
 
 $(DATA_PATH)/tokens_dense_500MiB.in:
 	(cd $(DATA_PATH) && make)
@@ -72,6 +72,11 @@ test: $(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)=== CUDA LEXER DEBUG TESTS ===$(DEFAULT)"
 	@./$(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)==============================$(DEFAULT)"
+
+devinfo:
+	$(COMPILER) $(FLAGS) -o devinfo devinfo.cu
+	./devinfo
+	rm -f devinfo
 
 clean:
 	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM) $(FUTHARK_PROGRAM) *.out
