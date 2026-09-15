@@ -854,8 +854,8 @@ lexerAlpaccImpl(CTX ctx,
 }
 
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__ void
-lexerAlpacc(LexerCtxLdg ctx,
+__global__ __launch_bounds__(BLOCK_SIZE, 4)
+void lexerAlpacc(LexerCtxLdg ctx,
       uint8_t* d_in, uint32_t* d_index_out, token_t* d_token_out,
       volatile State<state_t>* state_states, volatile State<I>* index_states,
       I size, I num_logical_blocks, volatile uint32_t* dyn_index_ptr,
@@ -868,8 +868,8 @@ lexerAlpacc(LexerCtxLdg ctx,
 // Like lexerAlpacc but loads the compose table into shmem once per block.
 // ITEMS_PER_THREAD is 1 less to fit the 288-byte table within 48KB shmem.
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__ void
-lexerAlpaccShmem(LexerCtxShmem ctx,
+__global__ __launch_bounds__(BLOCK_SIZE, 4)
+void lexerAlpaccShmem(LexerCtxShmem ctx,
       uint8_t* d_in, uint32_t* d_index_out, token_t* d_token_out,
       volatile State<state_t>* state_states, volatile State<I>* index_states,
       I size, I num_logical_blocks, volatile uint32_t* dyn_index_ptr,
