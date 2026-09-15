@@ -1071,7 +1071,7 @@ static inline size_t dynShmemBytes() {
     return compose + states + tok;
 }
 
-// Host helper: set the 164 KB shmem carveout and launch lexerAlpaccShmemDyn.
+// Host helper: set the shmem carveout and launch lexerAlpaccShmemDyn.
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 static void launchLexerAlpaccShmemDyn(
       LexerCtxShmem ctx,
@@ -1080,8 +1080,9 @@ static void launchLexerAlpaccShmemDyn(
       I size, I num_logical_blocks, volatile uint32_t* dyn_index_ptr,
       volatile I* new_size, volatile bool* is_valid) {
     auto kernel = lexerAlpaccShmemDyn<I, BLOCK_SIZE, ITEMS_PER_THREAD>;
+    size_t shmem_bytes = dynShmemBytes<I, BLOCK_SIZE, ITEMS_PER_THREAD>();
     gpuAssert(cudaFuncSetAttribute(kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, 164 * 1024));
+        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
     kernel<<<num_logical_blocks, BLOCK_SIZE, shmem_bytes>>>(
         ctx, d_in, d_index_out, d_token_out, state_states, index_states,
         size, num_logical_blocks, dyn_index_ptr, new_size, is_valid);
