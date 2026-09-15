@@ -1025,13 +1025,25 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
 
     I idx_pfx = decoupledLookbackPrefix<I, I, Add<I>>(index_states, Add<I>(), I(), dyn_index, prod_agg);
 
+    // tok_stage first: lid_stage aliases states[], so writing lid_stage would
+    // corrupt states[] reads for get_token if done in the same pass.
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+        if ((is_produce_state >> i) & 1) {
+            I slot = prod[i] - 1;
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
+            tok_stage[slot] = get_token(states[lid]);
+        }
+    }
+
+    __syncthreads();
+
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
             I slot = prod[i] - 1;
             I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             lid_stage[slot] = (uint16_t) lid;
-            tok_stage[slot] = get_token(states[lid]);
         }
     }
 
