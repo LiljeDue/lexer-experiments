@@ -78,16 +78,17 @@ test: $(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)==============================$(DEFAULT)"
 
 profile: $(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
-	ncu --set full \
-	    --kernel-name-base function \
-	    --kernel-name regex:lexerAlpacc \
-	    --target-processes all \
-	    ./$(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
-	ncu --set full \
-	    --kernel-name-base function \
-	    --kernel-name regex:lexerAlpaccShmemDyn \
-	    --target-processes all \
-	    ./$(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
+	{ ncu --set full \
+	      --kernel-name-base function \
+	      --kernel-name regex:lexerAlpacc \
+	      --target-processes all \
+	      ./$(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out; \
+	  ncu --set full \
+	      --kernel-name-base function \
+	      --kernel-name regex:lexerAlpaccShmemDyn \
+	      --target-processes all \
+	      ./$(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out; \
+	} > profile.txt 2>&1
 
 devinfo:
 	$(COMPILER) $(FLAGS) -o devinfo devinfo.cu
