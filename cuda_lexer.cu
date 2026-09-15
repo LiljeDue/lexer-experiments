@@ -935,9 +935,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     copyFromGlbToShr<state_t, I, 1>(0, NUM_STATES * NUM_STATES, NUM_STATES * NUM_STATES,
                                      ctx.d_compose_glb, shmem_compose);
     ctx.d_compose = (state_t*) shmem_compose;
-    if (threadIdx.x < 256) {
-        to_state_shr[threadIdx.x] = ctx.to_state(threadIdx.x);
-    }
+    copyFromGlbToShr<state_t, I, 1>(0, 256, 256, ctx.d_to_state, to_state_shr);
 
     if (threadIdx.x == I()) {
         next_block_first_state = identity;
