@@ -1064,7 +1064,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
 // Dynamic-shmem kernel wrapper. The caller must set the 164 KB shmem carveout
 // via cudaFuncSetAttribute before launching (see launchLexerAlpaccShmemDyn).
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__ __launch_bounds__(BLOCK_SIZE)
+__global__ __maxnreg__(64)
 void lexerAlpaccShmemDyn(LexerCtxShmem ctx,
       uint8_t* d_in, uint32_t* d_index_out, token_t* d_token_out,
       volatile State<state_t>* state_states, volatile State<I>* index_states,
