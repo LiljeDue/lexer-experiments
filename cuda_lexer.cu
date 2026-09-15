@@ -1214,8 +1214,6 @@ void testLexer(uint8_t* input,
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
     const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
     const I IN_READ = IN_ARRAY_BYTES;
-    const I IN_STATE_MAP = sizeof(state_t) * size;
-    const I SCAN_READ = sizeof(state_t) * (size + size / 2);
     lexer<I, BLOCK_SIZE, ITEMS_PER_THREAD><<<NUM_LOGICAL_BLOCKS, BLOCK_SIZE>>>(
         ctx,
         d_in,
@@ -1264,7 +1262,7 @@ void testLexer(uint8_t* input,
     }
 
     if (test_passes) {
-        compute_descriptors(temp, RUNS, IN_READ + IN_STATE_MAP + SCAN_READ + OUT_WRITE);
+        compute_descriptors(temp, RUNS, IN_READ + OUT_WRITE);
     }
 
     free(temp);
@@ -1384,8 +1382,6 @@ void testLexerShmemCompose(uint8_t* input,
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
     const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
     const I IN_READ = IN_ARRAY_BYTES;
-    const I IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
-    const I COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
 
     lexerShmemCompose<I, BLOCK_SIZE, ITEMS_PER_THREAD><<<NUM_LOGICAL_BLOCKS, BLOCK_SIZE>>>(
         ctx,
@@ -1435,7 +1431,7 @@ void testLexerShmemCompose(uint8_t* input,
     }
 
     if (test_passes) {
-        compute_descriptors(temp, RUNS, IN_READ + IN_STATE_MAP + COMPOSE_READ + OUT_WRITE);
+        compute_descriptors(temp, RUNS, IN_READ + OUT_WRITE);
     }
 
     free(temp);
@@ -1534,8 +1530,6 @@ void testLexerAlpacc(uint8_t* input,
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
     const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
     const I IN_READ = IN_ARRAY_BYTES;
-    const I IN_STATE_MAP = sizeof(state_t) * size;
-    const I SCAN_READ = sizeof(state_t) * (size + size / 2);
 
     lexerAlpacc<I, BLOCK_SIZE, ITEMS_PER_THREAD><<<NUM_LOGICAL_BLOCKS, BLOCK_SIZE>>>(
         ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
@@ -1573,7 +1567,7 @@ void testLexerAlpacc(uint8_t* input,
     }
 
     if (test_passes) {
-        compute_descriptors(temp, RUNS, IN_READ + IN_STATE_MAP + SCAN_READ + OUT_WRITE);
+        compute_descriptors(temp, RUNS, IN_READ + OUT_WRITE);
     }
 
     free(temp);
@@ -1672,8 +1666,6 @@ void testLexerAlpaccShmem(uint8_t* input,
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
     const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
     const I IN_READ = IN_ARRAY_BYTES;
-    const I IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
-    const I COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
 
     lexerAlpaccShmem<I, BLOCK_SIZE, ITEMS_PER_THREAD><<<NUM_LOGICAL_BLOCKS, BLOCK_SIZE>>>(
         ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
@@ -1711,7 +1703,7 @@ void testLexerAlpaccShmem(uint8_t* input,
     }
 
     if (test_passes) {
-        compute_descriptors(temp, RUNS, IN_READ + IN_STATE_MAP + COMPOSE_READ + OUT_WRITE);
+        compute_descriptors(temp, RUNS, IN_READ + OUT_WRITE);
     }
 
     free(temp);
@@ -1809,8 +1801,6 @@ void testLexerAlpaccShmemDyn(uint8_t* input,
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
     const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
     const I IN_READ = IN_ARRAY_BYTES;
-    const I IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
-    const I COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
 
     launchLexerAlpaccShmemDyn<I, BLOCK_SIZE, ITEMS_PER_THREAD>(
         ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
@@ -1848,7 +1838,7 @@ void testLexerAlpaccShmemDyn(uint8_t* input,
     }
 
     if (test_passes) {
-        compute_descriptors(temp, RUNS, IN_READ + IN_STATE_MAP + COMPOSE_READ + OUT_WRITE);
+        compute_descriptors(temp, RUNS, IN_READ + OUT_WRITE);
     }
 
     free(temp);
