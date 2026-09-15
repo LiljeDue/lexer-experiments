@@ -1080,9 +1080,13 @@ static void launchLexerAlpaccShmemDyn(
       I size, I num_logical_blocks, volatile uint32_t* dyn_index_ptr,
       volatile I* new_size, volatile bool* is_valid) {
     auto kernel = lexerAlpaccShmemDyn<I, BLOCK_SIZE, ITEMS_PER_THREAD>;
+    int max_shmem_optin = 0;
+    cudaDeviceGetAttribute(&max_shmem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+    size_t shmem_bytes = dynShmemBytes<I, BLOCK_SIZE, ITEMS_PER_THREAD>();
+    printf("  shmem needed: %zu bytes, device optin max: %d bytes\n", shmem_bytes, max_shmem_optin);
+    fflush(stdout);
     gpuAssert(cudaFuncSetAttribute(kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, 164 * 1024));
-    size_t shmem_bytes = dynShmemBytes<I, BLOCK_SIZE, ITEMS_PER_THREAD>();
     kernel<<<num_logical_blocks, BLOCK_SIZE, shmem_bytes>>>(
         ctx, d_in, d_index_out, d_token_out, state_states, index_states,
         size, num_logical_blocks, dyn_index_ptr, new_size, is_valid);
