@@ -1152,6 +1152,8 @@ void testLexer(uint8_t* input,
         );
         cudaDeviceSynchronize();
         cudaMemset(d_dyn_index_ptr, 0, sizeof(uint32_t));
+        cudaMemset(d_state_states, 0, STATE_STATES_BYTES);
+        cudaMemset(d_index_states, 0, INDEX_STATES_BYTES);
         gpuAssert(cudaPeekAtLastError());
     }
 
@@ -1175,6 +1177,8 @@ void testLexer(uint8_t* input,
         cudaEventSynchronize(stop);
         cudaEventElapsedTime(temp + i, start, stop);
         cudaMemset(d_dyn_index_ptr, 0, sizeof(uint32_t));
+        cudaMemset(d_state_states, 0, STATE_STATES_BYTES);
+        cudaMemset(d_index_states, 0, INDEX_STATES_BYTES);
         gpuAssert(cudaPeekAtLastError());
     }
 
@@ -1308,6 +1312,8 @@ void testLexerShmemCompose(uint8_t* input,
         );
         cudaDeviceSynchronize();
         cudaMemset(d_dyn_index_ptr, 0, sizeof(uint32_t));
+        cudaMemset(d_state_states, 0, STATE_STATES_BYTES);
+        cudaMemset(d_index_states, 0, INDEX_STATES_BYTES);
         gpuAssert(cudaPeekAtLastError());
     }
 
@@ -1331,6 +1337,8 @@ void testLexerShmemCompose(uint8_t* input,
         cudaEventSynchronize(stop);
         cudaEventElapsedTime(temp + i, start, stop);
         cudaMemset(d_dyn_index_ptr, 0, sizeof(uint32_t));
+        cudaMemset(d_state_states, 0, STATE_STATES_BYTES);
+        cudaMemset(d_index_states, 0, INDEX_STATES_BYTES);
         gpuAssert(cudaPeekAtLastError());
     }
 
@@ -1454,6 +1462,8 @@ void testLexerAlpacc(uint8_t* input,
             size, NUM_LOGICAL_BLOCKS, d_dyn_index_ptr, d_new_size, d_is_valid);
         cudaDeviceSynchronize();
         cudaMemset(d_dyn_index_ptr, 0, sizeof(uint32_t));
+        cudaMemset(d_state_states, 0, STATE_STATES_BYTES);
+        cudaMemset(d_index_states, 0, INDEX_STATES_BYTES);
         gpuAssert(cudaPeekAtLastError());
     }
 
@@ -1467,6 +1477,8 @@ void testLexerAlpacc(uint8_t* input,
         cudaEventSynchronize(stop);
         cudaEventElapsedTime(temp + i, start, stop);
         cudaMemset(d_dyn_index_ptr, 0, sizeof(uint32_t));
+        cudaMemset(d_state_states, 0, STATE_STATES_BYTES);
+        cudaMemset(d_index_states, 0, INDEX_STATES_BYTES);
         gpuAssert(cudaPeekAtLastError());
     }
 
@@ -1577,6 +1589,8 @@ void testLexerAlpaccShmem(uint8_t* input,
             size, NUM_LOGICAL_BLOCKS, d_dyn_index_ptr, d_new_size, d_is_valid);
         cudaDeviceSynchronize();
         cudaMemset(d_dyn_index_ptr, 0, sizeof(uint32_t));
+        cudaMemset(d_state_states, 0, STATE_STATES_BYTES);
+        cudaMemset(d_index_states, 0, INDEX_STATES_BYTES);
         gpuAssert(cudaPeekAtLastError());
     }
 
@@ -1590,6 +1604,8 @@ void testLexerAlpaccShmem(uint8_t* input,
         cudaEventSynchronize(stop);
         cudaEventElapsedTime(temp + i, start, stop);
         cudaMemset(d_dyn_index_ptr, 0, sizeof(uint32_t));
+        cudaMemset(d_state_states, 0, STATE_STATES_BYTES);
+        cudaMemset(d_index_states, 0, INDEX_STATES_BYTES);
         gpuAssert(cudaPeekAtLastError());
     }
 
@@ -1711,6 +1727,8 @@ void testLexerAlpaccShmemDyn(uint8_t* input,
             size, NUM_LOGICAL_BLOCKS, d_dyn_index_ptr, d_new_size, d_is_valid);
         cudaDeviceSynchronize();
         cudaMemset(d_dyn_index_ptr, 0, sizeof(uint32_t));
+        cudaMemset(d_state_states, 0, STATE_STATES_BYTES);
+        cudaMemset(d_index_states, 0, INDEX_STATES_BYTES);
         gpuAssert(cudaPeekAtLastError());
     }
 
@@ -1724,6 +1742,8 @@ void testLexerAlpaccShmemDyn(uint8_t* input,
         cudaEventSynchronize(stop);
         cudaEventElapsedTime(temp + i, start, stop);
         cudaMemset(d_dyn_index_ptr, 0, sizeof(uint32_t));
+        cudaMemset(d_state_states, 0, STATE_STATES_BYTES);
+        cudaMemset(d_index_states, 0, INDEX_STATES_BYTES);
         gpuAssert(cudaPeekAtLastError());
     }
 
@@ -2006,7 +2026,7 @@ int main(int32_t argc, char *argv[]) {
     printf(PAD, "Lexer Alpacc Shmem Dyn BS512:");
     testLexerAlpaccShmemDyn<512, 106>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024:");
-    testLexerAlpaccShmemDyn<1024, 53>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    testLexerAlpaccShmemDyn<1024, 52>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
