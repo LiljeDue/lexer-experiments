@@ -1,11 +1,12 @@
 DATA_PATH=./data
 COMMON_PATH=./common
+FUTHARK_PROGRAM=futhark_lexer
 CUDA_PROGRAM=cuda_lexer
 CUDA_DEBUG_PROGRAM=cuda_lexer_debug
 COMPILER?=nvcc
 FLAGS?=-O3 --std=c++14 -diag-suppress 550 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80
-RED=[31m
-GREEN=[32m
+RED=[31m
+GREEN=[32m
 DEFAULT=\033[39m
 
 default: bench
@@ -21,23 +22,27 @@ $(DATA_PATH)/tokens_moderate_500MiB.in:
 $(DATA_PATH)/tokens_sparse_500MiB.in:
 	(cd $(DATA_PATH) && make)
 
-tokens_indices_dense_500MiB.out: $(DATA_PATH)/tokens_dense_500MiB.in
-	futhark script ./futhark_lexer 'indices ($$loaddata "$<")' -b >$@
+tokens_indices_dense_500MiB.out: $(DATA_PATH)/tokens_dense_500MiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'indices ($$loaddata "$<")' -b >$@
 
-tokens_indices_moderate_500MiB.out: $(DATA_PATH)/tokens_moderate_500MiB.in
-	futhark script ./futhark_lexer 'indices ($$loaddata "$<")' -b >$@
+tokens_indices_moderate_500MiB.out: $(DATA_PATH)/tokens_moderate_500MiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'indices ($$loaddata "$<")' -b >$@
 
-tokens_indices_sparse_500MiB.out: $(DATA_PATH)/tokens_sparse_500MiB.in
-	futhark script ./futhark_lexer 'indices ($$loaddata "$<")' -b >$@
+tokens_indices_sparse_500MiB.out: $(DATA_PATH)/tokens_sparse_500MiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'indices ($$loaddata "$<")' -b >$@
 
-tokens_tokens_dense_500MiB.out: $(DATA_PATH)/tokens_dense_500MiB.in
-	futhark script ./futhark_lexer 'tokens ($$loaddata "$<")' -b >$@
+tokens_tokens_dense_500MiB.out: $(DATA_PATH)/tokens_dense_500MiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'tokens ($$loaddata "$<")' -b >$@
 
-tokens_tokens_moderate_500MiB.out: $(DATA_PATH)/tokens_moderate_500MiB.in
-	futhark script ./futhark_lexer 'tokens ($$loaddata "$<")' -b >$@
+tokens_tokens_moderate_500MiB.out: $(DATA_PATH)/tokens_moderate_500MiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'tokens ($$loaddata "$<")' -b >$@
 
-tokens_tokens_sparse_500MiB.out: $(DATA_PATH)/tokens_sparse_500MiB.in
-	futhark script ./futhark_lexer 'tokens ($$loaddata "$<")' -b >$@
+tokens_tokens_sparse_500MiB.out: $(DATA_PATH)/tokens_sparse_500MiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'tokens ($$loaddata "$<")' -b >$@
+
+$(FUTHARK_PROGRAM): $(FUTHARK_PROGRAM).fut
+	futhark pkg sync
+	futhark cuda $< -o $@ --server
 
 $(CUDA_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h
 	$(COMPILER) $(FLAGS) -o $@ $<
@@ -45,7 +50,8 @@ $(CUDA_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h 
 $(CUDA_DEBUG_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h
 	$(COMPILER) $(FLAGS) -DDEBUG -o $@ $<
 
-bench: $(DATA_PATH)/tokens_dense_500MiB.in \
+bench: $(FUTHARK_PROGRAM) \
+       $(DATA_PATH)/tokens_dense_500MiB.in \
        $(DATA_PATH)/tokens_moderate_500MiB.in \
        $(DATA_PATH)/tokens_sparse_500MiB.in \
        tokens_indices_dense_500MiB.out \
@@ -55,6 +61,9 @@ bench: $(DATA_PATH)/tokens_dense_500MiB.in \
        tokens_tokens_moderate_500MiB.out \
        tokens_tokens_sparse_500MiB.out \
        $(CUDA_PROGRAM)
+	@echo -e "$(RED)=== FUTHARK LEXER ===$(DEFAULT)"
+	@futhark bench $(FUTHARK_PROGRAM).fut --backend=cuda --skip-compilation
+	@echo -e "$(RED)===============$(DEFAULT)"
 	@echo -e "$(GREEN)=== CUDA LEXER ===$(DEFAULT)"
 	@./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
 	@echo ""
@@ -69,4 +78,4 @@ test: $(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)==============================$(DEFAULT)"
 
 clean:
-	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM)
+	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM) $(FUTHARK_PROGRAM) *.out
