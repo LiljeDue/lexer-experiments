@@ -78,13 +78,11 @@ profile: $(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dens
 	    --kernel-name-base function \
 	    --kernel-name regex:lexerAlpacc \
 	    --target-processes all \
-	    -o profile_lexerAlpacc \
 	    ./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
 	ncu --set full \
 	    --kernel-name-base function \
 	    --kernel-name regex:lexerAlpaccShmemDyn \
 	    --target-processes all \
-	    -o profile_lexerAlpaccShmemDyn \
 	    ./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
 
 devinfo:
