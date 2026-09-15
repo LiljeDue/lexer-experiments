@@ -23,13 +23,12 @@ void compute_descriptors(float* measurements, size_t size, size_t bytes) {
     printf("%.0lfGB/s\n", sample_gbps);
 }
 
-int _gpuAssert(cudaError_t code, const char *fname, int lineno) {
+void _gpuAssert(cudaError_t code, const char *fname, int lineno) {
     if(code != cudaSuccess) {
         printf("GPU Error: %s, File: %s, Line: %i\n", cudaGetErrorString(code), fname, lineno);
         fflush(stdout);
-        return -1;
+        exit(1);
     }
-    return 0;
 }
 
 void info() {
