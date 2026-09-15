@@ -2052,7 +2052,7 @@ int main(int32_t argc, char *argv[]) {
     printf(PAD, "Lexer Alpacc Shmem:");
     testLexerAlpaccShmem(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS512:");
-    testLexerAlpaccShmemDyn<512, 8>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    testLexerAlpaccShmemDyn<512, 16>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024:");
     testLexerAlpaccShmemDyn<1024, 32>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
