@@ -926,7 +926,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     uint8_t *chars_reg = (uint8_t*) copy_reg;
     state_t st[ITEMS_PER_THREAD];
     I prod[ITEMS_PER_THREAD];
-    uint32_t is_produce_state = 0;
+    unsigned __int128 is_produce_state = 0;
 
     uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr);
     I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD;
@@ -1010,7 +1010,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
                 temp = gid == size - 1 || is_produce(states[lid + 1]);
             }
         }
-        is_produce_state |= (uint32_t)temp << i;
+        is_produce_state |= (unsigned __int128)temp << i;
         prod[i] = (I)temp;
     }
 
@@ -2052,9 +2052,9 @@ int main(int32_t argc, char *argv[]) {
     printf(PAD, "Lexer Alpacc Shmem:");
     testLexerAlpaccShmem(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS512:");
-    testLexerAlpaccShmemDyn<512, 32>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    testLexerAlpaccShmemDyn<512, 64>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024:");
-    testLexerAlpaccShmemDyn<1024, 32>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    testLexerAlpaccShmemDyn<1024, 64>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
