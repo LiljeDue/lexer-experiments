@@ -854,7 +854,7 @@ lexerAlpaccImpl(CTX ctx,
 }
 
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__ __launch_bounds__(BLOCK_SIZE, 4)
+__global__ __maxnreg__(64)
 void lexerAlpacc(LexerCtxLdg ctx,
       uint8_t* d_in, uint32_t* d_index_out, token_t* d_token_out,
       volatile State<state_t>* state_states, volatile State<I>* index_states,
@@ -868,12 +868,16 @@ void lexerAlpacc(LexerCtxLdg ctx,
 // Like lexerAlpacc but loads the compose table into shmem once per block.
 // ITEMS_PER_THREAD is 1 less to fit the 288-byte table within 48KB shmem.
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__ __launch_bounds__(BLOCK_SIZE, 4)
+__global__ __maxnreg__(64)
 void lexerAlpaccShmem(LexerCtxShmem ctx,
       uint8_t* d_in, uint32_t* d_index_out, token_t* d_token_out,
       volatile State<state_t>* state_states, volatile State<I>* index_states,
       I size, I num_logical_blocks, volatile uint32_t* dyn_index_ptr,
       volatile I* new_size, volatile bool* is_valid) {
+    // compose(288) + states(IPT*BS*2) + tok_stage(IPT*BS) + to_state(512) + sentinel(2)
+    // must fit in 48KB static shmem (CUB temp_storage adds ~2KB on top).
+    static_assert(288 + ITEMS_PER_THREAD * BLOCK_SIZE * 3 + 514 <= 48 * 1024 - 2048,
+                  "Static shmem exceeds 48KB limit for this BLOCK_SIZE/ITEMS_PER_THREAD");
     __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
     copyFromGlbToShr<state_t, I, 1>(0, NUM_STATES * NUM_STATES, NUM_STATES * NUM_STATES, ctx.d_compose_glb, shmem_compose);
     ctx.d_compose = shmem_compose;
@@ -1584,6 +1588,7 @@ void testLexerAlpacc(uint8_t* input,
     ctx.Cleanup();
 }
 
+template<uint32_t ITEMS_PER_THREAD = 30>
 void testLexerAlpaccShmem(uint8_t* input,
                size_t input_size,
                uint32_t* expected_indices,
@@ -1592,7 +1597,6 @@ void testLexerAlpaccShmem(uint8_t* input,
     using I = uint32_t;
     const I size = input_size;
     const I BLOCK_SIZE = 256;
-    const I ITEMS_PER_THREAD = 30;
     const I NUM_LOGICAL_BLOCKS = (size + BLOCK_SIZE * ITEMS_PER_THREAD - 1) / (BLOCK_SIZE * ITEMS_PER_THREAD);
     const I IN_ARRAY_BYTES = size * sizeof(uint8_t);
     const I INDEX_OUT_ARRAY_BYTES = size * sizeof(I);
@@ -2080,8 +2084,14 @@ int main(int32_t argc, char *argv[]) {
     testLexerShmemCompose(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc:");
     testLexerAlpacc(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Lexer Alpacc Shmem:");
-    testLexerAlpaccShmem(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Lexer Alpacc Shmem IPT=30:");
+    testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Lexer Alpacc Shmem IPT=40:");
+    testLexerAlpaccShmem<40>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Lexer Alpacc Shmem IPT=50:");
+    testLexerAlpaccShmem<50>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Lexer Alpacc Shmem IPT=58:");
+    testLexerAlpaccShmem<58>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024 IPT=44:");
     testLexerAlpaccShmemDyn<1024, 44>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
