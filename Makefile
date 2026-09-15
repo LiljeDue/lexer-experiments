@@ -74,18 +74,17 @@ test: $(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)==============================$(DEFAULT)"
 
 profile: $(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
-	mkdir -p .claude-artifacts
 	ncu --set full \
 	    --kernel-name-base function \
 	    --kernel-name regex:lexerAlpacc \
 	    --target-processes all \
-	    -o .claude-artifacts/profile_lexerAlpacc \
+	    -o profile_lexerAlpacc \
 	    ./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
 	ncu --set full \
 	    --kernel-name-base function \
 	    --kernel-name regex:lexerAlpaccShmemDyn \
 	    --target-processes all \
-	    -o .claude-artifacts/profile_lexerAlpaccShmemDyn \
+	    -o profile_lexerAlpaccShmemDyn \
 	    ./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
 
 devinfo:
