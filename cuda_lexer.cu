@@ -1104,8 +1104,13 @@ void testLexer(uint8_t* input,
     const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
     const I STATE_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<state_t>);
     const I INDEX_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<I>);
+#ifdef PROFILE
+    const I WARMUP_RUNS = 1;
+    const I RUNS = 1;
+#else
     const I WARMUP_RUNS = 500;
     const I RUNS = 100;
+#endif
 
     std::vector<token_t> h_token_out(size, 0);
     std::vector<I> h_index_out(size, 0);
@@ -1269,8 +1274,13 @@ void testLexerShmemCompose(uint8_t* input,
     const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
     const I STATE_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<state_t>);
     const I INDEX_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<I>);
+#ifdef PROFILE
+    const I WARMUP_RUNS = 1;
+    const I RUNS = 1;
+#else
     const I WARMUP_RUNS = 500;
     const I RUNS = 100;
+#endif
 
     std::vector<token_t> h_token_out(size, 0);
     std::vector<I> h_index_out(size, 0);
@@ -1434,8 +1444,13 @@ void testLexerAlpacc(uint8_t* input,
     const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
     const I STATE_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<state_t>);
     const I INDEX_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<I>);
+#ifdef PROFILE
+    const I WARMUP_RUNS = 1;
+    const I RUNS = 1;
+#else
     const I WARMUP_RUNS = 500;
     const I RUNS = 100;
+#endif
 
     std::vector<token_t> h_token_out(size, 0);
     std::vector<I> h_index_out(size, 0);
@@ -1567,8 +1582,13 @@ void testLexerAlpaccShmem(uint8_t* input,
     const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
     const I STATE_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<state_t>);
     const I INDEX_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<I>);
+#ifdef PROFILE
+    const I WARMUP_RUNS = 1;
+    const I RUNS = 1;
+#else
     const I WARMUP_RUNS = 500;
     const I RUNS = 100;
+#endif
 
     std::vector<token_t> h_token_out(size, 0);
     std::vector<I> h_index_out(size, 0);
@@ -1699,8 +1719,13 @@ void testLexerAlpaccShmemDyn(uint8_t* input,
     const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
     const I STATE_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<state_t>);
     const I INDEX_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<I>);
+#ifdef PROFILE
+    const I WARMUP_RUNS = 1;
+    const I RUNS = 1;
+#else
     const I WARMUP_RUNS = 500;
     const I RUNS = 100;
+#endif
 
     std::vector<token_t> h_token_out(size, 0);
     std::vector<I> h_index_out(size, 0);
