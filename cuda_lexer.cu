@@ -935,7 +935,9 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     copyFromGlbToShr<state_t, I, 1>(0, NUM_STATES * NUM_STATES, NUM_STATES * NUM_STATES,
                                      ctx.d_compose_glb, shmem_compose);
     ctx.d_compose = (state_t*) shmem_compose;
-    to_state_shr[threadIdx.x] = ctx.to_state(threadIdx.x);
+    if (threadIdx.x < 256) {
+        to_state_shr[threadIdx.x] = ctx.to_state(threadIdx.x);
+    }
 
     if (threadIdx.x == I()) {
         next_block_first_state = identity;
@@ -2026,7 +2028,7 @@ int main(int32_t argc, char *argv[]) {
     printf(PAD, "Lexer Alpacc Shmem Dyn BS512:");
     testLexerAlpaccShmemDyn<512, 64>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024:");
-    testLexerAlpaccShmemDyn<1024, 64>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    testLexerAlpaccShmemDyn<1024, 32>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
