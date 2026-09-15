@@ -1220,14 +1220,19 @@ void testLexer(uint8_t* input,
         std::cout << "Lexer Test Failed: Expected size=" << expected_size << " but got size=" << temp_size << std::endl;
     } else {
         for (I i = 0; i < expected_size; ++i) {
-            test_passes &= h_index_out[i] == expected_indices[i];
-            test_passes &= h_token_out[i] == expected_tokens[i];
-
-            if (!test_passes) {
-                std::cout << "Lexer Test Failed: Due to elements mismatch at index=" << i << std::endl;
+            if (h_index_out[i] != expected_indices[i]) {
+                printf("Lexer Test Failed: index mismatch at i=%u: expected=%u got=%u\n",
+                       i, expected_indices[i], h_index_out[i]);
+                test_passes = false;
                 break;
             }
-        } 
+            if (h_token_out[i] != expected_tokens[i]) {
+                printf("Lexer Test Failed: token mismatch at i=%u: expected=%u got=%u\n",
+                       i, (unsigned)expected_tokens[i], (unsigned)h_token_out[i]);
+                test_passes = false;
+                break;
+            }
+        }
     }
 
     if (test_passes) {
