@@ -10,7 +10,7 @@ DEFAULT=\033[39m
 
 default: bench
 
-.PHONY: clean bench test devinfo
+.PHONY: clean bench test devinfo profile
 
 $(DATA_PATH)/tokens_dense_500MiB.in:
 	(cd $(DATA_PATH) && make)
@@ -72,6 +72,20 @@ test: $(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)=== CUDA LEXER DEBUG TESTS ===$(DEFAULT)"
 	@./$(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)==============================$(DEFAULT)"
+
+profile: $(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
+	ncu --set full \
+	    --kernel-name-base function \
+	    --kernel-name regex:lexerAlpacc \
+	    --target-processes all \
+	    -o .claude-artifacts/profile_lexerAlpacc \
+	    ./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
+	ncu --set full \
+	    --kernel-name-base function \
+	    --kernel-name regex:lexerAlpaccShmemDyn \
+	    --target-processes all \
+	    -o .claude-artifacts/profile_lexerAlpaccShmemDyn \
+	    ./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
 
 devinfo:
 	$(COMPILER) $(FLAGS) -o devinfo devinfo.cu
