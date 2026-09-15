@@ -710,7 +710,7 @@ lexerAlpaccImpl(CTX ctx,
     uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr);
     I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD;
 
-    to_state_shr[threadIdx.x] = ctx.to_state(threadIdx.x);
+    copyFromGlbToShr<state_t, I, 1>(0, 256, 256, ctx.d_to_state, to_state_shr);
 
     if (threadIdx.x == I()) {
         next_block_first_state = identity;
