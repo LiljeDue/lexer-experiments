@@ -1688,6 +1688,18 @@ void testLexerAlpaccShmemDyn(uint8_t* input,
 
     LexerCtxShmem ctx = LexerCtxShmem();
 
+    {
+        cudaFuncAttributes attrs;
+        cudaFuncGetAttributes(&attrs, lexerAlpaccShmemDyn<I, BLOCK_SIZE, ITEMS_PER_THREAD>);
+        int optin = 0;
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+        size_t dyn = dynShmemBytes<I, BLOCK_SIZE, ITEMS_PER_THREAD>();
+        printf("  BS=%u IPT=%u: static_shmem=%zu dyn_shmem=%zu total=%zu optin_max=%d\n",
+               (unsigned)BLOCK_SIZE, (unsigned)ITEMS_PER_THREAD,
+               attrs.sharedSizeBytes, dyn, attrs.sharedSizeBytes + dyn, optin);
+        fflush(stdout);
+    }
+
     float * temp = (float *) malloc(sizeof(float) * RUNS);
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
