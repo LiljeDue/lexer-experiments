@@ -528,20 +528,11 @@ module lexer = mk_lexer {
     :> [endomorphism_size * endomorphism_size]endomorphism
 }
 
--- ==
--- input @ ../data/tokens_dense_500MiB.in
--- input @ ../data/tokens_moderate_500MiB.in
--- input @ ../data/tokens_sparse_500MiB.in
 entry main (s: []u8) : ?[k].([k]u32, [k]u8) =
   match lexer.lex s
   case #some r -> unzip r
   case #none -> ([], [])
 
--- ==
--- entry: expected
--- input @ ../data/tokens_dense_500MiB.in
--- input @ ../data/tokens_moderate_500MiB.in
--- input @ ../data/tokens_sparse_500MiB.in
 entry expected (s: []u8) : ?[k].([k]u32, [k]u8) =
   match lexer.lex_old s
   case #some r -> unzip r

@@ -5,7 +5,6 @@ CUDA_PROGRAM=cuda_lexer
 CUDA_DEBUG_PROGRAM=cuda_lexer_debug
 COMPILER?=nvcc
 FLAGS?=-O3 --std=c++14 -diag-suppress 550 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80
-RED=[31m
 GREEN=[32m
 DEFAULT=\033[39m
 
@@ -61,9 +60,6 @@ bench: $(FUTHARK_PROGRAM) \
        tokens_tokens_moderate_500MiB.out \
        tokens_tokens_sparse_500MiB.out \
        $(CUDA_PROGRAM)
-	@echo -e "$(RED)=== FUTHARK LEXER ===$(DEFAULT)"
-	@futhark bench $(FUTHARK_PROGRAM).fut --backend=cuda --skip-compilation
-	@echo -e "$(RED)===============$(DEFAULT)"
 	@echo -e "$(GREEN)=== CUDA LEXER ===$(DEFAULT)"
 	@./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
 	@echo ""
