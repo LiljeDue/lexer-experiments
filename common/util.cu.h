@@ -30,23 +30,3 @@ void _gpuAssert(cudaError_t code, const char *fname, int lineno) {
         exit(1);
     }
 }
-
-void info() {
-    cudaDeviceProp prop;
-    int nDevices;
-    cudaGetDeviceCount(&nDevices);
-    assert(nDevices != 0);
-    cudaGetDeviceProperties(&prop, 0);
-    uint32_t max_hwdth = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount;
-    uint32_t max_block = prop.maxThreadsPerBlock;
-    uint32_t max_shmen = prop.sharedMemPerBlock;
-    int max_shmen_optin = 0;
-    cudaDeviceGetAttribute(&max_shmen_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
-
-    printf("Number of devices: %i\n", nDevices);
-    printf("Device name: %s\n", prop.name);
-    printf("Number of hardware threads: %d\n", max_hwdth);
-    printf("Max block size: %d\n", max_block);
-    printf("Shared memory size: %d\n", max_shmen);
-    printf("Shared memory size (optin): %d\n\n", max_shmen_optin);
-}
