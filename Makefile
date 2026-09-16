@@ -92,7 +92,7 @@ profile: $(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indi
 
 
 profile_p1: $(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
-	ncu --set full \
+	-ncu --set full \
 	    --kernel-name-base function \
 	    --kernel-name regex:TwoPassV2P1 \
 	    --target-processes all \
