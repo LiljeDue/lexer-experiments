@@ -1070,199 +1070,177 @@ static void launchLexerAlpaccShmemDyn(
 //   OUT_WRITE         = num_tokens * (sizeof(I) + sizeof(token_t))
 //   SCAN_READ_INDEX   = size * sizeof(I)  (index decoupled lookback state traffic, approximated)
 
+#define LEXER_TWO_PASS_V2_P1_BODY \
+    using BlockScanState = cub::BlockScan<state_t, BLOCK_SIZE>; \
+    __shared__ typename BlockScanState::TempStorage temp_storage; \
+    __shared__ state_t to_state_shr[256]; \
+    extern __shared__ uint16_t dyn_shmem_p1[]; \
+    volatile state_t* shmem_compose = (volatile state_t*) dyn_shmem_p1; \
+    volatile state_t* states        = shmem_compose + NUM_STATES * NUM_STATES; \
+    const I REG_MEM = 1 + ITEMS_PER_THREAD / sizeof(uint64_t); \
+    uint64_t copy_reg[REG_MEM]; \
+    uint8_t *chars_reg = (uint8_t*) copy_reg; \
+    state_t st[ITEMS_PER_THREAD]; \
+    uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr); \
+    I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD; \
+    copyFromGlbToShr<state_t, I, 1>(0, NUM_STATES * NUM_STATES, NUM_STATES * NUM_STATES, \
+                                     ctx.d_compose_glb, shmem_compose); \
+    ctx.d_compose = (state_t*) shmem_compose; \
+    copyFromGlbToShr<state_t, I, 1>(0, 256, 256, ctx.d_to_state, to_state_shr); \
+    __syncthreads(); \
+    _Pragma("unroll") \
+    for (I i = 0; i < REG_MEM; i++) { \
+        I uint64_lid = i * blockDim.x + threadIdx.x; \
+        I lid = sizeof(uint64_t) * uint64_lid; \
+        I gid = glb_offs + lid; \
+        if (gid + sizeof(uint64_t) < size) { \
+            copy_reg[i] = *((uint64_t*) (gid + (uint8_t*) d_in)); \
+        } else { \
+            for (I j = 0; j < sizeof(uint64_t); j++) { \
+                I loc_gid = gid + j; \
+                if (loc_gid < size) \
+                    chars_reg[sizeof(uint64_t) * i + j] = d_in[loc_gid]; \
+            } \
+        } \
+    } \
+    _Pragma("unroll") \
+    for (I i = 0; i < REG_MEM; i++) { \
+        I lid = i * blockDim.x + threadIdx.x; \
+        I _gid = glb_offs + sizeof(uint64_t) * lid; \
+        for (I j = 0; j < sizeof(uint64_t); j++) { \
+            I gid = _gid + j; \
+            I lid_off = sizeof(uint64_t) * lid + j; \
+            I reg_off = sizeof(uint64_t) * i + j; \
+            bool is_in_block = lid_off < ITEMS_PER_THREAD * BLOCK_SIZE; \
+            if (gid < size && is_in_block) { \
+                states[lid_off] = to_state_shr[chars_reg[reg_off]]; \
+            } else if (is_in_block) { \
+                states[lid_off] = identity; \
+            } \
+        } \
+    } \
+    __syncthreads(); \
+    _Pragma("unroll") \
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) \
+        st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i]; \
+    state_t aggregate; \
+    BlockScanState(temp_storage).InclusiveScan(st, st, ctx, aggregate); \
+    state_t pfx = decoupledLookbackPrefix<state_t, I, LexerCtxShmem>( \
+        state_states, ctx, identity, dyn_index, aggregate); \
+    _Pragma("unroll") \
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) \
+        st[i] = ctx(pfx, st[i]); \
+    _Pragma("unroll") \
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) \
+        states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i]; \
+    __syncthreads(); \
+    copyFromShrToGlb<state_t, I, ITEMS_PER_THREAD>( \
+        glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE, size, states, d_states_out); \
+    if (dyn_index == num_logical_blocks - 1 && threadIdx.x == BLOCK_SIZE - 1) \
+        *is_valid = is_accept(st[ITEMS_PER_THREAD - 1]);
+
+#define LEXER_TWO_PASS_V2_P1_PARAMS \
+    LexerCtxShmem ctx, uint8_t* d_in, state_t* d_states_out, \
+    volatile State<state_t>* state_states, \
+    I size, I num_logical_blocks, volatile uint32_t* dyn_index_ptr, \
+    volatile bool* is_valid, state_t identity
+
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ __maxnreg__(64)
-void lexerAlpaccShmemTwoPassV2P1(LexerCtxShmem ctx,
-      uint8_t* d_in,
-      state_t* d_states_out,
-      volatile State<state_t>* state_states,
-      I size, I num_logical_blocks, volatile uint32_t* dyn_index_ptr,
-      volatile bool* is_valid,
-      state_t identity) {
-    using BlockScanState = cub::BlockScan<state_t, BLOCK_SIZE>;
-    __shared__ typename BlockScanState::TempStorage temp_storage;
-    __shared__ state_t to_state_shr[256];
-
-    extern __shared__ uint16_t dyn_shmem_p1[];
-    volatile state_t* shmem_compose = (volatile state_t*) dyn_shmem_p1;
-    volatile state_t* states        = shmem_compose + NUM_STATES * NUM_STATES;
-
-    const I REG_MEM = 1 + ITEMS_PER_THREAD / sizeof(uint64_t);
-    uint64_t copy_reg[REG_MEM];
-    uint8_t *chars_reg = (uint8_t*) copy_reg;
-    state_t st[ITEMS_PER_THREAD];
-
-    uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr);
-    I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD;
-
-    copyFromGlbToShr<state_t, I, 1>(0, NUM_STATES * NUM_STATES, NUM_STATES * NUM_STATES,
-                                     ctx.d_compose_glb, shmem_compose);
-    ctx.d_compose = (state_t*) shmem_compose;
-    copyFromGlbToShr<state_t, I, 1>(0, 256, 256, ctx.d_to_state, to_state_shr);
-
-    __syncthreads();
-
-    // Vectorized u64 load of input bytes into registers (striped).
-    #pragma unroll
-    for (I i = 0; i < REG_MEM; i++) {
-        I uint64_lid = i * blockDim.x + threadIdx.x;
-        I lid = sizeof(uint64_t) * uint64_lid;
-        I gid = glb_offs + lid;
-        if (gid + sizeof(uint64_t) < size) {
-            copy_reg[i] = *((uint64_t*) (gid + (uint8_t*) d_in));
-        } else {
-            for (I j = 0; j < sizeof(uint64_t); j++) {
-                I loc_gid = gid + j;
-                if (loc_gid < size)
-                    chars_reg[sizeof(uint64_t) * i + j] = d_in[loc_gid];
-            }
-        }
-    }
-
-    // Map bytes -> states into shmem (striped layout for coalesced access).
-    #pragma unroll
-    for (I i = 0; i < REG_MEM; i++) {
-        I lid = i * blockDim.x + threadIdx.x;
-        I _gid = glb_offs + sizeof(uint64_t) * lid;
-        for (I j = 0; j < sizeof(uint64_t); j++) {
-            I gid = _gid + j;
-            I lid_off = sizeof(uint64_t) * lid + j;
-            I reg_off = sizeof(uint64_t) * i + j;
-            bool is_in_block = lid_off < ITEMS_PER_THREAD * BLOCK_SIZE;
-            if (gid < size && is_in_block) {
-                states[lid_off] = to_state_shr[chars_reg[reg_off]];
-            } else if (is_in_block) {
-                states[lid_off] = identity;
-            }
-        }
-    }
-    __syncthreads();
-
-    // Load flat shmem into blocked register layout for CUB scan.
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
-
-    state_t aggregate;
-    BlockScanState(temp_storage).InclusiveScan(st, st, ctx, aggregate);
-
-    state_t pfx = decoupledLookbackPrefix<state_t, I, LexerCtxShmem>(
-        state_states, ctx, identity, dyn_index, aggregate);
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        st[i] = ctx(pfx, st[i]);
-
-    // Write scanned results back to flat shmem then flush to global.
-    // We write only `size` elements (not padded) so pass 2 can read `size+1`
-    // safely with the +1 landing on the last valid element at size-1.
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
-    __syncthreads();
-
-    copyFromShrToGlb<state_t, I, ITEMS_PER_THREAD>(
-        glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE, size, states, d_states_out);
-
-    if (dyn_index == num_logical_blocks - 1 && threadIdx.x == BLOCK_SIZE - 1)
-        *is_valid = is_accept(st[ITEMS_PER_THREAD - 1]);
+void lexerAlpaccShmemTwoPassV2P1(LEXER_TWO_PASS_V2_P1_PARAMS) {
+    LEXER_TWO_PASS_V2_P1_BODY
 }
+
+template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+__global__ __maxnreg__(48)
+void lexerAlpaccShmemTwoPassV2P1Nreg48(LEXER_TWO_PASS_V2_P1_PARAMS) {
+    LEXER_TWO_PASS_V2_P1_BODY
+}
+
+template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+__global__
+void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
+    LEXER_TWO_PASS_V2_P1_BODY
+}
+
+#define LEXER_TWO_PASS_V2_P2_BODY \
+    static_assert(ITEMS_PER_THREAD <= 64, "ITEMS_PER_THREAD exceeds 64-bit is_produce_state capacity"); \
+    using BlockScanI = cub::BlockScan<I, BLOCK_SIZE>; \
+    extern __shared__ uint8_t dyn_shmem_p2[]; \
+    __shared__ typename BlockScanI::TempStorage temp_storage; \
+    volatile uint8_t*  shmem_buf = dyn_shmem_p2; \
+    volatile state_t*  states    = (volatile state_t*)  shmem_buf; \
+    volatile uint16_t* lid_stage = (volatile uint16_t*) shmem_buf; \
+    volatile uint8_t*  tok_stage = shmem_buf + ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(uint16_t); \
+    token_t tokens[ITEMS_PER_THREAD]; \
+    I       prod[ITEMS_PER_THREAD]; \
+    uint64_t is_produce_state = 0; \
+    uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr); \
+    I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD; \
+    copyFromGlbToShr<state_t, I, ITEMS_PER_THREAD>( \
+        glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE + 1, size, d_states_in, states); \
+    _Pragma("unroll") \
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
+        I lid = threadIdx.x * ITEMS_PER_THREAD + i; \
+        I gid = glb_offs + lid; \
+        bool temp = false; \
+        if (gid < size) { \
+            tokens[i] = get_token(states[lid]); \
+            temp = gid == size - 1 || is_produce(states[lid + 1]); \
+        } \
+        is_produce_state |= (uint64_t)temp << i; \
+        prod[i] = (I)temp; \
+    } \
+    I prod_agg; \
+    BlockScanI(temp_storage).InclusiveScan(prod, prod, Add<I>(), prod_agg); \
+    I idx_pfx = decoupledLookbackPrefix<I, I, Add<I>>( \
+        index_states, Add<I>(), I(), dyn_index, prod_agg); \
+    _Pragma("unroll") \
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
+        if ((is_produce_state >> i) & 1) { \
+            I slot = prod[i] - 1; \
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i; \
+            tok_stage[slot] = tokens[i]; \
+        } \
+    } \
+    __syncthreads(); \
+    _Pragma("unroll") \
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
+        if ((is_produce_state >> i) & 1) { \
+            I slot = prod[i] - 1; \
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i; \
+            lid_stage[slot] = (uint16_t) lid; \
+        } \
+    } \
+    __syncthreads(); \
+    for (I slot = threadIdx.x; slot < prod_agg; slot += BLOCK_SIZE) { \
+        I out_idx = idx_pfx + slot; \
+        d_index_out[out_idx] = glb_offs + lid_stage[slot]; \
+        d_token_out[out_idx] = tok_stage[slot]; \
+    } \
+    if (dyn_index == num_logical_blocks - 1 && threadIdx.x == blockDim.x - 1) { \
+        *new_size = Add<I>()(idx_pfx, prod_agg); \
+    }
+
+#define LEXER_TWO_PASS_V2_P2_PARAMS \
+    state_t* d_states_in, uint32_t* d_index_out, token_t* d_token_out, \
+    volatile State<I>* index_states, \
+    I size, I num_logical_blocks, volatile uint32_t* dyn_index_ptr, \
+    volatile I* new_size
 
 // Pass 2: read IPT*BS+1 states coalesced into shmem, compute produce bits in
 // blocked layout (thread t owns positions [t*IPT, (t+1)*IPT)), CUB BlockScan,
 // decoupled lookback, stage (lid, token) for coalesced sequential output flush.
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ __maxnreg__(64)
-void lexerAlpaccShmemTwoPassV2P2(
-      state_t* d_states_in,
-      uint32_t* d_index_out, token_t* d_token_out,
-      volatile State<I>* index_states,
-      I size, I num_logical_blocks, volatile uint32_t* dyn_index_ptr,
-      volatile I* new_size) {
-    static_assert(ITEMS_PER_THREAD <= 64, "ITEMS_PER_THREAD exceeds 64-bit is_produce_state capacity");
-    using BlockScanI = cub::BlockScan<I, BLOCK_SIZE>;
+void lexerAlpaccShmemTwoPassV2P2(LEXER_TWO_PASS_V2_P2_PARAMS) {
+    LEXER_TWO_PASS_V2_P2_BODY
+}
 
-    // Dynamic shmem layout (phases share the same buffer):
-    //   Phase A: (IPT*BS+1) * sizeof(state_t) bytes — state read buffer
-    //   Phase C: IPT*BS * sizeof(uint16_t) + IPT*BS * sizeof(uint8_t) bytes
-    //          = IPT*BS * 3 bytes — lid_stage + tok_stage
-    // (IPT*BS+1)*2 vs IPT*BS*3: the latter is larger for IPT*BS >= 2.
-    extern __shared__ uint8_t dyn_shmem_p2[];
-    __shared__ typename BlockScanI::TempStorage temp_storage;
-    volatile uint8_t*  shmem_buf = dyn_shmem_p2;
-
-    volatile state_t*  states    = (volatile state_t*)  shmem_buf;
-    volatile uint16_t* lid_stage = (volatile uint16_t*) shmem_buf;
-    volatile uint8_t*  tok_stage = shmem_buf + ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(uint16_t);
-
-    token_t tokens[ITEMS_PER_THREAD];
-    I       prod[ITEMS_PER_THREAD];
-    uint64_t is_produce_state = 0;
-
-    uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr);
-    I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD;
-
-    // Coalesced load of IPT*BS+1 states.  copyFromGlbToShr fills shmem[k] with
-    // d_states_in[glb_offs + k], so states[k] = the k-th element of this tile.
-    // The +1 means states[IPT*BS] is the first element of the next tile, which
-    // lets states[lid+1] work for the last position without a separate buffer.
-    copyFromGlbToShr<state_t, I, ITEMS_PER_THREAD>(
-        glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE + 1, size, d_states_in, states);
-
-    // Blocked layout: thread t owns tile positions [t*IPT, (t+1)*IPT).
-    // lid = t*IPT + i, states[lid+1] gives the tile-sequential next element.
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-        I lid = threadIdx.x * ITEMS_PER_THREAD + i;
-        I gid = glb_offs + lid;
-        bool temp = false;
-        if (gid < size) {
-            tokens[i] = get_token(states[lid]);
-            temp = gid == size - 1 || is_produce(states[lid + 1]);
-        }
-        is_produce_state |= (uint64_t)temp << i;
-        prod[i] = (I)temp;
-    }
-
-    I prod_agg;
-    BlockScanI(temp_storage).InclusiveScan(prod, prod, Add<I>(), prod_agg);
-
-    I idx_pfx = decoupledLookbackPrefix<I, I, Add<I>>(
-        index_states, Add<I>(), I(), dyn_index, prod_agg);
-
-    // Stage tok_stage first (shmem reuse: states[] is dead, lid_stage aliases
-    // shmem_buf start — writing lid would corrupt tok_stage region otherwise).
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-        if ((is_produce_state >> i) & 1) {
-            I slot = prod[i] - 1;
-            I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
-            tok_stage[slot] = tokens[i];
-        }
-    }
-
-    __syncthreads();
-
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-        if ((is_produce_state >> i) & 1) {
-            I slot = prod[i] - 1;
-            I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
-            lid_stage[slot] = (uint16_t) lid;
-        }
-    }
-
-    __syncthreads();
-
-    // Coalesced sequential flush.
-    for (I slot = threadIdx.x; slot < prod_agg; slot += BLOCK_SIZE) {
-        I out_idx = idx_pfx + slot;
-        d_index_out[out_idx] = glb_offs + lid_stage[slot];
-        d_token_out[out_idx] = tok_stage[slot];
-    }
-
-    if (dyn_index == num_logical_blocks - 1 && threadIdx.x == blockDim.x - 1) {
-        *new_size = Add<I>()(idx_pfx, prod_agg);
-    }
+template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+__global__
+void lexerAlpaccShmemTwoPassV2P2NregNone(LEXER_TWO_PASS_V2_P2_PARAMS) {
+    LEXER_TWO_PASS_V2_P2_BODY
 }
 
 // Shmem bytes for pass 1 v2: compose table + states (IPT*BS entries).
@@ -1279,10 +1257,8 @@ static inline size_t dynShmemBytesP2V2() {
     return (size_t) ITEMS_PER_THREAD * BLOCK_SIZE * 3 + 2;
 }
 
-// Pass 1 and pass 2 have independent BS/IPT: they tile the same `size`-element
-// array independently, each with their own dynamic index counter and lookback
-// state array.
-template<typename I, I BS1, I IPT1, I BS2, I IPT2>
+// NREG1/NREG2: 64=maxnreg(64), 48=maxnreg(48), 0=no limit
+template<typename I, I BS1, I IPT1, I BS2, I IPT2, uint32_t NREG1=64, uint32_t NREG2=64>
 static void launchLexerAlpaccShmemTwoPassV2(
       LexerCtxShmem ctx,
       uint8_t* d_in, uint32_t* d_index_out, token_t* d_token_out,
@@ -1292,23 +1268,32 @@ static void launchLexerAlpaccShmemTwoPassV2(
       volatile I* new_size, volatile bool* is_valid,
       state_t* d_states_glb) {
     {
-        auto kernel = lexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1>;
+        void* kernel;
+        if      (NREG1 == 48) kernel = (void*) lexerAlpaccShmemTwoPassV2P1Nreg48<I, BS1, IPT1>;
+        else if (NREG1 == 0)  kernel = (void*) lexerAlpaccShmemTwoPassV2P1NregNone<I, BS1, IPT1>;
+        else                  kernel = (void*) lexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1>;
         size_t shmem_bytes = dynShmemBytesP1V2<I, BS1, IPT1>();
         gpuAssert(cudaFuncSetAttribute(kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
-        kernel<<<nlb1, BS1, shmem_bytes>>>(
-            ctx, d_in, d_states_glb, state_states,
-            size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
+        if      (NREG1 == 48) lexerAlpaccShmemTwoPassV2P1Nreg48<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
+            ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
+        else if (NREG1 == 0)  lexerAlpaccShmemTwoPassV2P1NregNone<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
+            ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
+        else                  lexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
+            ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
     }
     gpuAssert(cudaDeviceSynchronize());
     {
-        auto kernel = lexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2>;
+        void* kernel;
+        if (NREG2 == 0) kernel = (void*) lexerAlpaccShmemTwoPassV2P2NregNone<I, BS2, IPT2>;
+        else            kernel = (void*) lexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2>;
         size_t shmem_bytes = dynShmemBytesP2V2<I, BS2, IPT2>();
         gpuAssert(cudaFuncSetAttribute(kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
-        kernel<<<nlb2, BS2, shmem_bytes>>>(
-            d_states_glb, d_index_out, d_token_out, index_states,
-            size, nlb2, dyn_index_ptr2, new_size);
+        if (NREG2 == 0) lexerAlpaccShmemTwoPassV2P2NregNone<I, BS2, IPT2><<<nlb2, BS2, shmem_bytes>>>(
+            d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
+        else            lexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2><<<nlb2, BS2, shmem_bytes>>>(
+            d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
     }
 }
 
@@ -1758,7 +1743,8 @@ void testLexerAlpaccShmemDyn(uint8_t* input,
 }
 
 
-template<uint32_t BS1, uint32_t IPT1, uint32_t BS2, uint32_t IPT2>
+template<uint32_t BS1, uint32_t IPT1, uint32_t BS2, uint32_t IPT2,
+         uint32_t NREG1=64, uint32_t NREG2=64>
 void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
                size_t input_size,
                uint32_t* expected_indices,
@@ -1827,7 +1813,7 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     };
 
     for (I i = 0; i < WARMUP_RUNS; ++i) {
-        launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2>(
+        launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2, NREG1, NREG2>(
             ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
             size, NLB1, NLB2, d_dyn_index_ptr1, d_dyn_index_ptr2,
             d_new_size, d_is_valid, d_states_glb);
@@ -1838,7 +1824,7 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
 
     for (I i = 0; i < RUNS; ++i) {
         cudaEventRecord(start, 0);
-        launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2>(
+        launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2, NREG1, NREG2>(
             ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
             size, NLB1, NLB2, d_dyn_index_ptr1, d_dyn_index_ptr2,
             d_new_size, d_is_valid, d_states_glb);
@@ -2138,16 +2124,18 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024 IPT=44:");
     testLexerAlpaccShmemDyn<1024, 44>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS256/IPT44 P2=BS256/IPT18:");
-    testLexerAlpaccShmemTwoPassV2<256, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS320/IPT44 P2=BS256/IPT18:");
-    testLexerAlpaccShmemTwoPassV2<320, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS384/IPT44 P2=BS256/IPT18:");
-    testLexerAlpaccShmemTwoPassV2<384, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS448/IPT44 P2=BS256/IPT18:");
-    testLexerAlpaccShmemTwoPassV2<448, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS512/IPT44 P2=BS256/IPT18:");
-    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS512/IPT44 P1nreg64 P2nreg64:");
+    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 64, 64>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS512/IPT44 P1nreg48 P2nreg64:");
+    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 48, 64>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS512/IPT44 P1nreg0  P2nreg64:");
+    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 0, 64>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS512/IPT44 P1nreg64 P2nreg0:");
+    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 64, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS512/IPT44 P1nreg48 P2nreg0:");
+    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 48, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS512/IPT44 P1nreg0  P2nreg0:");
+    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
