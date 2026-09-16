@@ -110,11 +110,9 @@ __global__ void ourScanKernelStriped(
     using BlockExchange = cub::BlockExchange<uint32_t, BLOCK_SIZE, ITEMS_PER_THREAD>;
     using PrefixOp      = TilePrefixCallbackOp<uint32_t, Add<I>>;
 
-    __shared__ union {
-        typename BlockScan::TempStorage     scan;
-        typename BlockExchange::TempStorage exchange;
-    } temp;
-    __shared__ typename PrefixOp::TempStorage prefix_storage;
+    __shared__ typename BlockScan::TempStorage     scan_temp;
+    __shared__ typename BlockExchange::TempStorage exchange_temp;
+    __shared__ typename PrefixOp::TempStorage      prefix_storage;
 
     I tile_idx = blockIdx.x;
     I glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
@@ -128,13 +126,13 @@ __global__ void ourScanKernelStriped(
     }
 
     // Convert striped -> blocked for BlockScan
-    BlockExchange(temp.exchange).StripedToBlocked(items);
+    BlockExchange(exchange_temp).StripedToBlocked(items);
 
     PrefixOp prefix_op(tile_state, prefix_storage, Add<I>(), (int)tile_idx, uint32_t(0));
-    BlockScan(temp.scan).InclusiveScan(items, items, Add<I>(), prefix_op);
+    BlockScan(scan_temp).InclusiveScan(items, items, Add<I>(), prefix_op);
 
     // Convert blocked -> striped for coalesced store
-    BlockExchange(temp.exchange).BlockedToStriped(items);
+    BlockExchange(exchange_temp).BlockedToStriped(items);
 
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
