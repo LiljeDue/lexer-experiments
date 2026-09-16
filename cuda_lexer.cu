@@ -1917,11 +1917,12 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     }
 
     if (test_passes) {
-        printf("  P1 (%uMiB): ", P1_BYTES >> 20);
+        printf("\n");
+        printf("  %-36s ", "P1:");
         compute_descriptors(temp_p1, RUNS, P1_BYTES);
-        printf("  P2 (%uMiB): ", P2_BYTES >> 20);
+        printf("  %-36s ", "P2:");
         compute_descriptors(temp_p2, RUNS, P2_BYTES);
-        printf("  Total (%uMiB): ", (P1_BYTES + P2_BYTES) >> 20);
+        printf("  %-36s ", "Total:");
         compute_descriptors(temp_total, RUNS, P1_BYTES + P2_BYTES);
     }
 
