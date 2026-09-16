@@ -217,14 +217,18 @@ struct TilePrefixCallbackOp {
             exclusive_prefix = scan_op(window_agg, exclusive_prefix);
         }
 
+        // Broadcast exclusive_prefix from lane 0 to all warp lanes via shuffle
+        // (avoids shared-memory write + unsynchronized read across warp lanes).
+        T ep = (T) __shfl_sync(0xffffffff, (uint32_t) exclusive_prefix, 0);
+
         if (threadIdx.x == 0) {
-            inclusive_prefix = scan_op(exclusive_prefix, block_aggregate);
+            inclusive_prefix = scan_op(ep, block_aggregate);
             tile_state.SetInclusive(tile_idx, inclusive_prefix);
-            temp_storage.exclusive_prefix = exclusive_prefix;
+            temp_storage.exclusive_prefix = ep;
             temp_storage.inclusive_prefix = inclusive_prefix;
         }
 
-        return temp_storage.exclusive_prefix;
+        return ep;
     }
 
     __device__ __forceinline__ T GetExclusivePrefix() { return temp_storage.exclusive_prefix; }
