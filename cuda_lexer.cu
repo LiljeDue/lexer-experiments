@@ -2138,16 +2138,16 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024 IPT=44:");
     testLexerAlpaccShmemDyn<1024, 44>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS1024/IPT32 P2=BS256/IPT18:");
-    testLexerAlpaccShmemTwoPassV2<1024, 32, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS1024/IPT44 P2=BS256/IPT18:");
-    testLexerAlpaccShmemTwoPassV2<1024, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS1024/IPT56 P2=BS256/IPT18:");
-    testLexerAlpaccShmemTwoPassV2<1024, 56, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS512/IPT32 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<512, 32, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "2Pass V2 P1=BS512/IPT44 P2=BS256/IPT18:");
     testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS768/IPT44 P2=BS256/IPT18:");
-    testLexerAlpaccShmemTwoPassV2<768, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS512/IPT56 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<512, 56, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS384/IPT44 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<384, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS256/IPT44 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<256, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
