@@ -2140,8 +2140,8 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmemDyn<1024, 44>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "2Pass V2 P1=BS1024/IPT44 P2=BS256/IPT18:");
     testLexerAlpaccShmemTwoPassV2<1024, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS576/IPT44 P2=BS256/IPT18:");
-    testLexerAlpaccShmemTwoPassV2<576, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS576/IPT14 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<576, 14, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
