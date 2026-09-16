@@ -191,13 +191,18 @@ struct TilePrefixCallbackOp {
         temp_storage.warp_flags[threadIdx.x] = tail_flag;
         __syncwarp();
 
-        // Scan from lane WARP-1 towards lane 0, combining until we hit a tail flag.
+        // Right-to-left tail-segmented scan: lane k covers tile (tile_idx-k-1).
+        // Lower lanes are CLOSER predecessors. We scan from lane WARP-1 towards
+        // lane 0, reading from t+offset, so each lane accumulates its closer
+        // neighbors. After the scan, warp_vals[0] holds the combined value from
+        // the nearest INCLUSIVE/OOB lane down to lane 0 (exclusive prefix for
+        // this tile).
         T running = eff_value;
         #pragma unroll
         for (int offset = 1; offset < WARP; offset <<= 1) {
-            if (threadIdx.x >= offset) {
-                int   src_flag = temp_storage.warp_flags[threadIdx.x - offset];
-                T     src_val  = temp_storage.warp_vals[threadIdx.x - offset];
+            if (threadIdx.x + offset < WARP) {
+                int   src_flag = temp_storage.warp_flags[threadIdx.x + offset];
+                T     src_val  = temp_storage.warp_vals[threadIdx.x + offset];
                 if (!temp_storage.warp_flags[threadIdx.x]) {
                     running = scan_op(src_val, running);
                     temp_storage.warp_flags[threadIdx.x] = src_flag;
@@ -227,9 +232,9 @@ struct TilePrefixCallbackOp {
             running = eff_value;
             #pragma unroll
             for (int offset = 1; offset < WARP; offset <<= 1) {
-                if (threadIdx.x >= offset) {
-                    int   src_flag = temp_storage.warp_flags[threadIdx.x - offset];
-                    T     src_val  = temp_storage.warp_vals[threadIdx.x - offset];
+                if (threadIdx.x + offset < WARP) {
+                    int   src_flag = temp_storage.warp_flags[threadIdx.x + offset];
+                    T     src_val  = temp_storage.warp_vals[threadIdx.x + offset];
                     if (!temp_storage.warp_flags[threadIdx.x]) {
                         running = scan_op(src_val, running);
                         temp_storage.warp_flags[threadIdx.x] = src_flag;
