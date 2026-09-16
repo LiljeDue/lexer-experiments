@@ -345,7 +345,7 @@ lexer(LexerCtx ctx,
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
-            I slot = prod[i] - 1;
+            I slot = prod[i] - 1 - idx_pfx;
             I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             tok_stage[slot] = get_token(st[i]);
             lid_stage[slot] = (uint16_t) lid;
@@ -489,7 +489,7 @@ lexerShmemCompose(LexerCtxShmem ctx,
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
-            I slot = prod[i] - 1;
+            I slot = prod[i] - 1 - idx_pfx;
             I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             tok_stage[slot] = get_token(st[i]);
             lid_stage[slot] = (uint16_t) lid;
@@ -636,7 +636,7 @@ lexerAlpaccImpl(CTX ctx,
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
-            I slot = prod[i] - 1;
+            I slot = prod[i] - 1 - idx_pfx;
             I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             tok_stage[slot] = get_token(st[i]);
             lid_stage[slot] = (uint16_t) lid;
@@ -813,7 +813,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
-            I slot = prod[i] - 1;
+            I slot = prod[i] - 1 - idx_pfx;
             I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             tok_stage[slot] = get_token(states[lid]);
         }
@@ -824,7 +824,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
-            I slot = prod[i] - 1;
+            I slot = prod[i] - 1 - idx_pfx;
             I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             lid_stage[slot] = (uint16_t) lid;
         }
@@ -1033,7 +1033,7 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
         if ((is_produce_state >> i) & 1) { \
-            I slot = prod[i] - 1; \
+            I slot = prod[i] - 1 - idx_pfx; \
             I lid  = threadIdx.x * ITEMS_PER_THREAD + i; \
             tok_stage[slot] = tokens[i]; \
         } \
@@ -1042,7 +1042,7 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
         if ((is_produce_state >> i) & 1) { \
-            I slot = prod[i] - 1; \
+            I slot = prod[i] - 1 - idx_pfx; \
             I lid  = threadIdx.x * ITEMS_PER_THREAD + i; \
             lid_stage[slot] = (uint16_t) lid; \
         } \
