@@ -96,6 +96,53 @@ __global__ void ourScanKernelStatic(
     }
 }
 
+// Striped layout: thread t owns items t, t+BS, t+2*BS, ... (coalesced access).
+// BlockScan expects striped input when using BlockScan<..., BLOCK_SCAN_WARP_SCANS>.
+// We use cub::BlockExchange to convert striped->blocked before scan and blocked->striped after.
+template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+__global__ void ourScanKernelStriped(
+    const uint32_t* __restrict__ d_in,
+    uint32_t* __restrict__ d_out,
+    ScanTileState<uint32_t> tile_state,
+    I n)
+{
+    using BlockScan     = cub::BlockScan<uint32_t, BLOCK_SIZE>;
+    using BlockExchange = cub::BlockExchange<uint32_t, BLOCK_SIZE, ITEMS_PER_THREAD>;
+    using PrefixOp      = TilePrefixCallbackOp<uint32_t, Add<I>>;
+
+    __shared__ union {
+        typename BlockScan::TempStorage     scan;
+        typename BlockExchange::TempStorage exchange;
+    } temp;
+    __shared__ typename PrefixOp::TempStorage prefix_storage;
+
+    I tile_idx = blockIdx.x;
+    I glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+
+    // Striped load: thread t reads positions glb_offs+t, glb_offs+t+BS, ...
+    uint32_t items[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+        I gid = glb_offs + i * BLOCK_SIZE + threadIdx.x;
+        items[i] = gid < n ? d_in[gid] : 0;
+    }
+
+    // Convert striped -> blocked for BlockScan
+    BlockExchange(temp.exchange).StripedToBlocked(items);
+
+    PrefixOp prefix_op(tile_state, prefix_storage, Add<I>(), (int)tile_idx, uint32_t(0));
+    BlockScan(temp.scan).InclusiveScan(items, items, Add<I>(), prefix_op);
+
+    // Convert blocked -> striped for coalesced store
+    BlockExchange(temp.exchange).BlockedToStriped(items);
+
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+        I gid = glb_offs + i * BLOCK_SIZE + threadIdx.x;
+        if (gid < n) d_out[gid] = items[i];
+    }
+}
+
 // Kernel to fill d_in with a simple pattern (all ones) for easy verification
 __global__ void fillOnes(uint32_t* d, uint32_t n) {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -138,9 +185,10 @@ int main() {
     cudaEvent_t start, stop;
     gpuAssert(cudaEventCreate(&start));
     gpuAssert(cudaEventCreate(&stop));
-    float* times_cub    = (float*)malloc(sizeof(float) * RUNS);
-    float* times_ours   = (float*)malloc(sizeof(float) * RUNS);
-    float* times_static = (float*)malloc(sizeof(float) * RUNS);
+    float* times_cub     = (float*)malloc(sizeof(float) * RUNS);
+    float* times_ours    = (float*)malloc(sizeof(float) * RUNS);
+    float* times_static  = (float*)malloc(sizeof(float) * RUNS);
+    float* times_striped = (float*)malloc(sizeof(float) * RUNS);
 
     // Warmup CUB
     for (int i = 0; i < WARMUP; i++) {
@@ -187,6 +235,28 @@ int main() {
         gpuAssert(cudaEventElapsedTime(&times_ours[i], start, stop));
     }
 
+    // --- Our scan (static blockIdx.x, striped) ---
+    uint32_t* d_out_striped;
+    gpuAssert(cudaMalloc(&d_out_striped, BYTES));
+
+    auto reset_striped = [&]() { initScanTileState(tile_state, (int)NLB); };
+
+    for (int i = 0; i < WARMUP; i++) {
+        reset_striped();
+        ourScanKernelStriped<I, BLOCK_SIZE, ITEMS_PER_THREAD>
+            <<<NLB, BLOCK_SIZE>>>(d_in, d_out_striped, tile_state, N);
+        gpuAssert(cudaDeviceSynchronize());
+    }
+    for (int i = 0; i < RUNS; i++) {
+        reset_striped();
+        gpuAssert(cudaEventRecord(start));
+        ourScanKernelStriped<I, BLOCK_SIZE, ITEMS_PER_THREAD>
+            <<<NLB, BLOCK_SIZE>>>(d_in, d_out_striped, tile_state, N);
+        gpuAssert(cudaEventRecord(stop));
+        gpuAssert(cudaEventSynchronize(stop));
+        gpuAssert(cudaEventElapsedTime(&times_striped[i], start, stop));
+    }
+
     // --- Our scan (static blockIdx.x) ---
     uint32_t* d_out_static;
     gpuAssert(cudaMalloc(&d_out_static, BYTES));
@@ -210,10 +280,11 @@ int main() {
     }
 
     // Verify
-    std::vector<uint32_t> h_cub(N), h_ours(N), h_static(N);
-    gpuAssert(cudaMemcpy(h_cub.data(),    d_out_cub,    BYTES, cudaMemcpyDeviceToHost));
-    gpuAssert(cudaMemcpy(h_ours.data(),   d_out_ours,   BYTES, cudaMemcpyDeviceToHost));
-    gpuAssert(cudaMemcpy(h_static.data(), d_out_static, BYTES, cudaMemcpyDeviceToHost));
+    std::vector<uint32_t> h_cub(N), h_ours(N), h_static(N), h_striped(N);
+    gpuAssert(cudaMemcpy(h_cub.data(),     d_out_cub,     BYTES, cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(h_ours.data(),    d_out_ours,    BYTES, cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(h_static.data(),  d_out_static,  BYTES, cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(h_striped.data(), d_out_striped, BYTES, cudaMemcpyDeviceToHost));
     bool ok = true;
     for (I i = 0; i < N && ok; i++) {
         if (h_cub[i] != h_ours[i]) {
@@ -222,6 +293,10 @@ int main() {
         }
         if (h_cub[i] != h_static[i]) {
             printf("MISMATCH (static) at i=%u: cub=%u ours=%u\n", i, h_cub[i], h_static[i]);
+            ok = false;
+        }
+        if (h_cub[i] != h_striped[i]) {
+            printf("MISMATCH (striped) at i=%u: cub=%u ours=%u\n", i, h_cub[i], h_striped[i]);
             ok = false;
         }
     }
@@ -234,11 +309,15 @@ int main() {
     compute_descriptors(times_ours, RUNS, 2 * BYTES);
     printf(PAD, "Our TilePrefixCallbackOp (static):");
     compute_descriptors(times_static, RUNS, 2 * BYTES);
+    printf(PAD, "Our TilePrefixCallbackOp (striped):");
+    compute_descriptors(times_striped, RUNS, 2 * BYTES);
 
     free(times_cub);
     free(times_ours);
     free(times_static);
+    free(times_striped);
     gpuAssert(cudaFree(d_out_static));
+    gpuAssert(cudaFree(d_out_striped));
     gpuAssert(cudaFree(d_in));
     gpuAssert(cudaFree(d_out_ours));
     gpuAssert(cudaFree(d_out_cub));
