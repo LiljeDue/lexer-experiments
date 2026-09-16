@@ -91,6 +91,10 @@ profile: $(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indi
 	} > profile.txt 2>&1
 
 
+scan_bench: scan_bench.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h
+	$(COMPILER) $(FLAGS) -o scan_bench $<
+	./scan_bench
+
 devinfo:
 	$(COMPILER) $(FLAGS) -o devinfo devinfo.cu
 	./devinfo
