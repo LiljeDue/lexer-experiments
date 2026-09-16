@@ -4,7 +4,303 @@
 const uint8_t LG_WARP = 5;
 const uint8_t WARP = 1 << LG_WARP;
 
-template<typename T, typename I, I ITEMS_PER_THREAD>
+// Number of padding entries prepended to the tile state array.
+// Threads in block 0 look back at indices tile_idx - threadIdx.x - 1,
+// which for threadIdx.x up to WARP-1 gives indices as low as -WARP.
+// Padding these with SCAN_TILE_INCLUSIVE (OOB) means the lookback
+// terminates immediately for block 0 without any special-casing.
+const uint32_t TILE_STATUS_PADDING = WARP;
+
+enum ScanTileStatus : uint32_t {
+    SCAN_TILE_OOB       = 0,  // padding: acts as inclusive prefix of identity
+    SCAN_TILE_INVALID   = 1,  // not yet published
+    SCAN_TILE_PARTIAL   = 2,  // aggregate published, prefix not yet known
+    SCAN_TILE_INCLUSIVE = 3,  // inclusive prefix published
+};
+
+// ---------------------------------------------------------------------------
+// Single-word tile state: packs status + value into one TxnWord so that
+// publish and read are each a single atomic-width transaction.
+//
+// Layout (little-endian):
+//   TxnWord = [ value (sizeof(T) bytes) | status (sizeof(T) bytes) ]
+//
+// T=uint16_t: TxnWord=uint32_t, StatusWord=uint16_t
+// T=uint32_t: TxnWord=uint64_t, StatusWord=uint32_t
+// ---------------------------------------------------------------------------
+template<typename T>
+struct TxnWordTraits;
+
+template<> struct TxnWordTraits<uint16_t> {
+    using TxnWord    = uint32_t;
+    using StatusWord = uint16_t;
+};
+template<> struct TxnWordTraits<uint32_t> {
+    using TxnWord    = unsigned long long;
+    using StatusWord = uint32_t;
+};
+
+template<typename T>
+struct TileDescriptor {
+    typename TxnWordTraits<T>::StatusWord status;
+    T value;
+};
+
+// Store/load helpers using PTX acquire/release where available.
+template<typename TxnWord>
+__device__ __forceinline__ void store_release(TxnWord* ptr, TxnWord val) {
+    __threadfence();
+    *ptr = val;
+}
+
+template<typename TxnWord>
+__device__ __forceinline__ TxnWord load_relaxed(const TxnWord* ptr) {
+    return *const_cast<const volatile TxnWord*>(ptr);
+}
+
+// ---------------------------------------------------------------------------
+// ScanTileState<T>: per-tile state array with padding.
+// Allocated as (num_tiles + TILE_STATUS_PADDING) TxnWords.
+// Padding entries are initialised to SCAN_TILE_OOB so that the lookback
+// in block 0 terminates immediately.
+// ---------------------------------------------------------------------------
+template<typename T>
+struct ScanTileState {
+    using StatusWord = typename TxnWordTraits<T>::StatusWord;
+    using TxnWord    = typename TxnWordTraits<T>::TxnWord;
+
+    TxnWord* d_tile_descriptors;
+
+    // Number of TxnWords to allocate: num_tiles + TILE_STATUS_PADDING
+    __host__ static size_t AllocationSize(int num_tiles) {
+        return (num_tiles + TILE_STATUS_PADDING) * sizeof(TxnWord);
+    }
+
+    // Initialize from device: one thread per entry.
+    __device__ void InitializeStatus(int num_tiles) {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        TxnWord val = TxnWord();
+        TileDescriptor<T>* desc = reinterpret_cast<TileDescriptor<T>*>(&val);
+        if (idx < num_tiles) {
+            desc->status = StatusWord(SCAN_TILE_INVALID);
+            d_tile_descriptors[TILE_STATUS_PADDING + idx] = val;
+        }
+        if (blockIdx.x == 0 && threadIdx.x < TILE_STATUS_PADDING) {
+            desc->status = StatusWord(SCAN_TILE_OOB);
+            d_tile_descriptors[threadIdx.x] = val;
+        }
+    }
+
+    // Publish aggregate (partial): single atomic-width write.
+    __device__ __forceinline__ void SetPartial(int tile_idx, T value) {
+        TileDescriptor<T> desc;
+        desc.status = StatusWord(SCAN_TILE_PARTIAL);
+        desc.value  = value;
+        TxnWord word;
+        *reinterpret_cast<TileDescriptor<T>*>(&word) = desc;
+        store_release(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx, word);
+    }
+
+    // Publish inclusive prefix: single atomic-width write.
+    __device__ __forceinline__ void SetInclusive(int tile_idx, T value) {
+        TileDescriptor<T> desc;
+        desc.status = StatusWord(SCAN_TILE_INCLUSIVE);
+        desc.value  = value;
+        TxnWord word;
+        *reinterpret_cast<TileDescriptor<T>*>(&word) = desc;
+        store_release(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx, word);
+    }
+
+    // Spin until tile is non-invalid, return status and value.
+    __device__ __forceinline__ void WaitForValid(int tile_idx, StatusWord& status, T& value) {
+        TxnWord word = load_relaxed(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx);
+        TileDescriptor<T> desc = reinterpret_cast<TileDescriptor<T>&>(word);
+        while (__any_sync(0xffffffff, desc.status == StatusWord(SCAN_TILE_INVALID))) {
+            __nanosleep(64);
+            word = load_relaxed(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx);
+            desc = reinterpret_cast<TileDescriptor<T>&>(word);
+        }
+        status = desc.status;
+        value  = desc.value;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// TilePrefixCallbackOp: CUB-style prefix callback used with BlockScan.
+// Called by BlockScan on the first warp only. Each thread looks back at
+// predecessor tile_idx - threadIdx.x - 1. A WarpReduce with tail-segment
+// flag combines the window. The window slides back by WARP until a
+// SCAN_TILE_INCLUSIVE is found.
+// ---------------------------------------------------------------------------
+template<typename T, typename ScanOpT>
+struct TilePrefixCallbackOp {
+    using StatusWord = typename ScanTileState<T>::StatusWord;
+
+    ScanTileState<T>& tile_state;
+    ScanOpT           scan_op;
+    int               tile_idx;
+    T                 exclusive_prefix;
+    T                 inclusive_prefix;
+
+    // Temporary storage for warp reduce.
+    struct TempStorage {
+        T   warp_vals[WARP];
+        int warp_flags[WARP];
+        T   exclusive_prefix;
+        T   inclusive_prefix;
+        T   block_aggregate;
+    };
+
+    TempStorage& temp_storage;
+
+    __device__ __forceinline__
+    TilePrefixCallbackOp(ScanTileState<T>& tile_state,
+                         TempStorage& temp_storage,
+                         ScanOpT scan_op,
+                         int tile_idx)
+        : tile_state(tile_state)
+        , scan_op(scan_op)
+        , tile_idx(tile_idx)
+        , temp_storage(temp_storage)
+    {}
+
+    // Called by BlockScan with the block aggregate; returns exclusive prefix.
+    __device__ __forceinline__ T operator()(T block_aggregate) {
+        // Thread 0 publishes partial aggregate.
+        if (threadIdx.x == 0) {
+            temp_storage.block_aggregate = block_aggregate;
+            tile_state.SetPartial(tile_idx, block_aggregate);
+        }
+
+        // All 32 warp threads look back at their predecessor window simultaneously.
+        int predecessor_idx = tile_idx - threadIdx.x - 1;
+
+        StatusWord pred_status;
+        T          pred_value;
+        tile_state.WaitForValid(predecessor_idx, pred_status, pred_value);
+
+        // Warp-level tail-segmented reduction: stop reducing when we hit an
+        // INCLUSIVE status (which carries the full prefix up to that tile).
+        int tail_flag = (pred_status == StatusWord(SCAN_TILE_INCLUSIVE));
+        temp_storage.warp_vals[threadIdx.x]  = pred_value;
+        temp_storage.warp_flags[threadIdx.x] = tail_flag;
+        __syncwarp();
+
+        // Scan from lane WARP-1 towards lane 0, combining until we hit a tail flag.
+        T running = pred_value;
+        #pragma unroll
+        for (int offset = 1; offset < WARP; offset <<= 1) {
+            if (threadIdx.x >= offset) {
+                int   src_flag = temp_storage.warp_flags[threadIdx.x - offset];
+                T     src_val  = temp_storage.warp_vals[threadIdx.x - offset];
+                if (!temp_storage.warp_flags[threadIdx.x]) {
+                    running = scan_op(src_val, running);
+                    temp_storage.warp_flags[threadIdx.x] = src_flag;
+                }
+                temp_storage.warp_vals[threadIdx.x] = running;
+            }
+            __syncwarp();
+        }
+
+        // The exclusive prefix is in lane 0 of the warp-scan result from the
+        // window. But we may need to slide the window further back.
+        exclusive_prefix = temp_storage.warp_vals[0];
+
+        while (__all_sync(0xffffffff, pred_status != StatusWord(SCAN_TILE_INCLUSIVE))) {
+            predecessor_idx -= WARP;
+            tile_state.WaitForValid(predecessor_idx, pred_status, pred_value);
+
+            tail_flag = (pred_status == StatusWord(SCAN_TILE_INCLUSIVE));
+            temp_storage.warp_vals[threadIdx.x]  = pred_value;
+            temp_storage.warp_flags[threadIdx.x] = tail_flag;
+            __syncwarp();
+
+            running = pred_value;
+            #pragma unroll
+            for (int offset = 1; offset < WARP; offset <<= 1) {
+                if (threadIdx.x >= offset) {
+                    int   src_flag = temp_storage.warp_flags[threadIdx.x - offset];
+                    T     src_val  = temp_storage.warp_vals[threadIdx.x - offset];
+                    if (!temp_storage.warp_flags[threadIdx.x]) {
+                        running = scan_op(src_val, running);
+                        temp_storage.warp_flags[threadIdx.x] = src_flag;
+                    }
+                    temp_storage.warp_vals[threadIdx.x] = running;
+                }
+                __syncwarp();
+            }
+
+            exclusive_prefix = scan_op(temp_storage.warp_vals[0], exclusive_prefix);
+        }
+
+        // Thread 0 publishes inclusive prefix.
+        if (threadIdx.x == 0) {
+            inclusive_prefix = scan_op(exclusive_prefix, block_aggregate);
+            tile_state.SetInclusive(tile_idx, inclusive_prefix);
+            temp_storage.exclusive_prefix = exclusive_prefix;
+            temp_storage.inclusive_prefix = inclusive_prefix;
+        }
+        __syncwarp();
+
+        return temp_storage.exclusive_prefix;
+    }
+
+    __device__ __forceinline__ T GetExclusivePrefix() { return temp_storage.exclusive_prefix; }
+    __device__ __forceinline__ T GetInclusivePrefix() { return temp_storage.inclusive_prefix; }
+    __device__ __forceinline__ T GetBlockAggregate()  { return temp_storage.block_aggregate;  }
+};
+
+// ---------------------------------------------------------------------------
+// Kept for backward-compat with non-two-pass kernels that still call
+// dynamicIndex directly.
+// ---------------------------------------------------------------------------
+template<typename I>
+__device__ inline I dynamicIndex(volatile I* dyn_idx_ptr) {
+    volatile __shared__ I dyn_idx;
+    if (threadIdx.x == 0)
+        dyn_idx = atomicAdd(const_cast<I*>(dyn_idx_ptr), 1);
+    __syncthreads();
+    return dyn_idx;
+}
+
+// ---------------------------------------------------------------------------
+// Legacy types/functions used by non-two-pass kernels — kept intact.
+// ---------------------------------------------------------------------------
+enum Status: uint8_t {
+    Invalid = 0,
+    Aggregate = 1,
+    Prefix = 2,
+};
+
+template<typename T>
+struct State {
+    T aggregate;
+    T prefix;
+    Status status = Invalid;
+};
+
+template<typename T, typename I, typename OP>
+__device__ inline void
+scanWarp(volatile T* values,
+         volatile Status* statuses,
+         OP op,
+         const uint8_t lane,
+         const I dyn_idx,
+         const I lookback_warp) {
+    uint8_t h;
+    const I tid = threadIdx.x;
+    #pragma unroll
+    for (uint8_t d = 0; d < LG_WARP; d++) {
+        if ((h = 1 << d) <= lane && (tid - h + dyn_idx) >= lookback_warp) {
+            bool is_not_aggregate = statuses[tid] != Aggregate;
+            values[tid] = is_not_aggregate ? const_cast<T*>(values)[tid] : op(values[tid - h], values[tid]);
+            statuses[tid] = (statuses[tid - h] == Prefix || statuses[tid] == Prefix) ? Prefix : statuses[tid - h] == Invalid ? Invalid : statuses[tid];
+        }
+    }
+    __syncwarp();
+}
+
+template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
 __device__ inline void
 glbToShmemCpy(const I glb_offs,
               const I size,
@@ -36,6 +332,50 @@ shmemToGlbCpy(const I glb_offs,
     __syncthreads();
 }
 
+// ---------------------------------------------------------------------------
+// Legacy scan functions used by non-two-pass kernels — kept intact.
+// ---------------------------------------------------------------------------
+__device__ inline Status
+combine(Status a, Status b) {
+    if (b == Aggregate)
+        return a;
+    return b;
+}
+
+template<typename T, typename I, typename OP>
+__device__ inline T
+scanWarp(volatile T* shmem,
+         OP op,
+         const uint8_t lane) {
+    uint8_t h;
+    #pragma unroll
+    for (uint8_t d = 0; d < LG_WARP; d++)
+        if ((h = 1 << d) <= lane)
+            shmem[threadIdx.x] = op(shmem[threadIdx.x - h], shmem[threadIdx.x]);
+    return shmem[threadIdx.x];
+}
+
+template<typename T, typename I, typename OP>
+__device__ inline void
+scanBlock(volatile T* shmem,
+          OP op) {
+    const uint8_t lane = threadIdx.x & (WARP - 1);
+    const I warpid = threadIdx.x >> LG_WARP;
+    T res = scanWarp<T, I, OP>(shmem, op, lane);
+    __syncthreads();
+    if (lane == (WARP - 1))
+        shmem[warpid] = res;
+    __syncthreads();
+    if (warpid == 0)
+        scanWarp<T, I, OP>(shmem, op, lane);
+    __syncthreads();
+    if (warpid > 0)
+        res = op(shmem[warpid-1], res);
+    __syncthreads();
+    shmem[threadIdx.x] = res;
+    __syncthreads();
+}
+
 template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
 __device__ inline void
 scanThread(volatile T* shmem,
@@ -51,47 +391,6 @@ scanThread(volatile T* shmem,
         shmem[lid] = acc;
     }
     shmem_aux[threadIdx.x] = acc;
-	__syncthreads();
-}
-
-template<typename T, typename I, typename OP>
-__device__ inline T
-scanWarp(volatile T* shmem,
-         OP op,
-         const uint8_t lane) {
-    uint8_t h;
-
-    #pragma unroll
-    for (uint8_t d = 0; d < LG_WARP; d++)
-        if ((h = 1 << d) <= lane)
-            shmem[threadIdx.x] = op(shmem[threadIdx.x - h], shmem[threadIdx.x]);
-    
-    return shmem[threadIdx.x];
-}
-
-template<typename T, typename I, typename OP>
-__device__ inline void
-scanBlock(volatile T* shmem,
-          OP op) {
-    const uint8_t lane = threadIdx.x & (WARP - 1);
-    const I warpid = threadIdx.x >> LG_WARP;
-
-    T res = scanWarp<T, I, OP>(shmem, op, lane);
-    __syncthreads();
-
-    if (lane == (WARP - 1))
-        shmem[warpid] = res;
-    __syncthreads();
-
-    if (warpid == 0)
-        scanWarp<T, I, OP>(shmem, op, lane);
-    __syncthreads();
-
-    if (warpid > 0)
-        res = op(shmem[warpid-1], res);
-    __syncthreads();
-
-    shmem[threadIdx.x] = res;
     __syncthreads();
 }
 
@@ -105,11 +404,10 @@ addAuxBlockScan(volatile T* shmem,
         const I upper = offset + ITEMS_PER_THREAD;
         const T val = shmem_aux[threadIdx.x - 1];
         #pragma unroll
-        for (I lid = offset; lid < upper; lid++) {
+        for (I lid = offset; lid < upper; lid++)
             shmem[lid] = op(val, shmem[lid]);
-        }
     }
-	__syncthreads();
+    __syncthreads();
 }
 
 template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
@@ -118,94 +416,8 @@ scanBlock(volatile T* block,
           volatile T* block_aux,
           OP op) {
     scanThread<T, I, OP, ITEMS_PER_THREAD>(block, block_aux, op);
-
     scanBlock<T, I, OP>(block_aux, op);
-
     addAuxBlockScan<T, I, OP, ITEMS_PER_THREAD>(block, block_aux, op);
-}
-
-template<typename I>
-__device__ inline I dynamicIndex(volatile I* dyn_idx_ptr) {
-    volatile __shared__ I dyn_idx;
-    
-    if (threadIdx.x == 0)
-        dyn_idx = atomicAdd(const_cast<I*>(dyn_idx_ptr), 1);
-    
-    __syncthreads();
-	return dyn_idx;
-}
-
-enum Status: uint8_t {
-    Invalid = 0,
-    Aggregate = 1,
-    Prefix = 2,
-};
-
-template<typename T>
-struct State {
-    T aggregate;
-    T prefix;
-    Status status = Invalid;
-};
-
-/*
-Combine is associative since it is the binary operation which resuls in the left most element with
-Aggregate as an added identity element. The operation has the following table.
-
-P = Prefix
-A = Aggregate
-X = Invalid
-  | P | A | X
--------------
-P | P | P | X
--------------
-A | P | A | X
--------------
-X | P | X | X
-
-If we map X to False and both P and X to True then we get that this corresponds to the or operation.
-
-P = True
-A = False
-X = True
-  | P | A | X
--------------
-P | T | T | T
--------------
-A | T | F | T
--------------
-X | T | T | T
-
-Meaning this can be used for an irregular segmented scan where we can propegate the last status to
-the end of a segment while combining Aggregates with P and X.
-*/
-__device__ inline Status
-combine(Status a, Status b) {
-    if (b == Aggregate)
-        return a;
-    return b;
-}
-
-template<typename T, typename I, typename OP>
-__device__ inline void
-scanWarp(volatile T* values,
-         volatile Status* statuses,
-         OP op,
-         const uint8_t lane,
-         const I dyn_idx,
-         const I lookback_warp) {
-    uint8_t h;
-    const I tid = threadIdx.x;
-
-    #pragma unroll
-    for (uint8_t d = 0; d < LG_WARP; d++) {
-        if ((h = 1 << d) <= lane && (tid - h + dyn_idx) >= lookback_warp) {
-            bool is_not_aggregate = statuses[tid] != Aggregate;
-            values[tid] = is_not_aggregate ? const_cast<T*>(values)[tid] : op(values[tid - h], values[tid]);
-            statuses[tid] = combine(statuses[tid - h], statuses[tid]);
-        }
-    }
-    __syncwarp();
 }
 
 template<typename T, typename I, typename OP, I ITEMS_PER_THREAD>
@@ -220,24 +432,16 @@ decoupledLookbackScan(volatile State<T>* states,
     const uint8_t lane = threadIdx.x & (WARP - 1);
     const bool is_first = threadIdx.x == 0;
     const bool is_first_block = dyn_idx == 0;
-
     T aggregate = shmem[ITEMS_PER_THREAD * blockDim.x - 1];
-
-    if (is_first) {
+    if (is_first)
         states[dyn_idx].aggregate = aggregate;
-    }
-    
-    if (is_first_block && is_first) {
+    if (is_first_block && is_first)
         states[dyn_idx].prefix = aggregate;
-    }
-    
     __threadfence();
-    if (is_first_block && is_first) {
+    if (is_first_block && is_first)
         states[dyn_idx].status = Prefix;
-    } else if (is_first) {
+    else if (is_first)
         states[dyn_idx].status = Aggregate;
-    }
-
     T prefix;
     bool is_first_iter = true;
     if (threadIdx.x < WARP && !is_first_block) {
@@ -253,46 +457,34 @@ decoupledLookbackScan(volatile State<T>* states,
             } else {
                 statuses[threadIdx.x] = Aggregate;
             }
-
             scanWarp<T, I, OP>(values, statuses, op, lane, dyn_idx, lookback_warp);
-
             status = statuses[WARP - 1];
-
             if (status == Invalid)
                 continue;
-
             if (is_first) {
-                if (is_first_iter) {
+                if (is_first_iter)
                     prefix = values[WARP - 1];
-                } else {
+                else
                     prefix = op(values[WARP - 1], prefix);
-                }
             }
-
             lookback_warp += WARP;
             is_first_iter = false;
         } while (status != Prefix);
     }
-
-    if (!is_first_block && is_first) {
+    if (!is_first_block && is_first)
         shmem_prefix = prefix;
-    }
-
     __syncthreads();
-
     if (is_first) {
         states[dyn_idx].prefix = is_first_block ? aggregate : op(shmem_prefix, aggregate);
         __threadfence();
         states[dyn_idx].status = Prefix;
     }
-
     const I offset = threadIdx.x * ITEMS_PER_THREAD;
     const I upper = offset + ITEMS_PER_THREAD;
     #pragma unroll
     for (I lid = offset; lid < upper; lid++) {
-        if (!is_first_block) {
+        if (!is_first_block)
             shmem[lid] = op(shmem_prefix, shmem[lid]);
-        }
     }
     __syncthreads();
 }
@@ -304,9 +496,7 @@ scan(volatile T* block,
      volatile State<T>* states,
      OP op,
      uint32_t dyn_idx) {
-    
     scanBlock<T, I, OP, ITEMS_PER_THREAD>(block, block_aux, op);
-
     decoupledLookbackScan<T, I, OP, ITEMS_PER_THREAD>(states, block, op, dyn_idx);
 }
 
@@ -323,24 +513,16 @@ decoupledLookbackScanNoWrite(volatile State<T>* states,
     const uint8_t lane = threadIdx.x & (WARP - 1);
     const bool is_first = threadIdx.x == 0;
     const bool is_first_block = dyn_idx == 0;
-
     T aggregate = shmem[ITEMS_PER_THREAD * blockDim.x - 1];
-
-    if (is_first) {
+    if (is_first)
         states[dyn_idx].aggregate = aggregate;
-    }
-    
-    if (is_first_block && is_first) {
+    if (is_first_block && is_first)
         states[dyn_idx].prefix = aggregate;
-    }
-    
     __threadfence();
-    if (is_first_block && is_first) {
+    if (is_first_block && is_first)
         states[dyn_idx].status = Prefix;
-    } else if (is_first) {
+    else if (is_first)
         states[dyn_idx].status = Aggregate;
-    }
-
     T prefix;
     bool is_first_iter = true;
     if (threadIdx.x < WARP && !is_first_block) {
@@ -356,44 +538,31 @@ decoupledLookbackScanNoWrite(volatile State<T>* states,
             } else {
                 statuses[threadIdx.x] = Aggregate;
             }
-
             scanWarp<T, I, OP>(values, statuses, op, lane, dyn_idx, lookback_warp);
-
             status = statuses[WARP - 1];
-
             if (status == Invalid)
                 continue;
-                
             if (is_first) {
-                if (is_first_iter) {
+                if (is_first_iter)
                     prefix = values[WARP - 1];
-                } else {
+                else
                     prefix = op(values[WARP - 1], prefix);
-                }
             }
-
             lookback_warp += WARP;
             is_first_iter = false;
         } while (status != Prefix);
     }
-
-    if (!is_first_block && is_first) {
+    if (!is_first_block && is_first)
         shmem_prefix = prefix;
-    }
-
     __syncthreads();
-
     if (is_first) {
-        if (!is_first_block) {
+        if (!is_first_block)
             states[dyn_idx].prefix = op(shmem_prefix, aggregate);
-        }
         __threadfence();
         states[dyn_idx].status = Prefix;
     }
-    
-    if (is_first_block) {
+    if (is_first_block)
         return ne;
-    } else {
+    else
         return shmem_prefix;
-    }
 }
