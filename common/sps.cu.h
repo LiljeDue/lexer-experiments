@@ -294,7 +294,7 @@ scanWarp(volatile T* values,
         if ((h = 1 << d) <= lane && (tid - h + dyn_idx) >= lookback_warp) {
             bool is_not_aggregate = statuses[tid] != Aggregate;
             values[tid] = is_not_aggregate ? const_cast<T*>(values)[tid] : op(values[tid - h], values[tid]);
-            statuses[tid] = (statuses[tid - h] == Prefix || statuses[tid] == Prefix) ? Prefix : statuses[tid - h] == Invalid ? Invalid : statuses[tid];
+            statuses[tid] = combine(statuses[tid - h], statuses[tid]);
         }
     }
     __syncwarp();
