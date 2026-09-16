@@ -1731,6 +1731,32 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     test_passes = temp_size == expected_size;
     if (!test_passes) {
         std::cout << "Lexer Test Failed: Expected size=" << expected_size << " but got size=" << temp_size << std::endl;
+        // Check if the first min(temp_size, expected_size) outputs match
+        bool prefix_ok = true;
+        I min_size = temp_size < (I)expected_size ? temp_size : (I)expected_size;
+        for (I i = 0; i < min_size; ++i) {
+            if (h_index_out[i] != expected_indices[i] || h_token_out[i] != expected_tokens[i]) {
+                printf("  First mismatch at i=%u: expected (idx=%u tok=%u) got (idx=%u tok=%u)\n",
+                       i, expected_indices[i], (unsigned)expected_tokens[i],
+                       h_index_out[i], (unsigned)h_token_out[i]);
+                prefix_ok = false;
+                break;
+            }
+        }
+        if (prefix_ok) printf("  First %u outputs match expected\n", min_size);
+        I extras = temp_size > (I)expected_size ? temp_size - (I)expected_size : 0;
+        if (extras > 0) {
+            printf("  Extra tokens (%u total), first 8:\n", extras);
+            I lim = (I)expected_size + (extras < 8 ? extras : 8);
+            for (I i = (I)expected_size; i < lim; ++i)
+                printf("    [%u] idx=%u tok=%u\n", i, h_index_out[i], (unsigned)h_token_out[i]);
+        }
+        printf("  Outputs around expected boundary:\n");
+        I lo = (I)expected_size > 4 ? (I)expected_size - 4 : 0;
+        I hi = (I)expected_size + 4 < temp_size ? (I)expected_size + 4 : temp_size;
+        for (I i = lo; i < hi; ++i)
+            printf("    [%u] idx=%u tok=%u%s\n", i, h_index_out[i], (unsigned)h_token_out[i],
+                   i < (I)expected_size ? "" : " <extra>");
     } else {
         for (I i = 0; i < expected_size; ++i) {
             if (h_index_out[i] != expected_indices[i]) {
