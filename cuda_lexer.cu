@@ -306,7 +306,6 @@ lexer(LexerCtx ctx,
 
     __syncthreads();
 
-    // Blocked load for BlockScan (expects blocked input).
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
@@ -314,24 +313,15 @@ lexer(LexerCtx ctx,
     PrefixOpState state_prefix_op(state_states, state_prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY));
     BlockScanState(state_temp).InclusiveScan(st, st, ctx, state_prefix_op);
 
-    // Write blocked scan results back to shmem, then re-layout to striped for
-    // coalesced produce-check lookups and copyFromShrToGlb output.
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
-    __syncthreads();
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        st[i] = states[i * BLOCK_SIZE + threadIdx.x];
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        states[i * BLOCK_SIZE + threadIdx.x] = st[i];
 
     __syncthreads();
 
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-        I lid = i * BLOCK_SIZE + threadIdx.x;
+        I lid = threadIdx.x * ITEMS_PER_THREAD + i;
         I gid = glb_offs + lid;
         bool temp = false;
         if (gid < size) {
@@ -356,7 +346,7 @@ lexer(LexerCtx ctx,
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
             I slot = prod[i] - 1 - idx_pfx;
-            I lid  = i * BLOCK_SIZE + threadIdx.x;
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             tok_stage[slot] = get_token(st[i]);
             lid_stage[slot] = (uint16_t) lid;
         }
@@ -470,19 +460,12 @@ lexerShmemCompose(LexerCtxShmem ctx,
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
-    __syncthreads();
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        st[i] = states[i * BLOCK_SIZE + threadIdx.x];
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        states[i * BLOCK_SIZE + threadIdx.x] = st[i];
 
     __syncthreads();
 
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-        I lid = i * BLOCK_SIZE + threadIdx.x;
+        I lid = threadIdx.x * ITEMS_PER_THREAD + i;
         I gid = glb_offs + lid;
         bool temp = false;
         if (gid < size) {
@@ -507,7 +490,7 @@ lexerShmemCompose(LexerCtxShmem ctx,
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
             I slot = prod[i] - 1 - idx_pfx;
-            I lid  = i * BLOCK_SIZE + threadIdx.x;
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             tok_stage[slot] = get_token(st[i]);
             lid_stage[slot] = (uint16_t) lid;
         }
@@ -624,19 +607,12 @@ lexerAlpaccImpl(CTX ctx,
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
-    __syncthreads();
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        st[i] = states[i * BLOCK_SIZE + threadIdx.x];
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        states[i * BLOCK_SIZE + threadIdx.x] = st[i];
 
     __syncthreads();
 
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-        I lid = i * BLOCK_SIZE + threadIdx.x;
+        I lid = threadIdx.x * ITEMS_PER_THREAD + i;
         I gid = glb_offs + lid;
         bool temp = false;
         if (gid < size) {
@@ -661,7 +637,7 @@ lexerAlpaccImpl(CTX ctx,
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
             I slot = prod[i] - 1 - idx_pfx;
-            I lid  = i * BLOCK_SIZE + threadIdx.x;
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             tok_stage[slot] = get_token(st[i]);
             lid_stage[slot] = (uint16_t) lid;
         }
@@ -808,13 +784,6 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
-    __syncthreads();
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        st[i] = states[i * BLOCK_SIZE + threadIdx.x];
-    #pragma unroll
-    for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        states[i * BLOCK_SIZE + threadIdx.x] = st[i];
 
     state_t last_state = st[ITEMS_PER_THREAD - 1];
 
@@ -822,7 +791,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
 
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
-        I lid = i * BLOCK_SIZE + threadIdx.x;
+        I lid = threadIdx.x * ITEMS_PER_THREAD + i;
         I gid = glb_offs + lid;
         bool temp = false;
         if (gid < size) {
@@ -845,7 +814,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
             I slot = prod[i] - 1 - idx_pfx;
-            I lid  = i * BLOCK_SIZE + threadIdx.x;
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             tok_stage[slot] = get_token(states[lid]);
         }
     }
@@ -856,7 +825,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     for (I i = 0; i < ITEMS_PER_THREAD; i++) {
         if ((is_produce_state >> i) & 1) {
             I slot = prod[i] - 1 - idx_pfx;
-            I lid  = i * BLOCK_SIZE + threadIdx.x;
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
             lid_stage[slot] = (uint16_t) lid;
         }
     }
@@ -1052,9 +1021,19 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD; \
     copyFromGlbToShr<state_t, I, ITEMS_PER_THREAD>( \
         glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE + 1, size, d_states_in, states); \
+    { \
+        state_t _tmp[ITEMS_PER_THREAD]; \
+        _Pragma("unroll") \
+        for (I i = 0; i < ITEMS_PER_THREAD; i++) \
+            _tmp[i] = states[i * BLOCK_SIZE + threadIdx.x]; \
+        _Pragma("unroll") \
+        for (I i = 0; i < ITEMS_PER_THREAD; i++) \
+            states[threadIdx.x * ITEMS_PER_THREAD + i] = _tmp[i]; \
+        __syncthreads(); \
+    } \
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
-        I lid = i * BLOCK_SIZE + threadIdx.x; \
+        I lid = threadIdx.x * ITEMS_PER_THREAD + i; \
         I gid = glb_offs + lid; \
         bool temp = false; \
         if (gid < size) { \
@@ -1072,7 +1051,7 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
         if ((is_produce_state >> i) & 1) { \
             I slot = prod[i] - 1 - idx_pfx; \
-            I lid  = i * BLOCK_SIZE + threadIdx.x; \
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i; \
             tok_stage[slot] = tokens[i]; \
         } \
     } \
@@ -1081,7 +1060,7 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
         if ((is_produce_state >> i) & 1) { \
             I slot = prod[i] - 1 - idx_pfx; \
-            I lid  = i * BLOCK_SIZE + threadIdx.x; \
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i; \
             lid_stage[slot] = (uint16_t) lid; \
         } \
     } \
