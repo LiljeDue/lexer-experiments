@@ -1258,6 +1258,47 @@ static inline size_t dynShmemBytesP2V2() {
 }
 
 // NREG1/NREG2: 64=maxnreg(64), 48=maxnreg(48), 0=no limit
+template<typename I, I BS1, I IPT1, uint32_t NREG1=64>
+static void launchLexerAlpaccShmemTwoPassV2P1(
+      LexerCtxShmem ctx,
+      uint8_t* d_in, state_t* d_states_glb,
+      volatile State<state_t>* state_states,
+      I size, I nlb1,
+      volatile uint32_t* dyn_index_ptr1, volatile bool* is_valid) {
+    void* kernel;
+    if      (NREG1 == 48) kernel = (void*) lexerAlpaccShmemTwoPassV2P1Nreg48<I, BS1, IPT1>;
+    else if (NREG1 == 0)  kernel = (void*) lexerAlpaccShmemTwoPassV2P1NregNone<I, BS1, IPT1>;
+    else                  kernel = (void*) lexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1>;
+    size_t shmem_bytes = dynShmemBytesP1V2<I, BS1, IPT1>();
+    gpuAssert(cudaFuncSetAttribute(kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
+    if      (NREG1 == 48) lexerAlpaccShmemTwoPassV2P1Nreg48<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
+        ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
+    else if (NREG1 == 0)  lexerAlpaccShmemTwoPassV2P1NregNone<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
+        ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
+    else                  lexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
+        ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
+}
+
+template<typename I, I BS2, I IPT2, uint32_t NREG2=64>
+static void launchLexerAlpaccShmemTwoPassV2P2(
+      state_t* d_states_glb,
+      uint32_t* d_index_out, token_t* d_token_out,
+      volatile State<I>* index_states,
+      I size, I nlb2,
+      volatile uint32_t* dyn_index_ptr2, volatile I* new_size) {
+    void* kernel;
+    if (NREG2 == 0) kernel = (void*) lexerAlpaccShmemTwoPassV2P2NregNone<I, BS2, IPT2>;
+    else            kernel = (void*) lexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2>;
+    size_t shmem_bytes = dynShmemBytesP2V2<I, BS2, IPT2>();
+    gpuAssert(cudaFuncSetAttribute(kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
+    if (NREG2 == 0) lexerAlpaccShmemTwoPassV2P2NregNone<I, BS2, IPT2><<<nlb2, BS2, shmem_bytes>>>(
+        d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
+    else            lexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2><<<nlb2, BS2, shmem_bytes>>>(
+        d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
+}
+
 template<typename I, I BS1, I IPT1, I BS2, I IPT2, uint32_t NREG1=64, uint32_t NREG2=64>
 static void launchLexerAlpaccShmemTwoPassV2(
       LexerCtxShmem ctx,
@@ -1267,34 +1308,11 @@ static void launchLexerAlpaccShmemTwoPassV2(
       volatile uint32_t* dyn_index_ptr1, volatile uint32_t* dyn_index_ptr2,
       volatile I* new_size, volatile bool* is_valid,
       state_t* d_states_glb) {
-    {
-        void* kernel;
-        if      (NREG1 == 48) kernel = (void*) lexerAlpaccShmemTwoPassV2P1Nreg48<I, BS1, IPT1>;
-        else if (NREG1 == 0)  kernel = (void*) lexerAlpaccShmemTwoPassV2P1NregNone<I, BS1, IPT1>;
-        else                  kernel = (void*) lexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1>;
-        size_t shmem_bytes = dynShmemBytesP1V2<I, BS1, IPT1>();
-        gpuAssert(cudaFuncSetAttribute(kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
-        if      (NREG1 == 48) lexerAlpaccShmemTwoPassV2P1Nreg48<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
-            ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
-        else if (NREG1 == 0)  lexerAlpaccShmemTwoPassV2P1NregNone<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
-            ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
-        else                  lexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
-            ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
-    }
+    launchLexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1, NREG1>(
+        ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid);
     gpuAssert(cudaDeviceSynchronize());
-    {
-        void* kernel;
-        if (NREG2 == 0) kernel = (void*) lexerAlpaccShmemTwoPassV2P2NregNone<I, BS2, IPT2>;
-        else            kernel = (void*) lexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2>;
-        size_t shmem_bytes = dynShmemBytesP2V2<I, BS2, IPT2>();
-        gpuAssert(cudaFuncSetAttribute(kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
-        if (NREG2 == 0) lexerAlpaccShmemTwoPassV2P2NregNone<I, BS2, IPT2><<<nlb2, BS2, shmem_bytes>>>(
-            d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
-        else            lexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2><<<nlb2, BS2, shmem_bytes>>>(
-            d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
-    }
+    launchLexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2, NREG2>(
+        d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
 }
 
 void testLexerShmemCompose(uint8_t* input,
@@ -1800,7 +1818,9 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
 
     LexerCtxShmem ctx = LexerCtxShmem();
 
-    float * temp = (float *) malloc(sizeof(float) * RUNS);
+    float* temp_total = (float*) malloc(sizeof(float) * RUNS);
+    float* temp_p1    = (float*) malloc(sizeof(float) * RUNS);
+    float* temp_p2    = (float*) malloc(sizeof(float) * RUNS);
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -1823,15 +1843,27 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     }
 
     for (I i = 0; i < RUNS; ++i) {
+        // Time P1
         cudaEventRecord(start, 0);
-        launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2, NREG1, NREG2>(
-            ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
-            size, NLB1, NLB2, d_dyn_index_ptr1, d_dyn_index_ptr2,
-            d_new_size, d_is_valid, d_states_glb);
-        cudaDeviceSynchronize();
+        launchLexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1, NREG1>(
+            ctx, d_in, d_states_glb, d_state_states,
+            size, NLB1, d_dyn_index_ptr1, d_is_valid);
+        gpuAssert(cudaDeviceSynchronize());
         cudaEventRecord(stop, 0);
         cudaEventSynchronize(stop);
-        cudaEventElapsedTime(temp + i, start, stop);
+        cudaEventElapsedTime(temp_p1 + i, start, stop);
+
+        // Time P2
+        cudaEventRecord(start, 0);
+        launchLexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2, NREG2>(
+            d_states_glb, d_index_out, d_token_out, d_index_states,
+            size, NLB2, d_dyn_index_ptr2, d_new_size);
+        gpuAssert(cudaDeviceSynchronize());
+        cudaEventRecord(stop, 0);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(temp_p2 + i, start, stop);
+
+        temp_total[i] = temp_p1[i] + temp_p2[i];
         reset();
         gpuAssert(cudaPeekAtLastError());
     }
@@ -1848,7 +1880,7 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     const I P2_BYTES = STATES_GLB_READ + OUT_WRITE;
 
     reset();
-    launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2>(
+    launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2, NREG1, NREG2>(
         ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
         size, NLB1, NLB2, d_dyn_index_ptr1, d_dyn_index_ptr2,
         d_new_size, d_is_valid, d_states_glb);
@@ -1885,12 +1917,17 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     }
 
     if (test_passes) {
-        printf("  P1: %uMiB  P2: %uMiB  total: %uMiB\n",
-               P1_BYTES >> 20, P2_BYTES >> 20, (P1_BYTES + P2_BYTES) >> 20);
-        compute_descriptors(temp, RUNS, P1_BYTES + P2_BYTES);
+        printf("  P1 (%uMiB): ", P1_BYTES >> 20);
+        compute_descriptors(temp_p1, RUNS, P1_BYTES);
+        printf("  P2 (%uMiB): ", P2_BYTES >> 20);
+        compute_descriptors(temp_p2, RUNS, P2_BYTES);
+        printf("  Total (%uMiB): ", (P1_BYTES + P2_BYTES) >> 20);
+        compute_descriptors(temp_total, RUNS, P1_BYTES + P2_BYTES);
     }
 
-    free(temp);
+    free(temp_total);
+    free(temp_p1);
+    free(temp_p2);
     gpuAssert(cudaFree(d_in));
     gpuAssert(cudaFree(d_token_out));
     gpuAssert(cudaFree(d_index_out));
@@ -2128,14 +2165,6 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 64, 64>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "2Pass V2 BS512/IPT44 P1nreg48 P2nreg64:");
     testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 48, 64>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS512/IPT44 P1nreg0  P2nreg64:");
-    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 0, 64>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS512/IPT44 P1nreg64 P2nreg0:");
-    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 64, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS512/IPT44 P1nreg48 P2nreg0:");
-    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 48, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS512/IPT44 P1nreg0  P2nreg0:");
-    testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
