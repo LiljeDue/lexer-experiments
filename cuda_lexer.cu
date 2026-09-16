@@ -1274,7 +1274,7 @@ static void launchLexerAlpaccShmemDynTwoPass(
             ctx, d_in, d_states_glb, d_next_state_glb, state_states,
             size, num_logical_blocks, dyn_index_ptr1, is_valid, IDENTITY);
     }
-    cudaDeviceSynchronize();
+    gpuAssert(cudaDeviceSynchronize());
     // Pass 2: index scan + scatter
     {
         auto kernel = lexerAlpaccShmemDynPass2<I, BLOCK_SIZE, ITEMS_PER_THREAD>;
@@ -1746,7 +1746,7 @@ void testLexerAlpaccShmemDynTwoPass(uint8_t* input,
     const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
     const I STATE_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<state_t>);
     const I INDEX_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<I>);
-    const I STATES_GLB_BYTES = size * sizeof(state_t);
+    const I STATES_GLB_BYTES = NUM_LOGICAL_BLOCKS * BLOCK_SIZE * ITEMS_PER_THREAD * sizeof(state_t);
     const I NEXT_STATE_GLB_BYTES = NUM_LOGICAL_BLOCKS * sizeof(state_t);
 #ifdef PROFILE
     const I WARMUP_RUNS = 1;
