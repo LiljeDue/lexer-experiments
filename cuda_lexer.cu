@@ -2045,6 +2045,16 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmemTwoPassV2<128, 44, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "2Pass V2 BS128/IPT64:");
     testLexerAlpaccShmemTwoPassV2<128, 64, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS256/IPT16:");
+    testLexerAlpaccShmemTwoPassV2<256, 16, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS256/IPT11:");
+    testLexerAlpaccShmemTwoPassV2<256, 11, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS256/IPT8:");
+    testLexerAlpaccShmemTwoPassV2<256, 8, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS512/IPT11:");
+    testLexerAlpaccShmemTwoPassV2<512, 11, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS512/IPT16:");
+    testLexerAlpaccShmemTwoPassV2<512, 16, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
