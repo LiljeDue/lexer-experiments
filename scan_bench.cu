@@ -63,6 +63,39 @@ __global__ void ourScanKernel(
     }
 }
 
+template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+__global__ void ourScanKernelStatic(
+    const uint32_t* __restrict__ d_in,
+    uint32_t* __restrict__ d_out,
+    ScanTileState<uint32_t> tile_state,
+    I n)
+{
+    using BlockScan = cub::BlockScan<uint32_t, BLOCK_SIZE>;
+    using PrefixOp  = TilePrefixCallbackOp<uint32_t, Add<I>>;
+
+    __shared__ typename BlockScan::TempStorage scan_storage;
+    __shared__ typename PrefixOp::TempStorage  prefix_storage;
+
+    I tile_idx = blockIdx.x;
+    I glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+
+    uint32_t items[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+        I gid = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i;
+        items[i] = gid < n ? d_in[gid] : 0;
+    }
+
+    PrefixOp prefix_op(tile_state, prefix_storage, Add<I>(), (int)tile_idx, uint32_t(0));
+    BlockScan(scan_storage).InclusiveScan(items, items, Add<I>(), prefix_op);
+
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+        I gid = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i;
+        if (gid < n) d_out[gid] = items[i];
+    }
+}
+
 // Kernel to fill d_in with a simple pattern (all ones) for easy verification
 __global__ void fillOnes(uint32_t* d, uint32_t n) {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -105,8 +138,9 @@ int main() {
     cudaEvent_t start, stop;
     gpuAssert(cudaEventCreate(&start));
     gpuAssert(cudaEventCreate(&stop));
-    float* times_cub  = (float*)malloc(sizeof(float) * RUNS);
-    float* times_ours = (float*)malloc(sizeof(float) * RUNS);
+    float* times_cub    = (float*)malloc(sizeof(float) * RUNS);
+    float* times_ours   = (float*)malloc(sizeof(float) * RUNS);
+    float* times_static = (float*)malloc(sizeof(float) * RUNS);
 
     // Warmup CUB
     for (int i = 0; i < WARMUP; i++) {
@@ -153,14 +187,41 @@ int main() {
         gpuAssert(cudaEventElapsedTime(&times_ours[i], start, stop));
     }
 
+    // --- Our scan (static blockIdx.x) ---
+    uint32_t* d_out_static;
+    gpuAssert(cudaMalloc(&d_out_static, BYTES));
+
+    auto reset_static = [&]() { initScanTileState(tile_state, (int)NLB); };
+
+    for (int i = 0; i < WARMUP; i++) {
+        reset_static();
+        ourScanKernelStatic<I, BLOCK_SIZE, ITEMS_PER_THREAD>
+            <<<NLB, BLOCK_SIZE>>>(d_in, d_out_static, tile_state, N);
+        gpuAssert(cudaDeviceSynchronize());
+    }
+    for (int i = 0; i < RUNS; i++) {
+        reset_static();
+        gpuAssert(cudaEventRecord(start));
+        ourScanKernelStatic<I, BLOCK_SIZE, ITEMS_PER_THREAD>
+            <<<NLB, BLOCK_SIZE>>>(d_in, d_out_static, tile_state, N);
+        gpuAssert(cudaEventRecord(stop));
+        gpuAssert(cudaEventSynchronize(stop));
+        gpuAssert(cudaEventElapsedTime(&times_static[i], start, stop));
+    }
+
     // Verify
-    std::vector<uint32_t> h_cub(N), h_ours(N);
-    gpuAssert(cudaMemcpy(h_cub.data(),  d_out_cub,  BYTES, cudaMemcpyDeviceToHost));
-    gpuAssert(cudaMemcpy(h_ours.data(), d_out_ours, BYTES, cudaMemcpyDeviceToHost));
+    std::vector<uint32_t> h_cub(N), h_ours(N), h_static(N);
+    gpuAssert(cudaMemcpy(h_cub.data(),    d_out_cub,    BYTES, cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(h_ours.data(),   d_out_ours,   BYTES, cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(h_static.data(), d_out_static, BYTES, cudaMemcpyDeviceToHost));
     bool ok = true;
     for (I i = 0; i < N && ok; i++) {
         if (h_cub[i] != h_ours[i]) {
-            printf("MISMATCH at i=%u: cub=%d ours=%d\n", i, h_cub[i], h_ours[i]);
+            printf("MISMATCH (dynamic) at i=%u: cub=%u ours=%u\n", i, h_cub[i], h_ours[i]);
+            ok = false;
+        }
+        if (h_cub[i] != h_static[i]) {
+            printf("MISMATCH (static) at i=%u: cub=%u ours=%u\n", i, h_cub[i], h_static[i]);
             ok = false;
         }
     }
@@ -169,11 +230,15 @@ int main() {
     // Report (2*BYTES = read + write)
     printf(PAD, "CUB DeviceScan::InclusiveSum:");
     compute_descriptors(times_cub, RUNS, 2 * BYTES);
-    printf(PAD, "Our TilePrefixCallbackOp:");
+    printf(PAD, "Our TilePrefixCallbackOp (dynamic):");
     compute_descriptors(times_ours, RUNS, 2 * BYTES);
+    printf(PAD, "Our TilePrefixCallbackOp (static):");
+    compute_descriptors(times_static, RUNS, 2 * BYTES);
 
     free(times_cub);
     free(times_ours);
+    free(times_static);
+    gpuAssert(cudaFree(d_out_static));
     gpuAssert(cudaFree(d_in));
     gpuAssert(cudaFree(d_out_ours));
     gpuAssert(cudaFree(d_out_cub));
