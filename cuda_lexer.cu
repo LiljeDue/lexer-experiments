@@ -1838,13 +1838,14 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
 
     I temp_size = 0;
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
-    const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
-    const I IN_READ = IN_ARRAY_BYTES;
-    const I IN_STATE_MAP = sizeof(state_t) * 256 * NLB1;
-    const I COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NLB1;
-    const I STATES_GLB_WRITE = STATES_GLB_BYTES;
-    // Pass 2 reads IPT*BS+1 per block but clamped to size; approximate as size.
-    const I STATES_GLB_READ = STATES_GLB_BYTES;
+    const I OUT_WRITE       = temp_size * (sizeof(I) + sizeof(token_t));
+    const I IN_READ         = IN_ARRAY_BYTES;                                    // P1: input bytes
+    const I IN_STATE_MAP    = sizeof(state_t) * 256 * NLB1;                     // P1: to_state table
+    const I COMPOSE_READ    = sizeof(state_t) * NUM_STATES * NUM_STATES * NLB1; // P1: compose table
+    const I STATES_GLB_WRITE = STATES_GLB_BYTES;                                // P1: state array write
+    const I STATES_GLB_READ  = STATES_GLB_BYTES;                                // P2: state array read (approx size)
+    const I P1_BYTES = IN_READ + IN_STATE_MAP + COMPOSE_READ + STATES_GLB_WRITE;
+    const I P2_BYTES = STATES_GLB_READ + OUT_WRITE;
 
     reset();
     launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2>(
@@ -1884,10 +1885,9 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     }
 
     if (test_passes) {
-        compute_descriptors(temp, RUNS,
-            IN_READ + IN_STATE_MAP + COMPOSE_READ +
-            STATES_GLB_WRITE + STATES_GLB_READ +
-            OUT_WRITE);
+        printf("  P1: %uMiB  P2: %uMiB  total: %uMiB\n",
+               P1_BYTES >> 20, P2_BYTES >> 20, (P1_BYTES + P2_BYTES) >> 20);
+        compute_descriptors(temp, RUNS, P1_BYTES + P2_BYTES);
     }
 
     free(temp);
