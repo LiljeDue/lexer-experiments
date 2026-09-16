@@ -221,6 +221,34 @@ copyFromShrToGlb(
     __syncthreads();
 }
 
+// Convert register array from striped to blocked layout using shmem as scratch.
+// shmem must be at least ITEMS_PER_THREAD*BLOCK_SIZE elements of type T.
+template<typename T, typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+__device__ inline void
+stripedToBlocked(T (&regs)[ITEMS_PER_THREAD], volatile T* shmem) {
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++)
+        shmem[i * BLOCK_SIZE + threadIdx.x] = regs[i];
+    __syncthreads();
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++)
+        regs[i] = shmem[threadIdx.x * ITEMS_PER_THREAD + i];
+    __syncthreads();
+}
+
+// Convert register array from blocked to striped layout using shmem as scratch.
+template<typename T, typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+__device__ inline void
+blockedToStriped(T (&regs)[ITEMS_PER_THREAD], volatile T* shmem) {
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++)
+        shmem[threadIdx.x * ITEMS_PER_THREAD + i] = regs[i];
+    __syncthreads();
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++)
+        regs[i] = shmem[i * BLOCK_SIZE + threadIdx.x];
+    __syncthreads();
+}
 
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
@@ -963,13 +991,7 @@ static void launchLexerAlpaccShmemDyn(
         st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i]; \
     PrefixOpState prefix_op(state_states, prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY)); \
     BlockScanState(temp_storage).InclusiveScan(st, st, ctx, prefix_op); \
-    _Pragma("unroll") \
-    for (I i = 0; i < ITEMS_PER_THREAD; i++) \
-        states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i]; \
-    __syncthreads(); \
-    _Pragma("unroll") \
-    for (I i = 0; i < ITEMS_PER_THREAD; i++) \
-        st[i] = states[i * BLOCK_SIZE + threadIdx.x]; \
+    blockedToStriped<state_t, I, BLOCK_SIZE, ITEMS_PER_THREAD>(st, states); \
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) \
         states[i * BLOCK_SIZE + threadIdx.x] = st[i]; \
@@ -1014,26 +1036,19 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     volatile state_t*  states    = (volatile state_t*)  shmem_buf; \
     volatile uint16_t* lid_stage = (volatile uint16_t*) shmem_buf; \
     volatile uint8_t*  tok_stage = shmem_buf + ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(uint16_t); \
+    __shared__ I _prod_shr[ITEMS_PER_THREAD * BLOCK_SIZE]; \
     token_t tokens[ITEMS_PER_THREAD]; \
     I       prod[ITEMS_PER_THREAD]; \
     uint64_t is_produce_state = 0; \
+    I idx_pfx  = 0; \
+    I prod_agg = 0; \
     uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr); \
     I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD; \
     copyFromGlbToShr<state_t, I, ITEMS_PER_THREAD>( \
         glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE + 1, size, d_states_in, states); \
-    { \
-        state_t _tmp[ITEMS_PER_THREAD]; \
-        _Pragma("unroll") \
-        for (I i = 0; i < ITEMS_PER_THREAD; i++) \
-            _tmp[i] = states[i * BLOCK_SIZE + threadIdx.x]; \
-        _Pragma("unroll") \
-        for (I i = 0; i < ITEMS_PER_THREAD; i++) \
-            states[threadIdx.x * ITEMS_PER_THREAD + i] = _tmp[i]; \
-        __syncthreads(); \
-    } \
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
-        I lid = threadIdx.x * ITEMS_PER_THREAD + i; \
+        I lid = i * BLOCK_SIZE + threadIdx.x; \
         I gid = glb_offs + lid; \
         bool temp = false; \
         if (gid < size) { \
@@ -1043,15 +1058,19 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
         is_produce_state |= (uint64_t)temp << i; \
         prod[i] = (I)temp; \
     } \
-    PrefixOpIdx prefix_op(index_states, prefix_storage, Add<I>(), (int)dyn_index, I(0)); \
-    BlockScanI(temp_storage).InclusiveScan(prod, prod, Add<I>(), prefix_op); \
-    I idx_pfx = prefix_op.GetExclusivePrefix(); \
-    I prod_agg = prefix_op.GetBlockAggregate(); \
+    stripedToBlocked<I, I, BLOCK_SIZE, ITEMS_PER_THREAD>(prod, _prod_shr); \
+    { \
+        PrefixOpIdx prefix_op(index_states, prefix_storage, Add<I>(), (int)dyn_index, I(0)); \
+        BlockScanI(temp_storage).InclusiveScan(prod, prod, Add<I>(), prefix_op); \
+        idx_pfx  = prefix_op.GetExclusivePrefix(); \
+        prod_agg = prefix_op.GetBlockAggregate(); \
+    } \
+    blockedToStriped<I, I, BLOCK_SIZE, ITEMS_PER_THREAD>(prod, _prod_shr); \
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
         if ((is_produce_state >> i) & 1) { \
             I slot = prod[i] - 1 - idx_pfx; \
-            I lid  = threadIdx.x * ITEMS_PER_THREAD + i; \
+            I lid  = i * BLOCK_SIZE + threadIdx.x; \
             tok_stage[slot] = tokens[i]; \
         } \
     } \
@@ -1060,7 +1079,7 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
         if ((is_produce_state >> i) & 1) { \
             I slot = prod[i] - 1 - idx_pfx; \
-            I lid  = threadIdx.x * ITEMS_PER_THREAD + i; \
+            I lid  = i * BLOCK_SIZE + threadIdx.x; \
             lid_stage[slot] = (uint16_t) lid; \
         } \
     } \
