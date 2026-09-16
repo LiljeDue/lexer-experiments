@@ -1712,11 +1712,29 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     const I P2_BYTES = STATES_GLB_READ + OUT_WRITE;
 
     reset();
-    launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2, NREG1, NREG2>(
-        ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
-        size, NLB1, NLB2, d_dyn_index_ptr1, d_dyn_index_ptr2,
-        d_new_size, d_is_valid, d_states_glb);
-    cudaDeviceSynchronize();
+    // Run P1 only, then dump states around P1 tile boundaries before running P2
+    launchLexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1, NREG1>(
+        ctx, d_in, d_states_glb, d_state_states, size, NLB1, d_dyn_index_ptr1, d_is_valid);
+    gpuAssert(cudaDeviceSynchronize());
+    {
+        const I P1_TILE = BS1 * IPT1;
+        std::vector<state_t> h_states_probe(10);
+        printf("  P1 states around tile boundaries (BS1=%u IPT1=%u tile=%u):\n", (unsigned)BS1, (unsigned)IPT1, (unsigned)P1_TILE);
+        for (int tb = 1; tb <= 3 && (I)(tb * P1_TILE) < size; tb++) {
+            I base = tb * P1_TILE - 2;
+            gpuAssert(cudaMemcpy(h_states_probe.data(), d_states_glb + base,
+                                 10 * sizeof(state_t), cudaMemcpyDeviceToHost));
+            printf("    tile %d boundary (pos %u..%u):", tb, base, base+9);
+            for (int k = 0; k < 10; k++)
+                printf(" %u%s", (unsigned)h_states_probe[k],
+                       (k==1) ? "|" : "");  // | marks the tile boundary
+            printf("\n");
+        }
+    }
+    launchLexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2, NREG2>(
+        d_states_glb, d_index_out, d_token_out, d_index_states,
+        size, NLB2, d_dyn_index_ptr2, d_new_size);
+    gpuAssert(cudaDeviceSynchronize());
     gpuAssert(cudaPeekAtLastError());
     bool is_valid = false;
     gpuAssert(cudaMemcpy(h_index_out.data(), d_index_out, INDEX_OUT_ARRAY_BYTES, cudaMemcpyDeviceToHost));
