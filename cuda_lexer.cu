@@ -1279,33 +1279,36 @@ static inline size_t dynShmemBytesP2V2() {
     return (size_t) ITEMS_PER_THREAD * BLOCK_SIZE * 3 + 2;
 }
 
-template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+// Pass 1 and pass 2 have independent BS/IPT: they tile the same `size`-element
+// array independently, each with their own dynamic index counter and lookback
+// state array.
+template<typename I, I BS1, I IPT1, I BS2, I IPT2>
 static void launchLexerAlpaccShmemTwoPassV2(
       LexerCtxShmem ctx,
       uint8_t* d_in, uint32_t* d_index_out, token_t* d_token_out,
       volatile State<state_t>* state_states, volatile State<I>* index_states,
-      I size, I num_logical_blocks,
+      I size, I nlb1, I nlb2,
       volatile uint32_t* dyn_index_ptr1, volatile uint32_t* dyn_index_ptr2,
       volatile I* new_size, volatile bool* is_valid,
       state_t* d_states_glb) {
     {
-        auto kernel = lexerAlpaccShmemTwoPassV2P1<I, BLOCK_SIZE, ITEMS_PER_THREAD>;
-        size_t shmem_bytes = dynShmemBytesP1V2<I, BLOCK_SIZE, ITEMS_PER_THREAD>();
+        auto kernel = lexerAlpaccShmemTwoPassV2P1<I, BS1, IPT1>;
+        size_t shmem_bytes = dynShmemBytesP1V2<I, BS1, IPT1>();
         gpuAssert(cudaFuncSetAttribute(kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
-        kernel<<<num_logical_blocks, BLOCK_SIZE, shmem_bytes>>>(
+        kernel<<<nlb1, BS1, shmem_bytes>>>(
             ctx, d_in, d_states_glb, state_states,
-            size, num_logical_blocks, dyn_index_ptr1, is_valid, IDENTITY);
+            size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
     }
     gpuAssert(cudaDeviceSynchronize());
     {
-        auto kernel = lexerAlpaccShmemTwoPassV2P2<I, BLOCK_SIZE, ITEMS_PER_THREAD>;
-        size_t shmem_bytes = dynShmemBytesP2V2<I, BLOCK_SIZE, ITEMS_PER_THREAD>();
+        auto kernel = lexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2>;
+        size_t shmem_bytes = dynShmemBytesP2V2<I, BS2, IPT2>();
         gpuAssert(cudaFuncSetAttribute(kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
-        kernel<<<num_logical_blocks, BLOCK_SIZE, shmem_bytes>>>(
+        kernel<<<nlb2, BS2, shmem_bytes>>>(
             d_states_glb, d_index_out, d_token_out, index_states,
-            size, num_logical_blocks, dyn_index_ptr2, new_size);
+            size, nlb2, dyn_index_ptr2, new_size);
     }
 }
 
@@ -1755,7 +1758,7 @@ void testLexerAlpaccShmemDyn(uint8_t* input,
 }
 
 
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+template<uint32_t BS1, uint32_t IPT1, uint32_t BS2, uint32_t IPT2>
 void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
                size_t input_size,
                uint32_t* expected_indices,
@@ -1763,12 +1766,13 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
                size_t expected_size) {
     using I = uint32_t;
     const I size = input_size;
-    const I NUM_LOGICAL_BLOCKS = (size + BLOCK_SIZE * ITEMS_PER_THREAD - 1) / (BLOCK_SIZE * ITEMS_PER_THREAD);
+    const I NLB1 = (size + BS1 * IPT1 - 1) / (BS1 * IPT1);
+    const I NLB2 = (size + BS2 * IPT2 - 1) / (BS2 * IPT2);
     const I IN_ARRAY_BYTES = size * sizeof(uint8_t);
     const I INDEX_OUT_ARRAY_BYTES = size * sizeof(I);
     const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
-    const I STATE_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<state_t>);
-    const I INDEX_STATES_BYTES = NUM_LOGICAL_BLOCKS * sizeof(State<I>);
+    const I STATE_STATES_BYTES = NLB1 * sizeof(State<state_t>);
+    const I INDEX_STATES_BYTES = NLB2 * sizeof(State<I>);
     // Pass 1 writes exactly `size` states; pass 2 reads `size+1` (the +1 is
     // clamped to `size-1` by copyFromGlbToShr's bounds check).
     const I STATES_GLB_BYTES = size * sizeof(state_t);
@@ -1823,9 +1827,9 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     };
 
     for (I i = 0; i < WARMUP_RUNS; ++i) {
-        launchLexerAlpaccShmemTwoPassV2<I, BLOCK_SIZE, ITEMS_PER_THREAD>(
+        launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2>(
             ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
-            size, NUM_LOGICAL_BLOCKS, d_dyn_index_ptr1, d_dyn_index_ptr2,
+            size, NLB1, NLB2, d_dyn_index_ptr1, d_dyn_index_ptr2,
             d_new_size, d_is_valid, d_states_glb);
         cudaDeviceSynchronize();
         reset();
@@ -1834,9 +1838,9 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
 
     for (I i = 0; i < RUNS; ++i) {
         cudaEventRecord(start, 0);
-        launchLexerAlpaccShmemTwoPassV2<I, BLOCK_SIZE, ITEMS_PER_THREAD>(
+        launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2>(
             ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
-            size, NUM_LOGICAL_BLOCKS, d_dyn_index_ptr1, d_dyn_index_ptr2,
+            size, NLB1, NLB2, d_dyn_index_ptr1, d_dyn_index_ptr2,
             d_new_size, d_is_valid, d_states_glb);
         cudaDeviceSynchronize();
         cudaEventRecord(stop, 0);
@@ -1850,16 +1854,16 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
     const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
     const I IN_READ = IN_ARRAY_BYTES;
-    const I IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
-    const I COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
+    const I IN_STATE_MAP = sizeof(state_t) * 256 * NLB1;
+    const I COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NLB1;
     const I STATES_GLB_WRITE = STATES_GLB_BYTES;
     // Pass 2 reads IPT*BS+1 per block but clamped to size; approximate as size.
     const I STATES_GLB_READ = STATES_GLB_BYTES;
 
     reset();
-    launchLexerAlpaccShmemTwoPassV2<I, BLOCK_SIZE, ITEMS_PER_THREAD>(
+    launchLexerAlpaccShmemTwoPassV2<I, BS1, IPT1, BS2, IPT2>(
         ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
-        size, NUM_LOGICAL_BLOCKS, d_dyn_index_ptr1, d_dyn_index_ptr2,
+        size, NLB1, NLB2, d_dyn_index_ptr1, d_dyn_index_ptr2,
         d_new_size, d_is_valid, d_states_glb);
     cudaDeviceSynchronize();
     gpuAssert(cudaPeekAtLastError());
@@ -2134,8 +2138,22 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024 IPT=44:");
     testLexerAlpaccShmemDyn<1024, 44>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Lexer Alpacc Shmem 2Pass V2 BS1024 IPT=44:");
-    testLexerAlpaccShmemTwoPassV2<1024, 44>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS1024/IPT44 P2=BS576/IPT14:");
+    testLexerAlpaccShmemTwoPassV2<1024, 44, 576, 14>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS576/IPT14 P2=BS576/IPT14:");
+    testLexerAlpaccShmemTwoPassV2<576, 14, 576, 14>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS1024/IPT14 P2=BS576/IPT14:");
+    testLexerAlpaccShmemTwoPassV2<1024, 14, 576, 14>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS576/IPT30 P2=BS576/IPT14:");
+    testLexerAlpaccShmemTwoPassV2<576, 30, 576, 14>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS1024/IPT44 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<1024, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS576/IPT14 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<576, 14, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS1024/IPT14 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<1024, 14, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS576/IPT30 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<576, 30, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
