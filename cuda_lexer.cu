@@ -991,10 +991,9 @@ static void launchLexerAlpaccShmemDyn(
         st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i]; \
     PrefixOpState prefix_op(state_states, prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY)); \
     BlockScanState(temp_storage).InclusiveScan(st, st, ctx, prefix_op); \
-    blockedToStriped<state_t, I, BLOCK_SIZE, ITEMS_PER_THREAD>(st, states); \
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) \
-        states[i * BLOCK_SIZE + threadIdx.x] = st[i]; \
+        states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i]; \
     __syncthreads(); \
     copyFromShrToGlb<state_t, I, ITEMS_PER_THREAD>( \
         glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE, size, states, d_states_out); \
