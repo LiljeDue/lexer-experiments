@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cub/cub.cuh>
 
 const uint8_t LG_WARP = 5;
 const uint8_t WARP = 1 << LG_WARP;
@@ -7,12 +8,13 @@ const uint8_t WARP = 1 << LG_WARP;
 // Number of padding entries prepended to the tile state array.
 // Threads in block 0 look back at indices tile_idx - threadIdx.x - 1,
 // which for threadIdx.x up to WARP-1 gives indices as low as -WARP.
-// Padding these with SCAN_TILE_INCLUSIVE (OOB) means the lookback
-// terminates immediately for block 0 without any special-casing.
+// Padding these with SCAN_TILE_OOB means WaitForValid returns immediately
+// (status != INVALID), and TailSegmentedReduce treats them as partial
+// aggregates with value=identity (stop flag only set on INCLUSIVE).
 const uint32_t TILE_STATUS_PADDING = WARP;
 
 enum ScanTileStatus : uint32_t {
-    SCAN_TILE_OOB       = 0,  // padding: acts as inclusive prefix of identity
+    SCAN_TILE_OOB       = 0,  // out-of-bounds padding
     SCAN_TILE_INVALID   = 1,  // not yet published
     SCAN_TILE_PARTIAL   = 2,  // aggregate published, prefix not yet known
     SCAN_TILE_INCLUSIVE = 3,  // inclusive prefix published
@@ -73,8 +75,6 @@ __device__ __forceinline__ TxnWord load_relaxed(const TxnWord* ptr) {
 // ---------------------------------------------------------------------------
 // ScanTileState<T>: per-tile state array with padding.
 // Allocated as (num_tiles + TILE_STATUS_PADDING) TxnWords.
-// Padding entries are initialised to SCAN_TILE_OOB so that the lookback
-// in block 0 terminates immediately.
 // ---------------------------------------------------------------------------
 template<typename T>
 struct ScanTileState {
@@ -129,13 +129,21 @@ struct ScanTileState {
 // ---------------------------------------------------------------------------
 // TilePrefixCallbackOp: CUB-style prefix callback used with BlockScan.
 // Called by BlockScan on the first warp only. Each thread looks back at
-// predecessor tile_idx - threadIdx.x - 1. A WarpReduce with tail-segment
-// flag combines the window. The window slides back by WARP until a
-// SCAN_TILE_INCLUSIVE is found.
+// predecessor tile_idx - threadIdx.x - 1. cub::WarpReduce::TailSegmentedReduce
+// (shuffle-based, no __syncwarp) combines the window. The window slides back
+// by WARP until a SCAN_TILE_INCLUSIVE is found.
+//
+// OOB padding entries have status=SCAN_TILE_OOB (not INCLUSIVE), so the while
+// loop stops only on INCLUSIVE — matching CUB's single_pass_scan_operators.
+// OOB values are T() (zero). For block 0's predecessors, the TailSegmentedReduce
+// accumulates these zero values until the while loop terminates when the warp
+// reaches no INCLUSIVE tiles at all (all OOB) — but the identity field is used
+// to seed an artificial INCLUSIVE at the OOB boundary instead.
 // ---------------------------------------------------------------------------
 template<typename T, typename ScanOpT>
 struct TilePrefixCallbackOp {
-    using StatusWord = typename ScanTileState<T>::StatusWord;
+    using StatusWord  = typename ScanTileState<T>::StatusWord;
+    using WarpReduceT = cub::WarpReduce<T, WARP>;
 
     ScanTileState<T>& tile_state;
     ScanOpT           scan_op;
@@ -144,10 +152,8 @@ struct TilePrefixCallbackOp {
     T                 exclusive_prefix;
     T                 inclusive_prefix;
 
-    // Temporary storage for warp reduce.
     struct TempStorage {
-        T   warp_vals[WARP];
-        int warp_flags[WARP];
+        typename WarpReduceT::TempStorage warp_reduce;
         T   exclusive_prefix;
         T   inclusive_prefix;
         T   block_aggregate;
@@ -168,94 +174,55 @@ struct TilePrefixCallbackOp {
         , temp_storage(temp_storage)
     {}
 
+    // Scan one window of WARP predecessor tiles. Returns the window aggregate
+    // (combined value from the rightmost INCLUSIVE/OOB tile through lane 0),
+    // and sets predecessor_status to this lane's tile status.
+    __device__ __forceinline__ T
+    ProcessWindow(int predecessor_idx, StatusWord& predecessor_status) {
+        T value;
+        tile_state.WaitForValid(predecessor_idx, predecessor_status, value);
+
+        // OOB acts like identity: not a stop flag here, but contributes identity value.
+        // Only INCLUSIVE is the stop flag for TailSegmentedReduce.
+        // For block 0 (all OOB predecessors), the while loop below never fires
+        // (because __all_sync(!= INCLUSIVE) would be true forever), BUT
+        // we handle block 0 specially: treat OOB as INCLUSIVE with identity value.
+        int is_oob    = (predecessor_status == StatusWord(SCAN_TILE_OOB));
+        int tail_flag = (predecessor_status == StatusWord(SCAN_TILE_INCLUSIVE)) | is_oob;
+        T   eff_value = is_oob ? identity : value;
+
+        // TailSegmentedReduce combines from the rightmost tail_flag lane toward lane 0.
+        // Uses shuffle instructions — no shared memory, no __syncwarp needed.
+        return WarpReduceT(temp_storage.warp_reduce)
+                   .TailSegmentedReduce(eff_value, tail_flag, scan_op);
+    }
+
     // Called by BlockScan with the block aggregate; returns exclusive prefix.
     __device__ __forceinline__ T operator()(T block_aggregate) {
-        // Thread 0 publishes partial aggregate.
         if (threadIdx.x == 0) {
             temp_storage.block_aggregate = block_aggregate;
             tile_state.SetPartial(tile_idx, block_aggregate);
         }
 
-        // All 32 warp threads look back at their predecessor window simultaneously.
         int predecessor_idx = tile_idx - threadIdx.x - 1;
+        StatusWord predecessor_status;
 
-        StatusWord pred_status;
-        T          pred_value;
-        tile_state.WaitForValid(predecessor_idx, pred_status, pred_value);
+        exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status);
 
-        // OOB padding acts as identity: treat it as a stop (like INCLUSIVE) with
-        // the scan identity as the effective value.
-        int is_oob    = (pred_status == StatusWord(SCAN_TILE_OOB));
-        int tail_flag = (pred_status == StatusWord(SCAN_TILE_INCLUSIVE)) | is_oob;
-        T   eff_value = is_oob ? identity : pred_value;
-        temp_storage.warp_vals[threadIdx.x]  = eff_value;
-        temp_storage.warp_flags[threadIdx.x] = tail_flag;
-        __syncwarp();
-
-        // Right-to-left tail-segmented scan: lane k covers tile (tile_idx-k-1).
-        // Lower lanes are CLOSER predecessors. We scan from lane WARP-1 towards
-        // lane 0, reading from t+offset, so each lane accumulates its closer
-        // neighbors. After the scan, warp_vals[0] holds the combined value from
-        // the nearest INCLUSIVE/OOB lane down to lane 0 (exclusive prefix for
-        // this tile).
-        T running = eff_value;
-        #pragma unroll
-        for (int offset = 1; offset < WARP; offset <<= 1) {
-            if (threadIdx.x + offset < WARP) {
-                int   src_flag = temp_storage.warp_flags[threadIdx.x + offset];
-                T     src_val  = temp_storage.warp_vals[threadIdx.x + offset];
-                if (!temp_storage.warp_flags[threadIdx.x]) {
-                    running = scan_op(src_val, running);
-                    temp_storage.warp_flags[threadIdx.x] = src_flag;
-                }
-                temp_storage.warp_vals[threadIdx.x] = running;
-            }
-            __syncwarp();
-        }
-
-        // The exclusive prefix is in lane 0 of the warp-scan result from the
-        // window. But we may need to slide the window further back.
-        exclusive_prefix = temp_storage.warp_vals[0];
-
-        // Continue sliding back only while no lane has found INCLUSIVE or OOB.
-        while (__all_sync(0xffffffff, pred_status != StatusWord(SCAN_TILE_INCLUSIVE)
-                                   && pred_status != StatusWord(SCAN_TILE_OOB))) {
+        // Slide window back until we find an INCLUSIVE tile (or hit all-OOB).
+        while (__all_sync(0xffffffff, predecessor_status != StatusWord(SCAN_TILE_INCLUSIVE)
+                                   && predecessor_status != StatusWord(SCAN_TILE_OOB))) {
             predecessor_idx -= WARP;
-            tile_state.WaitForValid(predecessor_idx, pred_status, pred_value);
-
-            is_oob    = (pred_status == StatusWord(SCAN_TILE_OOB));
-            tail_flag = (pred_status == StatusWord(SCAN_TILE_INCLUSIVE)) | is_oob;
-            eff_value = is_oob ? identity : pred_value;
-            temp_storage.warp_vals[threadIdx.x]  = eff_value;
-            temp_storage.warp_flags[threadIdx.x] = tail_flag;
-            __syncwarp();
-
-            running = eff_value;
-            #pragma unroll
-            for (int offset = 1; offset < WARP; offset <<= 1) {
-                if (threadIdx.x + offset < WARP) {
-                    int   src_flag = temp_storage.warp_flags[threadIdx.x + offset];
-                    T     src_val  = temp_storage.warp_vals[threadIdx.x + offset];
-                    if (!temp_storage.warp_flags[threadIdx.x]) {
-                        running = scan_op(src_val, running);
-                        temp_storage.warp_flags[threadIdx.x] = src_flag;
-                    }
-                    temp_storage.warp_vals[threadIdx.x] = running;
-                }
-                __syncwarp();
-            }
-
-            exclusive_prefix = scan_op(temp_storage.warp_vals[0], exclusive_prefix);
+            T window_agg = ProcessWindow(predecessor_idx, predecessor_status);
+            exclusive_prefix = scan_op(window_agg, exclusive_prefix);
         }
 
-        // Thread 0 publishes inclusive prefix.
         if (threadIdx.x == 0) {
             inclusive_prefix = scan_op(exclusive_prefix, block_aggregate);
             tile_state.SetInclusive(tile_idx, inclusive_prefix);
             temp_storage.exclusive_prefix = exclusive_prefix;
             temp_storage.inclusive_prefix = inclusive_prefix;
         }
-        __syncwarp();
 
         return temp_storage.exclusive_prefix;
     }
@@ -309,4 +276,3 @@ shmemToGlbCpy(const I glb_offs,
     }
     __syncthreads();
 }
-
