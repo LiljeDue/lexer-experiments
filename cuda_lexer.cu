@@ -2138,14 +2138,14 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024 IPT=44:");
     testLexerAlpaccShmemDyn<1024, 44>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS992/IPT20 P2=BS576/IPT14:");
-    testLexerAlpaccShmemTwoPassV2<992, 20, 576, 14>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS992/IPT32 P2=BS576/IPT14:");
-    testLexerAlpaccShmemTwoPassV2<992, 32, 576, 14>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS992/IPT44 P2=BS576/IPT14:");
-    testLexerAlpaccShmemTwoPassV2<992, 44, 576, 14>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 P1=BS512/IPT44 P2=BS576/IPT14:");
-    testLexerAlpaccShmemTwoPassV2<512, 44, 576, 14>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS256/IPT44 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<256, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS320/IPT44 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<320, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS384/IPT44 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<384, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 P1=BS448/IPT44 P2=BS256/IPT18:");
+    testLexerAlpaccShmemTwoPassV2<448, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "2Pass V2 P1=BS512/IPT44 P2=BS256/IPT18:");
     testLexerAlpaccShmemTwoPassV2<512, 44, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
