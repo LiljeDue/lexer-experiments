@@ -1870,13 +1870,12 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
 
     I temp_size = 0;
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
-    const I OUT_WRITE       = temp_size * (sizeof(I) + sizeof(token_t));
-    const I IN_READ         = IN_ARRAY_BYTES;                                    // P1: input bytes
-    const I IN_STATE_MAP    = sizeof(state_t) * 256 * NLB1;                     // P1: to_state table
-    const I COMPOSE_READ    = sizeof(state_t) * NUM_STATES * NUM_STATES * NLB1; // P1: compose table
-    const I STATES_GLB_WRITE = STATES_GLB_BYTES;                                // P1: state array write
-    const I STATES_GLB_READ  = STATES_GLB_BYTES;                                // P2: state array read (approx size)
-    const I P1_BYTES = IN_READ + IN_STATE_MAP + COMPOSE_READ + STATES_GLB_WRITE;
+    const I OUT_WRITE        = temp_size * (sizeof(I) + sizeof(token_t));
+    const I IN_READ          = IN_ARRAY_BYTES;      // P1: 1B per input element
+    const I STATES_GLB_WRITE = STATES_GLB_BYTES;    // P1: 2B per input element written
+    const I STATES_GLB_READ  = STATES_GLB_BYTES;    // P2: 2B per input element read
+    // to_state (512B) and compose table (2KB) are tiny and hit L2 after first block
+    const I P1_BYTES = IN_READ + STATES_GLB_WRITE;
     const I P2_BYTES = STATES_GLB_READ + OUT_WRITE;
 
     reset();
