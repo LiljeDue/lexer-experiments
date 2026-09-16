@@ -191,10 +191,14 @@ struct TilePrefixCallbackOp {
         int tail_flag = (predecessor_status == StatusWord(SCAN_TILE_INCLUSIVE)) | is_oob;
         T   eff_value = is_oob ? identity : value;
 
-        // TailSegmentedReduce combines from the rightmost tail_flag lane toward lane 0.
-        // Uses shuffle instructions — no shared memory, no __syncwarp needed.
+        // TailSegmentedReduce reduces op(lane_i, lane_{i+1}) toward lane 0, giving
+        // op(v[0], op(v[1], ..., v[k])) where lane k holds the INCLUSIVE/OOB stop value.
+        // For our scan, lane 0 is the most-recent predecessor and lane k the oldest, so
+        // we need compose(oldest, ..., newest) = compose(v[k], ..., v[0]).
+        // Flipping the operator gives the correct accumulation direction.
+        auto flipped_op = [&](T a, T b) { return scan_op(b, a); };
         return WarpReduceT(temp_storage.warp_reduce)
-                   .TailSegmentedReduce(eff_value, tail_flag, scan_op);
+                   .TailSegmentedReduce(eff_value, tail_flag, flipped_op);
     }
 
     // Called by BlockScan with the block aggregate; returns exclusive prefix.
