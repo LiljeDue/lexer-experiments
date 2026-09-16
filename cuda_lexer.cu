@@ -1171,9 +1171,14 @@ void lexerAlpaccShmemDynPass2(LexerCtxShmem ctx,
     __shared__ typename BlockScanI::TempStorage temp_storage;
 
     extern __shared__ uint16_t dyn_shmem2[];
-    volatile state_t* states   = (volatile state_t*) dyn_shmem2;
+    volatile state_t* shmem_compose = (volatile state_t*) dyn_shmem2;
+    volatile state_t* states   = shmem_compose + NUM_STATES * NUM_STATES;
     volatile uint8_t* tok_stage = (volatile uint8_t*) (states + ITEMS_PER_THREAD * BLOCK_SIZE);
     volatile uint16_t* lid_stage = (volatile uint16_t*) states;
+
+    copyFromGlbToShr<state_t, I, 1>(0, NUM_STATES * NUM_STATES, NUM_STATES * NUM_STATES,
+                                     ctx.d_compose_glb, shmem_compose);
+    ctx.d_compose = (state_t*) shmem_compose;
 
     uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr);
     I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD;
@@ -1240,13 +1245,14 @@ void lexerAlpaccShmemDynPass2(LexerCtxShmem ctx,
         *new_size = Add<I>()(idx_pfx, prod_agg);
 }
 
-// Shmem size for pass 2: states[] + tok_stage[] only (no compose table needed).
+// Shmem size for pass 2: compose table + states[] + tok_stage[].
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 static inline size_t dynShmemBytesPass2() {
-    size_t states = (size_t) ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(state_t);
-    size_t tok    = (size_t) ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(uint8_t);
+    size_t compose = NUM_STATES * NUM_STATES * sizeof(state_t);
+    size_t states  = (size_t) ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(state_t);
+    size_t tok     = (size_t) ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(uint8_t);
     tok = (tok + 1) & ~(size_t)1;
-    return states + tok;
+    return compose + states + tok;
 }
 
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
@@ -1823,7 +1829,8 @@ void testLexerAlpaccShmemDynTwoPass(uint8_t* input,
     const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
     const I IN_READ = IN_ARRAY_BYTES;
     const I IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
-    const I COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
+    // Compose table is read in both pass 1 and pass 2.
+    const I COMPOSE_READ = 2 * sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
     // Extra: pass 1 writes states to global, pass 2 reads them back.
     const I STATES_GLB_WRITE = STATES_GLB_BYTES;
     const I STATES_GLB_READ  = STATES_GLB_BYTES;
