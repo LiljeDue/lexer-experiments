@@ -310,7 +310,7 @@ lexer(LexerCtx ctx,
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
 
-    PrefixOpState state_prefix_op(state_states, state_prefix_storage, ctx, (int)dyn_index);
+    PrefixOpState state_prefix_op(state_states, state_prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY));
     BlockScanState(state_temp).InclusiveScan(st, st, ctx, state_prefix_op);
 
     #pragma unroll
@@ -335,7 +335,7 @@ lexer(LexerCtx ctx,
         prod[i] = (I)temp;
     }
 
-    PrefixOpIdx index_prefix_op(index_states, index_prefix_storage, Add<I>(), (int)dyn_index);
+    PrefixOpIdx index_prefix_op(index_states, index_prefix_storage, Add<I>(), (int)dyn_index, I(0));
     BlockScanI(index_temp).InclusiveScan(prod, prod, Add<I>(), index_prefix_op);
     I idx_pfx  = index_prefix_op.GetExclusivePrefix();
     I prod_agg = index_prefix_op.GetBlockAggregate();
@@ -454,7 +454,7 @@ lexerShmemCompose(LexerCtxShmem ctx,
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
 
-    PrefixOpState state_prefix_op(state_states, state_prefix_storage, ctx, (int)dyn_index);
+    PrefixOpState state_prefix_op(state_states, state_prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY));
     BlockScanState(state_temp).InclusiveScan(st, st, ctx, state_prefix_op);
 
     #pragma unroll
@@ -479,7 +479,7 @@ lexerShmemCompose(LexerCtxShmem ctx,
         prod[i] = (I)temp;
     }
 
-    PrefixOpIdx index_prefix_op(index_states, index_prefix_storage, Add<I>(), (int)dyn_index);
+    PrefixOpIdx index_prefix_op(index_states, index_prefix_storage, Add<I>(), (int)dyn_index, I(0));
     BlockScanI(index_temp).InclusiveScan(prod, prod, Add<I>(), index_prefix_op);
     I idx_pfx  = index_prefix_op.GetExclusivePrefix();
     I prod_agg = index_prefix_op.GetBlockAggregate();
@@ -601,7 +601,7 @@ lexerAlpaccImpl(CTX ctx,
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
 
-    PrefixOpState state_prefix_op(state_states, state_prefix_storage, ctx, (int)dyn_index);
+    PrefixOpState state_prefix_op(state_states, state_prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY));
     BlockScanState(state_temp).InclusiveScan(st, st, ctx, state_prefix_op);
 
     #pragma unroll
@@ -626,7 +626,7 @@ lexerAlpaccImpl(CTX ctx,
         prod[i] = (I)temp;
     }
 
-    PrefixOpIdx index_prefix_op(index_states, index_prefix_storage, Add<I>(), (int)dyn_index);
+    PrefixOpIdx index_prefix_op(index_states, index_prefix_storage, Add<I>(), (int)dyn_index, I(0));
     BlockScanI(index_temp).InclusiveScan(prod, prod, Add<I>(), index_prefix_op);
     I idx_pfx  = index_prefix_op.GetExclusivePrefix();
     I prod_agg = index_prefix_op.GetBlockAggregate();
@@ -778,7 +778,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
         st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
 
-    PrefixOpState state_prefix_op(state_states, state_prefix_storage, ctx, (int)dyn_index);
+    PrefixOpState state_prefix_op(state_states, state_prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY));
     BlockScanState(state_temp).InclusiveScan(st, st, ctx, state_prefix_op);
 
     #pragma unroll
@@ -805,7 +805,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
         prod[i] = (I)temp;
     }
 
-    PrefixOpIdx index_prefix_op(index_states, index_prefix_storage, Add<I>(), (int)dyn_index);
+    PrefixOpIdx index_prefix_op(index_states, index_prefix_storage, Add<I>(), (int)dyn_index, I(0));
     BlockScanI(index_temp).InclusiveScan(prod, prod, Add<I>(), index_prefix_op);
     I idx_pfx  = index_prefix_op.GetExclusivePrefix();
     I prod_agg = index_prefix_op.GetBlockAggregate();
@@ -961,7 +961,7 @@ static void launchLexerAlpaccShmemDyn(
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) \
         st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i]; \
-    PrefixOpState prefix_op(state_states, prefix_storage, ctx, (int)dyn_index); \
+    PrefixOpState prefix_op(state_states, prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY)); \
     BlockScanState(temp_storage).InclusiveScan(st, st, ctx, prefix_op); \
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) \
@@ -1026,7 +1026,7 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
         is_produce_state |= (uint64_t)temp << i; \
         prod[i] = (I)temp; \
     } \
-    PrefixOpIdx prefix_op(index_states, prefix_storage, Add<I>(), (int)dyn_index); \
+    PrefixOpIdx prefix_op(index_states, prefix_storage, Add<I>(), (int)dyn_index, I(0)); \
     BlockScanI(temp_storage).InclusiveScan(prod, prod, Add<I>(), prefix_op); \
     I idx_pfx = prefix_op.GetExclusivePrefix(); \
     I prod_agg = prefix_op.GetBlockAggregate(); \

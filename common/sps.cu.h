@@ -139,6 +139,7 @@ struct TilePrefixCallbackOp {
     ScanTileState<T>& tile_state;
     ScanOpT           scan_op;
     int               tile_idx;
+    T                 identity;
     T                 exclusive_prefix;
     T                 inclusive_prefix;
 
@@ -157,10 +158,12 @@ struct TilePrefixCallbackOp {
     TilePrefixCallbackOp(ScanTileState<T>& tile_state,
                          TempStorage& temp_storage,
                          ScanOpT scan_op,
-                         int tile_idx)
+                         int tile_idx,
+                         T identity)
         : tile_state(tile_state)
         , scan_op(scan_op)
         , tile_idx(tile_idx)
+        , identity(identity)
         , temp_storage(temp_storage)
     {}
 
@@ -179,15 +182,17 @@ struct TilePrefixCallbackOp {
         T          pred_value;
         tile_state.WaitForValid(predecessor_idx, pred_status, pred_value);
 
-        // Warp-level tail-segmented reduction: stop reducing when we hit an
-        // INCLUSIVE status (which carries the full prefix up to that tile).
-        int tail_flag = (pred_status == StatusWord(SCAN_TILE_INCLUSIVE));
-        temp_storage.warp_vals[threadIdx.x]  = pred_value;
+        // OOB padding acts as identity: treat it as a stop (like INCLUSIVE) with
+        // the scan identity as the effective value.
+        int is_oob    = (pred_status == StatusWord(SCAN_TILE_OOB));
+        int tail_flag = (pred_status == StatusWord(SCAN_TILE_INCLUSIVE)) | is_oob;
+        T   eff_value = is_oob ? identity : pred_value;
+        temp_storage.warp_vals[threadIdx.x]  = eff_value;
         temp_storage.warp_flags[threadIdx.x] = tail_flag;
         __syncwarp();
 
         // Scan from lane WARP-1 towards lane 0, combining until we hit a tail flag.
-        T running = pred_value;
+        T running = eff_value;
         #pragma unroll
         for (int offset = 1; offset < WARP; offset <<= 1) {
             if (threadIdx.x >= offset) {
@@ -206,16 +211,20 @@ struct TilePrefixCallbackOp {
         // window. But we may need to slide the window further back.
         exclusive_prefix = temp_storage.warp_vals[0];
 
-        while (__all_sync(0xffffffff, pred_status != StatusWord(SCAN_TILE_INCLUSIVE))) {
+        // Continue sliding back only while no lane has found INCLUSIVE or OOB.
+        while (__all_sync(0xffffffff, pred_status != StatusWord(SCAN_TILE_INCLUSIVE)
+                                   && pred_status != StatusWord(SCAN_TILE_OOB))) {
             predecessor_idx -= WARP;
             tile_state.WaitForValid(predecessor_idx, pred_status, pred_value);
 
-            tail_flag = (pred_status == StatusWord(SCAN_TILE_INCLUSIVE));
-            temp_storage.warp_vals[threadIdx.x]  = pred_value;
+            is_oob    = (pred_status == StatusWord(SCAN_TILE_OOB));
+            tail_flag = (pred_status == StatusWord(SCAN_TILE_INCLUSIVE)) | is_oob;
+            eff_value = is_oob ? identity : pred_value;
+            temp_storage.warp_vals[threadIdx.x]  = eff_value;
             temp_storage.warp_flags[threadIdx.x] = tail_flag;
             __syncwarp();
 
-            running = pred_value;
+            running = eff_value;
             #pragma unroll
             for (int offset = 1; offset < WARP; offset <<= 1) {
                 if (threadIdx.x >= offset) {
