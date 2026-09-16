@@ -92,12 +92,12 @@ profile: $(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indi
 
 diag: cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h \
       $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
-	mkdir -p .claude-artifacts
-	$(COMPILER) $(FLAGS) -DPROFILE -o .claude-artifacts/cuda_lexer_diag $<
-	./.claude-artifacts/cuda_lexer_diag \
+	$(COMPILER) $(FLAGS) -DPROFILE -o cuda_lexer_diag $<
+	./cuda_lexer_diag \
 	  $(DATA_PATH)/tokens_dense_500MiB.in \
 	  tokens_indices_dense_500MiB.out \
 	  tokens_tokens_dense_500MiB.out
+	rm -f cuda_lexer_diag
 
 devinfo:
 	$(COMPILER) $(FLAGS) -o devinfo devinfo.cu
