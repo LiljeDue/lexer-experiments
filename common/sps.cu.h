@@ -114,11 +114,14 @@ struct ScanTileState {
     }
 
     // Spin until tile is non-invalid, return status and value.
-    __device__ __forceinline__ void WaitForValid(int tile_idx, StatusWord& status, T& value) {
+    // initial_delay_ns: sleep before first load (absorbs L2 write latency from predecessor).
+    __device__ __forceinline__ void WaitForValid(int tile_idx, StatusWord& status, T& value,
+                                                 uint32_t initial_delay_ns = 450) {
+        __nanosleep(initial_delay_ns);
         TxnWord word = load_relaxed(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx);
         while (__any_sync(0xffffffff,
                TxnWordTraits<T>::unpack_status(word) == StatusWord(SCAN_TILE_INVALID))) {
-            __nanosleep(64);
+            __nanosleep(350);
             word = load_relaxed(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx);
         }
         status = TxnWordTraits<T>::unpack_status(word);
@@ -178,9 +181,10 @@ struct TilePrefixCallbackOp {
     // (combined value from the rightmost INCLUSIVE/OOB tile through lane 0),
     // and sets predecessor_status to this lane's tile status.
     __device__ __forceinline__ T
-    ProcessWindow(int predecessor_idx, StatusWord& predecessor_status) {
+    ProcessWindow(int predecessor_idx, StatusWord& predecessor_status,
+                  uint32_t delay_ns = 350) {
         T value;
-        tile_state.WaitForValid(predecessor_idx, predecessor_status, value);
+        tile_state.WaitForValid(predecessor_idx, predecessor_status, value, delay_ns);
 
         // OOB acts like identity: not a stop flag here, but contributes identity value.
         // Only INCLUSIVE is the stop flag for TailSegmentedReduce.
@@ -211,7 +215,8 @@ struct TilePrefixCallbackOp {
         int predecessor_idx = tile_idx - threadIdx.x - 1;
         StatusWord predecessor_status;
 
-        exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status);
+        // First window: use 450ns initial delay to absorb L2 write latency from predecessor.
+        exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status, 450);
 
         // Slide window back until we find an INCLUSIVE tile (or hit all-OOB).
         while (__all_sync(0xffffffff, predecessor_status != StatusWord(SCAN_TILE_INCLUSIVE)
