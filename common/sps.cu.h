@@ -22,11 +22,13 @@ enum ScanTileStatus : uint32_t {
 // Single-word tile state: packs status + value into one TxnWord so that
 // publish and read are each a single atomic-width transaction.
 //
-// Layout (little-endian):
-//   TxnWord = [ value (sizeof(T) bytes) | status (sizeof(T) bytes) ]
+// Layout: TxnWord = (value << (8*sizeof(T))) | status
 //
-// T=uint16_t: TxnWord=uint32_t, StatusWord=uint16_t
-// T=uint32_t: TxnWord=uint64_t, StatusWord=uint32_t
+// T=uint16_t: TxnWord=uint32_t,           status in bits [15:0],  value in bits [31:16]
+// T=uint32_t: TxnWord=unsigned long long, status in bits [31:0],  value in bits [63:32]
+//
+// Pack/unpack done with shifts — no reinterpret_cast — to avoid alignment
+// issues with local-memory stack variables.
 // ---------------------------------------------------------------------------
 template<typename T>
 struct TxnWordTraits;
@@ -34,16 +36,26 @@ struct TxnWordTraits;
 template<> struct TxnWordTraits<uint16_t> {
     using TxnWord    = uint32_t;
     using StatusWord = uint16_t;
+    __device__ __forceinline__
+    static TxnWord pack(StatusWord status, uint16_t value) {
+        return (uint32_t(value) << 16) | uint32_t(status);
+    }
+    __device__ __forceinline__
+    static StatusWord unpack_status(TxnWord w) { return StatusWord(w & 0xffffu); }
+    __device__ __forceinline__
+    static uint16_t   unpack_value(TxnWord w)  { return uint16_t(w >> 16); }
 };
 template<> struct TxnWordTraits<uint32_t> {
     using TxnWord    = unsigned long long;
     using StatusWord = uint32_t;
-};
-
-template<typename T>
-struct TileDescriptor {
-    typename TxnWordTraits<T>::StatusWord status;
-    T value;
+    __device__ __forceinline__
+    static TxnWord pack(StatusWord status, uint32_t value) {
+        return (TxnWord(value) << 32) | TxnWord(status);
+    }
+    __device__ __forceinline__
+    static StatusWord unpack_status(TxnWord w) { return StatusWord(w & 0xffffffffull); }
+    __device__ __forceinline__
+    static uint32_t   unpack_value(TxnWord w)  { return uint32_t(w >> 32); }
 };
 
 // Store/load helpers using PTX acquire/release where available.
@@ -79,49 +91,38 @@ struct ScanTileState {
     // Initialize from device: one thread per entry.
     __device__ void InitializeStatus(int num_tiles) {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        TxnWord val = TxnWord();
-        TileDescriptor<T>* desc = reinterpret_cast<TileDescriptor<T>*>(&val);
         if (idx < num_tiles) {
-            desc->status = StatusWord(SCAN_TILE_INVALID);
-            d_tile_descriptors[TILE_STATUS_PADDING + idx] = val;
+            d_tile_descriptors[TILE_STATUS_PADDING + idx] =
+                TxnWordTraits<T>::pack(StatusWord(SCAN_TILE_INVALID), T());
         }
         if (blockIdx.x == 0 && threadIdx.x < TILE_STATUS_PADDING) {
-            desc->status = StatusWord(SCAN_TILE_OOB);
-            d_tile_descriptors[threadIdx.x] = val;
+            d_tile_descriptors[threadIdx.x] =
+                TxnWordTraits<T>::pack(StatusWord(SCAN_TILE_OOB), T());
         }
     }
 
     // Publish aggregate (partial): single atomic-width write.
     __device__ __forceinline__ void SetPartial(int tile_idx, T value) {
-        TileDescriptor<T> desc;
-        desc.status = StatusWord(SCAN_TILE_PARTIAL);
-        desc.value  = value;
-        TxnWord word;
-        *reinterpret_cast<TileDescriptor<T>*>(&word) = desc;
-        store_release(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx, word);
+        store_release(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx,
+                      TxnWordTraits<T>::pack(StatusWord(SCAN_TILE_PARTIAL), value));
     }
 
     // Publish inclusive prefix: single atomic-width write.
     __device__ __forceinline__ void SetInclusive(int tile_idx, T value) {
-        TileDescriptor<T> desc;
-        desc.status = StatusWord(SCAN_TILE_INCLUSIVE);
-        desc.value  = value;
-        TxnWord word;
-        *reinterpret_cast<TileDescriptor<T>*>(&word) = desc;
-        store_release(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx, word);
+        store_release(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx,
+                      TxnWordTraits<T>::pack(StatusWord(SCAN_TILE_INCLUSIVE), value));
     }
 
     // Spin until tile is non-invalid, return status and value.
     __device__ __forceinline__ void WaitForValid(int tile_idx, StatusWord& status, T& value) {
         TxnWord word = load_relaxed(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx);
-        TileDescriptor<T> desc = reinterpret_cast<TileDescriptor<T>&>(word);
-        while (__any_sync(0xffffffff, desc.status == StatusWord(SCAN_TILE_INVALID))) {
+        while (__any_sync(0xffffffff,
+               TxnWordTraits<T>::unpack_status(word) == StatusWord(SCAN_TILE_INVALID))) {
             __nanosleep(64);
             word = load_relaxed(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx);
-            desc = reinterpret_cast<TileDescriptor<T>&>(word);
         }
-        status = desc.status;
-        value  = desc.value;
+        status = TxnWordTraits<T>::unpack_status(word);
+        value  = TxnWordTraits<T>::unpack_value(word);
     }
 };
 
