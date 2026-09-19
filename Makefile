@@ -46,6 +46,7 @@ $(FUTHARK_PROGRAM): $(FUTHARK_PROGRAM).fut
 
 $(CUDA_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h
 	$(COMPILER) $(FLAGS) -o $@ $<
+	@echo "Compilation done, starting benchmarks..."
 
 $(CUDA_DEBUG_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h
 	$(COMPILER) $(FLAGS) -DDEBUG -o $@ $<
