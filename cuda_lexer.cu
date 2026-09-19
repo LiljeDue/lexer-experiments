@@ -1231,15 +1231,11 @@ static void launchLexerAlpaccShmemTwoPassV2(
 }
 
 // Bandwidth ceiling kernel: reads input bytes using same u64 pattern as P1.
-// Threads atomicAdd into shared memory, then thread 0 writes the block result
-// to d_out[blockIdx.x] — one global write per block, no serialization.
+// Each thread writes its XOR-reduced result to a unique slot in d_out to
+// prevent DCE without any synchronization or contention.
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
 bwCeilingRead(const uint8_t* __restrict__ d_in, I size, uint64_t* d_out) {
-    __shared__ unsigned long long shmem_acc;
-    if (threadIdx.x == 0) shmem_acc = 0;
-    __syncthreads();
-
     const I U8       = sizeof(uint64_t);
     const I REG_MEM  = 1 + ITEMS_PER_THREAD / U8;
     const I glb_offs = (I)(blockIdx.x * BLOCK_SIZE * ITEMS_PER_THREAD);
@@ -1260,9 +1256,7 @@ bwCeilingRead(const uint8_t* __restrict__ d_in, I size, uint64_t* d_out) {
     uint64_t acc = 0;
     #pragma unroll
     for (I i = 0; i < REG_MEM; i++) acc ^= regs[i];
-    atomicAdd(&shmem_acc, (unsigned long long)acc);
-    __syncthreads();
-    if (threadIdx.x == 0) d_out[blockIdx.x] = (uint64_t)shmem_acc;
+    d_out[blockIdx.x * BLOCK_SIZE + threadIdx.x] = acc;
 }
 
 template<uint32_t BLOCK_SIZE=256, uint32_t ITEMS_PER_THREAD=22>
@@ -1280,7 +1274,7 @@ void testBwCeilingRead(uint8_t* input, size_t input_size) {
     uint8_t*  d_in;
     uint64_t* d_out;
     gpuAssert(cudaMalloc((void**)&d_in,  size * sizeof(uint8_t)));
-    gpuAssert(cudaMalloc((void**)&d_out, NLB * sizeof(uint64_t)));
+    gpuAssert(cudaMalloc((void**)&d_out, NLB * BLOCK_SIZE * sizeof(uint64_t)));
     gpuAssert(cudaMemcpy(d_in, input, size * sizeof(uint8_t), cudaMemcpyHostToDevice));
 
     float* temp = (float*)malloc(sizeof(float) * RUNS);
@@ -1300,7 +1294,9 @@ void testBwCeilingRead(uint8_t* input, size_t input_size) {
         cudaEventSynchronize(stop);
         cudaEventElapsedTime(temp + i, start, stop);
     }
-    compute_descriptors(temp, RUNS, (uint64_t)size * sizeof(uint8_t));
+    // Count bytes read (input) + bytes written (one u64 per thread)
+    compute_descriptors(temp, RUNS, (uint64_t)size * sizeof(uint8_t)
+                                  + (uint64_t)NLB * BLOCK_SIZE * sizeof(uint64_t));
     free(temp);
     gpuAssert(cudaFree(d_in));
     gpuAssert(cudaFree(d_out));
