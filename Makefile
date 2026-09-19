@@ -11,7 +11,7 @@ DEFAULT=\033[39m
 
 default: bench
 
-.PHONY: clean bench test devinfo profile
+.PHONY: clean bench test devinfo profile profile_p1_u32
 
 $(DATA_PATH)/tokens_dense_500MiB.in:
 	(cd $(DATA_PATH) && make)
@@ -103,6 +103,18 @@ profile_p1: $(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_i
 	    --target-processes all \
 	    ./$(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out \
 	    > profile_p1.txt 2>&1
+
+profile_p1_u32: $(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
+	-ncu --set full \
+	    --import-source 1 \
+	    --source-folders . \
+	    --page source \
+	    --print-source cuda \
+	    --kernel-name-base function \
+	    --kernel-name regex:TwoPassV2P1U32 \
+	    --target-processes all \
+	    ./$(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out \
+	    > profile_p1_u32.txt 2>&1
 
 scan_bench: scan_bench.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h
 	$(COMPILER) $(FLAGS) -o scan_bench $<
