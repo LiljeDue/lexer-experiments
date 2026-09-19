@@ -221,14 +221,15 @@ copyFromShrToGlb(
     __syncthreads();
 }
 
-// Load ITEMS_PER_THREAD bytes per thread from d_in[glb_offs..] using 128-bit
-// coalesced loads, map each byte through to_state[], and write the resulting
-// state_t values into states[] in striped layout (states[i*BS+t] = state of
-// global byte glb_offs + i*BS+t). Out-of-bounds positions get `identity`.
-// If next_state != nullptr, the one byte immediately past the tile end
-// (position glb_offs + IPT*BS) is mapped and stored there (for single-pass
-// kernels that need to look one element ahead across tile boundaries).
-// EXTRA=0: load exactly TILE bytes; EXTRA=1: load TILE+1 bytes (next_state ptr required).
+// Load ITEMS_PER_THREAD bytes per thread from d_in[glb_offs..] using 64-bit
+// coalesced loads, map each byte through to_state[], and write states to shmem
+// in sequential layout (byte p → states[p - glb_offs]).
+// Out-of-bounds positions get `identity`.
+// If EXTRA=1, also stores the one byte at position glb_offs+TILE into *next_state.
+//
+// REG_MEM = 1 + IPT/8 loads per thread (e.g. 4 for IPT=30). Loop is small
+// and fully unrolled. Global reads are coalesced: load i by thread t reads
+// global bytes glb_offs + (i*BS+t)*8 .. +7.
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD, I EXTRA=0>
 __device__ inline void
 loadBytesAsStates(
@@ -239,35 +240,36 @@ loadBytesAsStates(
     state_t identity,
     state_t* next_state = nullptr)
 {
-    const I U4    = sizeof(uint4);
+    const I U8    = sizeof(uint64_t);
     const I TILE  = ITEMS_PER_THREAD * BLOCK_SIZE;
-    const I LOADS = (TILE + EXTRA + U4 - 1) / U4;
-    auto in4 = reinterpret_cast<const uint4*>(d_in + glb_offs);
+    const I LOADS = 1 + (ITEMS_PER_THREAD + EXTRA) / U8;
+    uint64_t regs[LOADS];
+    uint8_t* bytes = (uint8_t*)regs;
     #pragma unroll
     for (I i = 0; i < LOADS; i++) {
-        I base      = i * BLOCK_SIZE + threadIdx.x;  // which uint4 this thread loads
-        I base_byte = base * U4;                      // byte offset within tile
-        uint4 v = {};
-        if (glb_offs + base_byte + U4 <= size) {
-            v = __ldg(in4 + base);
+        I base      = i * BLOCK_SIZE + threadIdx.x;
+        I base_byte = base * U8;
+        I gid       = glb_offs + base_byte;
+        if (gid + U8 <= size) {
+            regs[i] = *reinterpret_cast<const uint64_t*>(d_in + gid);
         } else {
-            uint8_t* b = (uint8_t*)&v;
+            regs[i] = 0;
             #pragma unroll
-            for (I j = 0; j < U4; j++) {
-                I gid = glb_offs + base_byte + j;
-                if (gid < size) b[j] = d_in[gid];
-            }
+            for (I j = 0; j < U8; j++)
+                if (gid + j < size) bytes[i * U8 + j] = d_in[gid + j];
         }
-        uint8_t* b = (uint8_t*)&v;
+    }
+    #pragma unroll
+    for (I i = 0; i < LOADS; i++) {
         #pragma unroll
-        for (I j = 0; j < U4; j++) {
-            I lid = base_byte + j;
+        for (I j = 0; j < U8; j++) {
+            I lid = (i * BLOCK_SIZE + threadIdx.x) * U8 + j;
             if (lid < TILE) {
                 states[lid] = (glb_offs + lid < size)
-                              ? to_state[b[j]] : identity;
+                              ? to_state[bytes[i * U8 + j]] : identity;
             } else if (EXTRA && lid == TILE) {
                 if (glb_offs + lid < size)
-                    *next_state = to_state[b[j]];
+                    *next_state = to_state[bytes[i * U8 + j]];
             }
         }
     }
