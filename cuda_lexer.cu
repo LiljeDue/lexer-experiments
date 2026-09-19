@@ -1108,9 +1108,9 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
         for (I i = 0; i < LOADS; i++) { \
             _Pragma("unroll") \
             for (I j = 0; j < U8; j++) { \
-                I lid = (i * BLOCK_SIZE + threadIdx.x) * U8 + j; \
+                I lid = i * U8 * BLOCK_SIZE + j * BLOCK_SIZE + threadIdx.x; \
                 if (lid < TILE) \
-                    states_u32[lid] = (glb_offs + lid < size) \
+                    states_u32[lid] = (glb_offs + (i * BLOCK_SIZE + threadIdx.x) * U8 + j < size) \
                                       ? to_state_shr[bytes[i * U8 + j]] : identity; \
             } \
         } \
@@ -1118,7 +1118,8 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     __syncthreads(); \
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) \
-        st[i] = (state_t) states_u32[threadIdx.x * ITEMS_PER_THREAD + i]; \
+        st[i] = (state_t) states_u32[i * BLOCK_SIZE + threadIdx.x]; \
+    stripedToBlocked<state_t, I, BLOCK_SIZE, ITEMS_PER_THREAD>(st, (volatile state_t*) states_u32); \
     PrefixOpState prefix_op(state_states, prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY)); \
     BlockScanState(temp_storage).InclusiveScan(st, st, ctx, prefix_op); \
     _Pragma("unroll") \
