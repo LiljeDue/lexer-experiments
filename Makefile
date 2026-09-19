@@ -108,8 +108,6 @@ profile_p1_u32: $(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in toke
 	-ncu --set full \
 	    --import-source 1 \
 	    --source-folders . \
-	    --page source \
-	    --print-source cuda \
 	    --kernel-name-base function \
 	    --kernel-name regex:TwoPassV2P1U32 \
 	    --target-processes all \
