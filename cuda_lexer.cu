@@ -228,7 +228,8 @@ copyFromShrToGlb(
 // If next_state != nullptr, the one byte immediately past the tile end
 // (position glb_offs + IPT*BS) is mapped and stored there (for single-pass
 // kernels that need to look one element ahead across tile boundaries).
-template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+// EXTRA=0: load exactly TILE bytes; EXTRA=1: load TILE+1 bytes (next_state ptr required).
+template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD, I EXTRA=0>
 __device__ inline void
 loadBytesAsStates(
     const uint8_t* __restrict__ d_in,
@@ -240,9 +241,6 @@ loadBytesAsStates(
 {
     const I U4    = sizeof(uint4);
     const I TILE  = ITEMS_PER_THREAD * BLOCK_SIZE;
-    // Number of 128-bit loads needed to cover TILE + (next_state ? 1 : 0) bytes.
-    // Each load covers U4 bytes; stride between loads = BLOCK_SIZE loads.
-    const I EXTRA = (next_state != nullptr) ? 1 : 0;
     const I LOADS = (TILE + EXTRA + U4 - 1) / U4;
     auto in4 = reinterpret_cast<const uint4*>(d_in + glb_offs);
     #pragma unroll
@@ -250,7 +248,7 @@ loadBytesAsStates(
         I base      = i * BLOCK_SIZE + threadIdx.x;  // which uint4 this thread loads
         I base_byte = base * U4;                      // byte offset within tile
         uint4 v = {};
-        if (base_byte + U4 <= size - glb_offs) {
+        if (glb_offs + base_byte + U4 <= size) {
             v = __ldg(in4 + base);
         } else {
             uint8_t* b = (uint8_t*)&v;
@@ -267,7 +265,7 @@ loadBytesAsStates(
             if (lid < TILE) {
                 states[lid] = (glb_offs + lid < size)
                               ? to_state[b[j]] : identity;
-            } else if (lid == TILE && next_state != nullptr) {
+            } else if (EXTRA && lid == TILE) {
                 if (glb_offs + lid < size)
                     *next_state = to_state[b[j]];
             }
@@ -348,7 +346,7 @@ lexer(LexerCtx ctx,
 
     __syncthreads();
 
-    loadBytesAsStates<I, BLOCK_SIZE, ITEMS_PER_THREAD>(
+    loadBytesAsStates<I, BLOCK_SIZE, ITEMS_PER_THREAD, 1>(
         d_in, glb_offs, size, (const state_t*)to_state_shr,
         states, state_t(IDENTITY), &next_block_first_state);
 
@@ -458,7 +456,7 @@ lexerShmemCompose(LexerCtxShmem ctx,
 
     __syncthreads();
 
-    loadBytesAsStates<I, BLOCK_SIZE, ITEMS_PER_THREAD>(
+    loadBytesAsStates<I, BLOCK_SIZE, ITEMS_PER_THREAD, 1>(
         d_in, glb_offs, size, (const state_t*)to_state_shr,
         states, state_t(IDENTITY), &next_block_first_state);
 
@@ -715,7 +713,7 @@ lexerAlpaccImpl(CTX ctx,
 
     __syncthreads();
 
-    loadBytesAsStates<I, BLOCK_SIZE, ITEMS_PER_THREAD>(
+    loadBytesAsStates<I, BLOCK_SIZE, ITEMS_PER_THREAD, 1>(
         d_in, glb_offs, size, (const state_t*)to_state_shr,
         states, identity, &next_block_first_state);
 
@@ -858,7 +856,7 @@ lexerAlpaccImplDyn(LexerCtxShmem ctx,
 
     __syncthreads();
 
-    loadBytesAsStates<I, BLOCK_SIZE, ITEMS_PER_THREAD>(
+    loadBytesAsStates<I, BLOCK_SIZE, ITEMS_PER_THREAD, 1>(
         d_in, glb_offs, size, (const state_t*)to_state_shr,
         states, identity, &next_block_first_state);
 
