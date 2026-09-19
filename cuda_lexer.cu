@@ -2658,12 +2658,6 @@ int main(int32_t argc, char *argv[]) {
     testBwCeilingRead<256, 22>(input, input_size);
     printf(PAD, "2Pass V2 BS256/IPT22 (NregNone):");
     testLexerAlpaccShmemTwoPassV2<256, 22, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS256/IPT8 (U32 shmem):");
-    testLexerAlpaccShmemTwoPassV2U32<256, 8, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS256/IPT11 (U32 shmem):");
-    testLexerAlpaccShmemTwoPassV2U32<256, 11, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS256/IPT16 (U32 shmem):");
-    testLexerAlpaccShmemTwoPassV2U32<256, 16, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "2Pass V2 BS256/IPT22 (U32 shmem):");
     testLexerAlpaccShmemTwoPassV2U32<256, 22, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
