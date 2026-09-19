@@ -51,7 +51,7 @@ $(CUDA_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h 
 $(CUDA_DEBUG_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h
 	$(COMPILER) $(FLAGS) -DDEBUG -o $@ $<
 
-$(CUDA_PROFILE_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h
+$(CUDA_PROFILE_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h Makefile
 	$(COMPILER) $(FLAGS) -DPROFILE -lineinfo -o $@ $<
 
 bench: $(FUTHARK_PROGRAM) \
