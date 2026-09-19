@@ -1114,12 +1114,10 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     PrefixOpState prefix_op(state_states, prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY)); \
     BlockScanState(temp_storage).InclusiveScan(st, st, ctx, prefix_op); \
     _Pragma("unroll") \
-    for (I i = 0; i < ITEMS_PER_THREAD; i++) \
-        states_u32[threadIdx.x * ITEMS_PER_THREAD + i] = st[i]; \
-    __syncthreads(); \
-    copyFromShrToGlb<state_t, I, ITEMS_PER_THREAD>( \
-        glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE, size, \
-        (volatile state_t*) states_u32, d_states_out); \
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
+        I gid = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i; \
+        if (gid < size) d_states_out[gid] = st[i]; \
+    } \
     if (dyn_index == num_logical_blocks - 1 && threadIdx.x == BLOCK_SIZE - 1) \
         *is_valid = is_accept(st[ITEMS_PER_THREAD - 1]);
 
