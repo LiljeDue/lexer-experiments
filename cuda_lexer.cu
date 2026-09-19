@@ -1230,6 +1230,75 @@ static void launchLexerAlpaccShmemTwoPassV2(
         d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
 }
 
+// Bandwidth ceiling kernel: reads input bytes using same u64 pattern as P1,
+// reduces to a single value to prevent dead-code elimination.
+// Use to isolate how much of P1's time is pure HBM read bandwidth.
+template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+__global__ void
+bwCeilingRead(const uint8_t* __restrict__ d_in, I size, uint64_t* d_out) {
+    const I U8        = sizeof(uint64_t);
+    const I REG_MEM   = 1 + ITEMS_PER_THREAD / U8;
+    const I glb_offs  = (I)(blockIdx.x * BLOCK_SIZE * ITEMS_PER_THREAD);
+    uint64_t regs[REG_MEM];
+    uint8_t* bytes = (uint8_t*)regs;
+    #pragma unroll
+    for (I i = 0; i < REG_MEM; i++) {
+        I gid = glb_offs + (i * BLOCK_SIZE + threadIdx.x) * U8;
+        if (gid + U8 <= size)
+            regs[i] = *reinterpret_cast<const uint64_t*>(d_in + gid);
+        else {
+            regs[i] = 0;
+            for (I j = 0; j < U8; j++)
+                if (gid + j < size) bytes[i * U8 + j] = d_in[gid + j];
+        }
+    }
+    uint64_t acc = 0;
+    #pragma unroll
+    for (I i = 0; i < REG_MEM * U8; i++) acc += bytes[i];
+    if (acc == 0xdeadbeefdeadbeefULL) *d_out = acc; // never true, prevents DCE
+}
+
+template<uint32_t BLOCK_SIZE=256, uint32_t ITEMS_PER_THREAD=22>
+void testBwCeilingRead(uint8_t* input, size_t input_size) {
+    using I = uint32_t;
+    const I size = (I)input_size;
+    const I NLB  = (size + BLOCK_SIZE * ITEMS_PER_THREAD - 1) / (BLOCK_SIZE * ITEMS_PER_THREAD);
+#ifdef PROFILE
+    const I WARMUP_RUNS = 1;
+    const I RUNS = 1;
+#else
+    const I WARMUP_RUNS = 500;
+    const I RUNS = 100;
+#endif
+    uint8_t*  d_in;
+    uint64_t* d_out;
+    gpuAssert(cudaMalloc((void**)&d_in,  size * sizeof(uint8_t)));
+    gpuAssert(cudaMalloc((void**)&d_out, sizeof(uint64_t)));
+    gpuAssert(cudaMemcpy(d_in, input, size * sizeof(uint8_t), cudaMemcpyHostToDevice));
+
+    float* temp = (float*)malloc(sizeof(float) * RUNS);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    for (I i = 0; i < WARMUP_RUNS; i++) {
+        bwCeilingRead<I, BLOCK_SIZE, ITEMS_PER_THREAD><<<NLB, BLOCK_SIZE>>>(d_in, size, d_out);
+        cudaDeviceSynchronize();
+    }
+    for (I i = 0; i < RUNS; i++) {
+        cudaEventRecord(start, 0);
+        bwCeilingRead<I, BLOCK_SIZE, ITEMS_PER_THREAD><<<NLB, BLOCK_SIZE>>>(d_in, size, d_out);
+        cudaDeviceSynchronize();
+        cudaEventRecord(stop, 0);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(temp + i, start, stop);
+    }
+    compute_descriptors(temp, RUNS, (uint64_t)size * sizeof(uint8_t));
+    free(temp);
+    gpuAssert(cudaFree(d_in));
+    gpuAssert(cudaFree(d_out));
+}
+
 void testLexerShmemCompose(uint8_t* input,
                size_t input_size,
                uint32_t* expected_indices,
@@ -2215,6 +2284,8 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024 IPT=44:");
     testLexerAlpaccShmemDyn<1024, 44>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "BW ceiling BS256/IPT22 (read only):");
+    testBwCeilingRead<256, 22>(input, input_size);
     printf(PAD, "2Pass V2 BS256/IPT22 (u128):");
     testLexerAlpaccShmemTwoPassV2<256, 22, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
