@@ -1995,10 +1995,10 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem Dyn BS1024 IPT=44:");
     testLexerAlpaccShmemDyn<1024, 44>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS256/IPT22 (u128):");
-    testLexerAlpaccShmemTwoPassV2<256, 22, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "2Pass V2 BS256/IPT22 (u64):");
     testLexerAlpaccShmemTwoPassV2<256, 22, 256, 18, 1, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS256/IPT22 (u128):");
+    testLexerAlpaccShmemTwoPassV2<256, 22, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
