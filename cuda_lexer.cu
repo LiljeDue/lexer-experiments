@@ -943,9 +943,6 @@ static void launchLexerAlpaccShmemDyn(
     extern __shared__ uint16_t dyn_shmem_p1[]; \
     volatile state_t* shmem_compose = (volatile state_t*) dyn_shmem_p1; \
     volatile state_t* states        = shmem_compose + NUM_STATES * NUM_STATES; \
-    const I REG_MEM = 1 + ITEMS_PER_THREAD / sizeof(uint64_t); \
-    uint64_t copy_reg[REG_MEM]; \
-    uint8_t *chars_reg = (uint8_t*) copy_reg; \
     state_t st[ITEMS_PER_THREAD]; \
     uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr); \
     I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD; \
@@ -954,34 +951,32 @@ static void launchLexerAlpaccShmemDyn(
     ctx.d_compose = (state_t*) shmem_compose; \
     copyFromGlbToShr<state_t, I, 1>(0, 256, 256, ctx.d_to_state, to_state_shr); \
     __syncthreads(); \
-    _Pragma("unroll") \
-    for (I i = 0; i < REG_MEM; i++) { \
-        I uint64_lid = i * blockDim.x + threadIdx.x; \
-        I lid = sizeof(uint64_t) * uint64_lid; \
-        I gid = glb_offs + lid; \
-        if (gid + sizeof(uint64_t) < size) { \
-            copy_reg[i] = *((uint64_t*) (gid + (uint8_t*) d_in)); \
-        } else { \
-            for (I j = 0; j < sizeof(uint64_t); j++) { \
-                I loc_gid = gid + j; \
-                if (loc_gid < size) \
-                    chars_reg[sizeof(uint64_t) * i + j] = d_in[loc_gid]; \
+    { \
+        const I U4 = sizeof(uint4); \
+        const I LOADS = (ITEMS_PER_THREAD + U4 - 1) / U4; \
+        auto in4 = reinterpret_cast<const uint4*>(d_in + glb_offs); \
+        _Pragma("unroll") \
+        for (I i = 0; i < LOADS; i++) { \
+            I base = i * BLOCK_SIZE + threadIdx.x; \
+            I base_byte = base * U4; \
+            uint4 v = {}; \
+            if (base_byte + U4 <= size - glb_offs) { \
+                v = __ldg(in4 + base); \
+            } else { \
+                uint8_t* b = (uint8_t*)&v; \
+                _Pragma("unroll") \
+                for (I j = 0; j < U4; j++) { \
+                    I gid = glb_offs + base_byte + j; \
+                    if (gid < size) b[j] = d_in[gid]; \
+                } \
             } \
-        } \
-    } \
-    _Pragma("unroll") \
-    for (I i = 0; i < REG_MEM; i++) { \
-        I lid = i * blockDim.x + threadIdx.x; \
-        I _gid = glb_offs + sizeof(uint64_t) * lid; \
-        for (I j = 0; j < sizeof(uint64_t); j++) { \
-            I gid = _gid + j; \
-            I lid_off = sizeof(uint64_t) * lid + j; \
-            I reg_off = sizeof(uint64_t) * i + j; \
-            bool is_in_block = lid_off < ITEMS_PER_THREAD * BLOCK_SIZE; \
-            if (gid < size && is_in_block) { \
-                states[lid_off] = to_state_shr[chars_reg[reg_off]]; \
-            } else if (is_in_block) { \
-                states[lid_off] = identity; \
+            uint8_t* b = (uint8_t*)&v; \
+            _Pragma("unroll") \
+            for (I j = 0; j < U4; j++) { \
+                I lid = base_byte + j; \
+                if (lid < ITEMS_PER_THREAD * BLOCK_SIZE) \
+                    states[lid] = (glb_offs + lid < size) \
+                                  ? to_state_shr[b[j]] : identity; \
             } \
         } \
     } \
