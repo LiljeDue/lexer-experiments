@@ -5,7 +5,7 @@ CUDA_PROGRAM=cuda_lexer
 CUDA_DEBUG_PROGRAM=cuda_lexer_debug
 CUDA_PROFILE_PROGRAM=cuda_lexer_profile
 COMPILER?=nvcc
-FLAGS?=-O3 --std=c++14 -diag-suppress 550 -gencode arch=compute_80,code=sm_80
+FLAGS?=-O3 --std=c++14 -diag-suppress 550 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80
 GREEN=[32m
 DEFAULT=\033[39m
 
