@@ -1230,32 +1230,39 @@ static void launchLexerAlpaccShmemTwoPassV2(
         d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
 }
 
-// Bandwidth ceiling kernel: reads input bytes using same u64 pattern as P1,
-// reduces to a single value to prevent dead-code elimination.
-// Use to isolate how much of P1's time is pure HBM read bandwidth.
+// Bandwidth ceiling kernel: reads input bytes using same u64 pattern as P1.
+// Threads atomicAdd into shared memory, then thread 0 writes the block result
+// to d_out[blockIdx.x] — one global write per block, no serialization.
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__ void
 bwCeilingRead(const uint8_t* __restrict__ d_in, I size, uint64_t* d_out) {
-    const I U8        = sizeof(uint64_t);
-    const I REG_MEM   = 1 + ITEMS_PER_THREAD / U8;
-    const I glb_offs  = (I)(blockIdx.x * BLOCK_SIZE * ITEMS_PER_THREAD);
+    __shared__ unsigned long long shmem_acc;
+    if (threadIdx.x == 0) shmem_acc = 0;
+    __syncthreads();
+
+    const I U8       = sizeof(uint64_t);
+    const I REG_MEM  = 1 + ITEMS_PER_THREAD / U8;
+    const I glb_offs = (I)(blockIdx.x * BLOCK_SIZE * ITEMS_PER_THREAD);
     uint64_t regs[REG_MEM];
     uint8_t* bytes = (uint8_t*)regs;
     #pragma unroll
     for (I i = 0; i < REG_MEM; i++) {
         I gid = glb_offs + (i * BLOCK_SIZE + threadIdx.x) * U8;
+        regs[i] = 0;
         if (gid + U8 <= size)
-            regs[i] = *reinterpret_cast<const uint64_t*>(d_in + gid);
+            regs[i] = __ldg(reinterpret_cast<const uint64_t*>(d_in + gid));
         else {
-            regs[i] = 0;
+            #pragma unroll
             for (I j = 0; j < U8; j++)
                 if (gid + j < size) bytes[i * U8 + j] = d_in[gid + j];
         }
     }
     uint64_t acc = 0;
     #pragma unroll
-    for (I i = 0; i < REG_MEM * U8; i++) acc += bytes[i];
-    if (acc == 0xdeadbeefdeadbeefULL) *d_out = acc; // never true, prevents DCE
+    for (I i = 0; i < REG_MEM; i++) acc ^= regs[i];
+    atomicAdd(&shmem_acc, (unsigned long long)acc);
+    __syncthreads();
+    if (threadIdx.x == 0) d_out[blockIdx.x] = (uint64_t)shmem_acc;
 }
 
 template<uint32_t BLOCK_SIZE=256, uint32_t ITEMS_PER_THREAD=22>
@@ -1273,7 +1280,7 @@ void testBwCeilingRead(uint8_t* input, size_t input_size) {
     uint8_t*  d_in;
     uint64_t* d_out;
     gpuAssert(cudaMalloc((void**)&d_in,  size * sizeof(uint8_t)));
-    gpuAssert(cudaMalloc((void**)&d_out, sizeof(uint64_t)));
+    gpuAssert(cudaMalloc((void**)&d_out, NLB * sizeof(uint64_t)));
     gpuAssert(cudaMemcpy(d_in, input, size * sizeof(uint8_t), cudaMemcpyHostToDevice));
 
     float* temp = (float*)malloc(sizeof(float) * RUNS);
