@@ -1076,7 +1076,7 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     __shared__ state_t to_state_shr[256]; \
     extern __shared__ uint16_t dyn_shmem_p1u32[]; \
     volatile state_t*  shmem_compose = (volatile state_t*) dyn_shmem_p1u32; \
-    volatile uint32_t* states_u32    = (volatile uint32_t*)(shmem_compose + NUM_STATES * NUM_STATES); \
+    volatile uint64_t* states_u64    = (volatile uint64_t*)(shmem_compose + NUM_STATES * NUM_STATES); \
     state_t st[ITEMS_PER_THREAD]; \
     uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr); \
     I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD; \
@@ -1104,30 +1104,30 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
                     if (gid + j < size) bytes[i * U8 + j] = d_in[gid + j]; \
             } \
         } \
+        volatile state_t* states_s = (volatile state_t*) states_u64; \
         _Pragma("unroll") \
         for (I i = 0; i < LOADS; i++) { \
             _Pragma("unroll") \
             for (I j = 0; j < U8; j++) { \
-                I lid = i * U8 * BLOCK_SIZE + j * BLOCK_SIZE + threadIdx.x; \
+                I lid = (i * BLOCK_SIZE + threadIdx.x) * U8 + j; \
                 if (lid < TILE) \
-                    states_u32[lid] = (glb_offs + (i * BLOCK_SIZE + threadIdx.x) * U8 + j < size) \
-                                      ? to_state_shr[bytes[i * U8 + j]] : identity; \
+                    states_s[lid] = (glb_offs + lid < size) \
+                                    ? to_state_shr[bytes[i * U8 + j]] : identity; \
             } \
         } \
     } \
     __syncthreads(); \
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) \
-        st[i] = (state_t) states_u32[i * BLOCK_SIZE + threadIdx.x]; \
-    stripedToBlocked<state_t, I, BLOCK_SIZE, ITEMS_PER_THREAD>(st, (volatile state_t*) states_u32); \
+        st[i] = ((volatile state_t*) states_u64)[threadIdx.x * ITEMS_PER_THREAD + i]; \
     PrefixOpState prefix_op(state_states, prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY)); \
     BlockScanState(temp_storage).InclusiveScan(st, st, ctx, prefix_op); \
     _Pragma("unroll") \
     for (I i = 0; i < ITEMS_PER_THREAD; i++) \
-        states_u32[threadIdx.x * ITEMS_PER_THREAD + i] = st[i]; \
+        ((volatile state_t*) states_u64)[threadIdx.x * ITEMS_PER_THREAD + i] = st[i]; \
     __syncthreads(); \
     copyFromShrToGlb<uint32_t, I, ITEMS_PER_THREAD>( \
-        glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE, size, states_u32, d_states_out); \
+        glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE, size, (volatile uint32_t*) states_u64, d_states_out); \
     if (dyn_index == num_logical_blocks - 1 && threadIdx.x == BLOCK_SIZE - 1) \
         *is_valid = is_accept(st[ITEMS_PER_THREAD - 1]);
 
@@ -1394,11 +1394,11 @@ static void launchLexerAlpaccShmemTwoPassV2(
         d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
 }
 
-// Shmem bytes for P1 U32 variant: compose table (state_t) + states (uint32_t).
+// Shmem bytes for P1 U64 variant: compose table (state_t) + states (uint64_t).
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 static inline size_t dynShmemBytesP1V2U32() {
     size_t compose = NUM_STATES * NUM_STATES * sizeof(state_t);
-    size_t states  = (size_t) ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(uint32_t);
+    size_t states  = (size_t) ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(uint64_t);
     return compose + states;
 }
 
