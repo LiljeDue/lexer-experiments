@@ -1056,19 +1056,19 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     LEXER_TWO_PASS_V2_P1_BODY
 }
 
-// Striped P1: loads IPT bytes per thread with stride-1 coalesced u8 reads,
-// maps to states in registers, then stripedToBlocked transpose (conflict-free
-// shmem writes at stride-1) before the scan. Output written directly from
-// scan registers to global, skipping copyFromShrToGlb.
-#define LEXER_TWO_PASS_V2_P1_STRIPED_BODY \
+// P1 variant with uint32_t shmem states: same u64 load pattern but stores
+// each state as 4 bytes instead of 2, reducing bank conflicts from 8-way to 4-way.
+// compose table and to_state table stay uint16_t (state_t); only the scratch
+// states[] array is widened.
+#define LEXER_TWO_PASS_V2_P1_U32_BODY \
     using BlockScanState = cub::BlockScan<state_t, BLOCK_SIZE>; \
     using PrefixOpState  = TilePrefixCallbackOp<state_t, LexerCtxShmem>; \
     __shared__ typename BlockScanState::TempStorage temp_storage; \
     __shared__ typename PrefixOpState::TempStorage  prefix_storage; \
     __shared__ state_t to_state_shr[256]; \
     extern __shared__ uint16_t dyn_shmem_p1[]; \
-    volatile state_t* shmem_compose = (volatile state_t*) dyn_shmem_p1; \
-    volatile state_t* states        = shmem_compose + NUM_STATES * NUM_STATES; \
+    volatile state_t*   shmem_compose = (volatile state_t*) dyn_shmem_p1; \
+    volatile uint32_t*  states_u32    = (volatile uint32_t*)(shmem_compose + NUM_STATES * NUM_STATES); \
     state_t st[ITEMS_PER_THREAD]; \
     uint32_t dyn_index = dynamicIndex<uint32_t>(dyn_index_ptr); \
     I glb_offs = dyn_index * BLOCK_SIZE * ITEMS_PER_THREAD; \
@@ -1077,33 +1077,56 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     ctx.d_compose = (state_t*) shmem_compose; \
     copyFromGlbToShr<state_t, I, 1>(0, 256, 256, ctx.d_to_state, to_state_shr); \
     __syncthreads(); \
-    _Pragma("unroll") \
-    for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
-        I gid = glb_offs + i * BLOCK_SIZE + threadIdx.x; \
-        uint8_t b = (gid < size) ? d_in[gid] : 0; \
-        st[i] = (gid < size) ? to_state_shr[b] : identity; \
+    { \
+        const I U8    = sizeof(uint64_t); \
+        const I TILE  = ITEMS_PER_THREAD * BLOCK_SIZE; \
+        const I LOADS = 1 + ITEMS_PER_THREAD / U8; \
+        uint64_t regs[LOADS]; \
+        uint8_t* bytes = (uint8_t*)regs; \
+        _Pragma("unroll") \
+        for (I i = 0; i < LOADS; i++) { \
+            I base = i * BLOCK_SIZE + threadIdx.x; \
+            I gid  = glb_offs + base * U8; \
+            if (gid + U8 <= size) \
+                regs[i] = *reinterpret_cast<const uint64_t*>(d_in + gid); \
+            else { \
+                regs[i] = 0; \
+                _Pragma("unroll") \
+                for (I j = 0; j < U8; j++) \
+                    if (gid + j < size) bytes[i * U8 + j] = d_in[gid + j]; \
+            } \
+        } \
+        _Pragma("unroll") \
+        for (I i = 0; i < LOADS; i++) { \
+            _Pragma("unroll") \
+            for (I j = 0; j < U8; j++) { \
+                I lid = (i * BLOCK_SIZE + threadIdx.x) * U8 + j; \
+                if (lid < TILE) \
+                    states_u32[lid] = (glb_offs + lid < size) \
+                                      ? to_state_shr[bytes[i * U8 + j]] : identity; \
+            } \
+        } \
     } \
-    stripedToBlocked<state_t, I, BLOCK_SIZE, ITEMS_PER_THREAD>(st, states); \
+    __syncthreads(); \
+    _Pragma("unroll") \
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) \
+        st[i] = (state_t) states_u32[threadIdx.x * ITEMS_PER_THREAD + i]; \
     PrefixOpState prefix_op(state_states, prefix_storage, ctx, (int)dyn_index, state_t(IDENTITY)); \
     BlockScanState(temp_storage).InclusiveScan(st, st, ctx, prefix_op); \
     _Pragma("unroll") \
-    for (I i = 0; i < ITEMS_PER_THREAD; i++) { \
-        I gid = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i; \
-        if (gid < size) d_states_out[gid] = st[i]; \
-    } \
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) \
+        states_u32[threadIdx.x * ITEMS_PER_THREAD + i] = st[i]; \
+    __syncthreads(); \
+    copyFromShrToGlb<state_t, I, ITEMS_PER_THREAD>( \
+        glb_offs, ITEMS_PER_THREAD * BLOCK_SIZE, size, \
+        (volatile state_t*) states_u32, d_states_out); \
     if (dyn_index == num_logical_blocks - 1 && threadIdx.x == BLOCK_SIZE - 1) \
         *is_valid = is_accept(st[ITEMS_PER_THREAD - 1]);
 
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
 __global__
-void lexerAlpaccShmemTwoPassV2P1Striped(LEXER_TWO_PASS_V2_P1_PARAMS) {
-    LEXER_TWO_PASS_V2_P1_STRIPED_BODY
-}
-
-template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__ __launch_bounds__(BLOCK_SIZE, 6)
-void lexerAlpaccShmemTwoPassV2P1StripedLB6(LEXER_TWO_PASS_V2_P1_PARAMS) {
-    LEXER_TWO_PASS_V2_P1_STRIPED_BODY
+void lexerAlpaccShmemTwoPassV2P1U32(LEXER_TWO_PASS_V2_P1_PARAMS) {
+    LEXER_TWO_PASS_V2_P1_U32_BODY
 }
 
 #define LEXER_TWO_PASS_V2_P2_BODY \
@@ -1246,27 +1269,6 @@ static void launchLexerAlpaccShmemTwoPassV2P1(
 }
 
 
-// LB6=false → no launch_bounds, LB6=true → __launch_bounds__(BS1, 6)
-template<typename I, I BS1, I IPT1, bool LB6=false>
-static void launchLexerAlpaccShmemTwoPassV2P1Striped(
-      LexerCtxShmem ctx,
-      uint8_t* d_in, state_t* d_states_glb,
-      ScanTileState<state_t> state_states,
-      I size, I nlb1,
-      volatile uint32_t* dyn_index_ptr1, volatile bool* is_valid) {
-    void* kernel = LB6
-        ? (void*) lexerAlpaccShmemTwoPassV2P1StripedLB6<I, BS1, IPT1>
-        : (void*) lexerAlpaccShmemTwoPassV2P1Striped<I, BS1, IPT1>;
-    size_t shmem_bytes = dynShmemBytesP1V2<I, BS1, IPT1>();
-    gpuAssert(cudaFuncSetAttribute(kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
-    if (LB6)
-        lexerAlpaccShmemTwoPassV2P1StripedLB6<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
-            ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
-    else
-        lexerAlpaccShmemTwoPassV2P1Striped<I, BS1, IPT1><<<nlb1, BS1, shmem_bytes>>>(
-            ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
-}
 
 template<typename I, I BS2, I IPT2, uint32_t NREG2=64>
 static void launchLexerAlpaccShmemTwoPassV2P2(
@@ -1303,8 +1305,31 @@ static void launchLexerAlpaccShmemTwoPassV2(
         d_states_glb, d_index_out, d_token_out, index_states, size, nlb2, dyn_index_ptr2, new_size);
 }
 
-template<typename I, I BS1, I IPT1, I BS2, I IPT2, bool LB6=false>
-static void launchLexerAlpaccShmemTwoPassV2Striped(
+// Shmem bytes for P1 U32 variant: compose table (state_t) + states (uint32_t).
+template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+static inline size_t dynShmemBytesP1V2U32() {
+    size_t compose = NUM_STATES * NUM_STATES * sizeof(state_t);
+    size_t states  = (size_t) ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(uint32_t);
+    return compose + states;
+}
+
+template<typename I, I BS1, I IPT1>
+static void launchLexerAlpaccShmemTwoPassV2P1U32(
+      LexerCtxShmem ctx,
+      uint8_t* d_in, state_t* d_states_glb,
+      ScanTileState<state_t> state_states,
+      I size, I nlb1,
+      volatile uint32_t* dyn_index_ptr1, volatile bool* is_valid) {
+    auto kernel = lexerAlpaccShmemTwoPassV2P1U32<I, BS1, IPT1>;
+    size_t shmem_bytes = dynShmemBytesP1V2U32<I, BS1, IPT1>();
+    gpuAssert(cudaFuncSetAttribute(kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
+    kernel<<<nlb1, BS1, shmem_bytes>>>(
+        ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid, IDENTITY);
+}
+
+template<typename I, I BS1, I IPT1, I BS2, I IPT2>
+static void launchLexerAlpaccShmemTwoPassV2U32(
       LexerCtxShmem ctx,
       uint8_t* d_in, uint32_t* d_index_out, token_t* d_token_out,
       ScanTileState<state_t> state_states, ScanTileState<I> index_states,
@@ -1312,7 +1337,7 @@ static void launchLexerAlpaccShmemTwoPassV2Striped(
       volatile uint32_t* dyn_index_ptr1, volatile uint32_t* dyn_index_ptr2,
       volatile I* new_size, volatile bool* is_valid,
       state_t* d_states_glb) {
-    launchLexerAlpaccShmemTwoPassV2P1Striped<I, BS1, IPT1, LB6>(
+    launchLexerAlpaccShmemTwoPassV2P1U32<I, BS1, IPT1>(
         ctx, d_in, d_states_glb, state_states, size, nlb1, dyn_index_ptr1, is_valid);
     gpuAssert(cudaDeviceSynchronize());
     launchLexerAlpaccShmemTwoPassV2P2<I, BS2, IPT2>(
@@ -1969,8 +1994,8 @@ void testLexerAlpaccShmemDyn(uint8_t* input,
 }
 
 
-template<uint32_t BS1, uint32_t IPT1, uint32_t BS2, uint32_t IPT2, bool LB6=false>
-void testLexerAlpaccShmemTwoPassV2Striped(uint8_t* input,
+template<uint32_t BS1, uint32_t IPT1, uint32_t BS2, uint32_t IPT2>
+void testLexerAlpaccShmemTwoPassV2U32(uint8_t* input,
                size_t input_size,
                uint32_t* expected_indices,
                token_t* expected_tokens,
@@ -2028,7 +2053,7 @@ void testLexerAlpaccShmemTwoPassV2Striped(uint8_t* input,
     };
     reset();
     for (I i = 0; i < WARMUP_RUNS; ++i) {
-        launchLexerAlpaccShmemTwoPassV2Striped<I, BS1, IPT1, BS2, IPT2, LB6>(
+        launchLexerAlpaccShmemTwoPassV2U32<I, BS1, IPT1, BS2, IPT2>(
             ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
             size, NLB1, NLB2, d_dyn_index_ptr1, d_dyn_index_ptr2,
             d_new_size, d_is_valid, d_states_glb);
@@ -2037,7 +2062,7 @@ void testLexerAlpaccShmemTwoPassV2Striped(uint8_t* input,
     }
     for (I i = 0; i < RUNS; ++i) {
         cudaEventRecord(start, 0);
-        launchLexerAlpaccShmemTwoPassV2P1Striped<I, BS1, IPT1, LB6>(
+        launchLexerAlpaccShmemTwoPassV2P1U32<I, BS1, IPT1>(
             ctx, d_in, d_states_glb, d_state_states,
             size, NLB1, d_dyn_index_ptr1, d_is_valid);
         gpuAssert(cudaDeviceSynchronize());
@@ -2062,7 +2087,7 @@ void testLexerAlpaccShmemTwoPassV2Striped(uint8_t* input,
     const I P1_BYTES = IN_READ + STATES_GLB_WRITE;
     const I P2_BYTES = STATES_GLB_READ + OUT_WRITE;
     reset();
-    launchLexerAlpaccShmemTwoPassV2Striped<I, BS1, IPT1, BS2, IPT2, LB6>(
+    launchLexerAlpaccShmemTwoPassV2U32<I, BS1, IPT1, BS2, IPT2>(
         ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
         size, NLB1, NLB2, d_dyn_index_ptr1, d_dyn_index_ptr2,
         d_new_size, d_is_valid, d_states_glb);
@@ -2523,10 +2548,8 @@ int main(int32_t argc, char *argv[]) {
     testBwCeilingRead<256, 22>(input, input_size);
     printf(PAD, "2Pass V2 BS256/IPT22 (NregNone):");
     testLexerAlpaccShmemTwoPassV2<256, 22, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS256/IPT22 (striped):");
-    testLexerAlpaccShmemTwoPassV2Striped<256, 22, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS256/IPT22 (striped LB6):");
-    testLexerAlpaccShmemTwoPassV2Striped<256, 22, 256, 18, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "2Pass V2 BS256/IPT22 (U32 shmem):");
+    testLexerAlpaccShmemTwoPassV2U32<256, 22, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
