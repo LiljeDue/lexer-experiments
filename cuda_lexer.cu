@@ -7,6 +7,13 @@
 #include "common/data.h"
 #include <math.h>
 #define PAD "%-38s "
+// Apply minnctapersm=6 only on sm_80+ (A100). sm_75 has fewer registers
+// and the hint would be out of range, producing a ptxas warning.
+#if __CUDA_ARCH__ >= 800
+#define LB_P1 __launch_bounds__(256, 6)
+#else
+#define LB_P1 __launch_bounds__(256)
+#endif
 
 using token_t = uint8_t;
 using state_t = uint16_t;
@@ -868,7 +875,7 @@ void lexerAlpaccShmemTwoPassV2P1(LEXER_TWO_PASS_V2_P1_PARAMS) {
 }
 
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__ __launch_bounds__(256, 6)
+__global__ LB_P1
 void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     LEXER_TWO_PASS_V2_P1_BODY
 }
@@ -915,7 +922,7 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     volatile bool* is_valid, state_t identity
 
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__ __launch_bounds__(256, 6)
+__global__ LB_P1
 void lexerAlpaccShmemTwoPassV2P1Add(LEXER_TWO_PASS_V2_P1_ADD_PARAMS) {
     LEXER_TWO_PASS_V2_P1_ADD_BODY
 }
