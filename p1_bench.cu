@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
+#include <thrust/iterator/transform_iterator.h>
 
 // ---------------------------------------------------------------------------
 // GPU error checking
@@ -255,11 +256,19 @@ __device__ inline uint32_t dynamicIndex(volatile uint32_t* ptr) {
 // DFA composition: compose(a, b) gives the state reached by first applying
 // transition a, then transition b.
 struct ComposeOp {
-    state_t* d_compose;   // NUM_STATES*NUM_STATES table in shmem
+    state_t* d_compose;   // NUM_STATES*NUM_STATES table (shmem or global)
 
     __device__ __forceinline__ state_t
     operator()(state_t a, state_t b) const {
         return d_compose[(b & 15u) * NUM_STATES + (a & 15u)];
+    }
+};
+
+// Functor for TransformInputIterator: maps a raw byte to its initial state.
+struct ByteToState {
+    state_t* d_to_state;
+    __device__ __forceinline__ state_t operator()(uint8_t byte) const {
+        return d_to_state[byte];
     }
 };
 
@@ -658,6 +667,42 @@ int main(int argc, char** argv) {
             gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
         }
         print_stats(ms, BENCH_RUNS, p1_bytes);
+    }
+
+    // ------------------------------------------------------------------
+    // P1 DeviceScan (CUB DeviceScan::InclusiveScan with TransformInputIterator)
+    // Bytes are mapped to initial states on-the-fly via ByteToState functor;
+    // the compose table is in global memory (no shmem available inside DeviceScan).
+    // ------------------------------------------------------------------
+    {
+        ByteToState byte_to_state{d_to_state_glb};
+        auto        d_in_states = thrust::make_transform_iterator(d_in, byte_to_state);
+        ComposeOp    compose_op{d_compose_glb};
+        size_t       p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+
+        void*  d_temp = nullptr;
+        size_t temp_bytes = 0;
+        cub::DeviceScan::InclusiveScan(d_temp, temp_bytes, d_in_states, d_states_out,
+                                       compose_op, (int)size);
+        gpuAssert(cudaMalloc(&d_temp, temp_bytes));
+
+        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (DeviceScan):", "P1:");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            cub::DeviceScan::InclusiveScan(d_temp, temp_bytes, d_in_states, d_states_out,
+                                           compose_op, (int)size);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            gpuAssert(cudaEventRecord(t0));
+            cub::DeviceScan::InclusiveScan(d_temp, temp_bytes, d_in_states, d_states_out,
+                                           compose_op, (int)size);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, p1_bytes);
+        gpuAssert(cudaFree(d_temp));
     }
 
     // ------------------------------------------------------------------
