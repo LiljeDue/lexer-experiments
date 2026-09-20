@@ -542,8 +542,13 @@ bw_ceiling(const uint8_t* __restrict__ d_in, uint32_t size, uint64_t* d_out)
 
 static const uint32_t BLOCK_SIZE       = 256;
 static const uint32_t ITEMS_PER_THREAD = 22;
+#ifdef PROFILE
+static const uint32_t WARMUP_RUNS      = 1;
+static const uint32_t BENCH_RUNS       = 1;
+#else
 static const uint32_t WARMUP_RUNS      = 500;
 static const uint32_t BENCH_RUNS       = 100;
+#endif
 
 static uint32_t num_tiles(uint32_t size) {
     return (size + BLOCK_SIZE * ITEMS_PER_THREAD - 1) / (BLOCK_SIZE * ITEMS_PER_THREAD);

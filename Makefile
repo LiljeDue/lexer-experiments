@@ -134,12 +134,13 @@ test: $(CUDA_DEBUG_PROGRAM)
 	@./$(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)==============================$(DEFAULT)"
 
-profile_p1: $(P1_BENCH_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in
+profile_p1: $(DATA_PATH)/tokens_dense_500MiB.in
+	$(COMPILER) $(FLAGS) -DPROFILE -lineinfo -o $(P1_BENCH_PROGRAM)_profile p1_bench.cu
 	-ncu --set full \
 	    --import-source 1 \
 	    --source-folders . \
 	    --target-processes all \
-	    ./$(P1_BENCH_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in \
+	    ./$(P1_BENCH_PROGRAM)_profile $(DATA_PATH)/tokens_dense_500MiB.in \
 	    > profile_p1.txt 2>&1
 
 scan_bench: scan_bench.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h
@@ -152,5 +153,5 @@ devinfo:
 	rm -f devinfo
 
 clean:
-	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM) $(CUDA_PROFILE_PROGRAM) $(P1_BENCH_PROGRAM) $(FUTHARK_PROGRAM) *.out
+	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM) $(CUDA_PROFILE_PROGRAM) $(P1_BENCH_PROGRAM) $(P1_BENCH_PROGRAM)_profile $(FUTHARK_PROGRAM) *.out
 	rm -f $(DATA_PATH)/tokens_*_1GiB.in
