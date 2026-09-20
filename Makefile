@@ -11,7 +11,9 @@ DEFAULT=\033[39m
 
 default: bench
 
-.PHONY: clean bench bench1g test devinfo profile_p1
+P1_BENCH_PROGRAM=p1_bench
+
+.PHONY: clean bench test devinfo profile_p1 bench_p1
 
 $(DATA_PATH)/tokens_dense_500MiB.in:
 	(cd $(DATA_PATH) && make)
@@ -71,6 +73,14 @@ bench: $(FUTHARK_PROGRAM) \
 	@./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_moderate_500MiB.in tokens_indices_moderate_500MiB.out tokens_tokens_moderate_500MiB.out
 	@echo ""
 	@./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_sparse_500MiB.in tokens_indices_sparse_500MiB.out tokens_tokens_sparse_500MiB.out
+	@echo -e "$(GREEN)============$(DEFAULT)"
+
+$(P1_BENCH_PROGRAM): p1_bench.cu
+	$(COMPILER) $(FLAGS) -o $@ $<
+
+bench_p1: $(P1_BENCH_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in
+	@echo -e "$(GREEN)=== P1 BENCH ===$(DEFAULT)"
+	@./$(P1_BENCH_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in
 	@echo -e "$(GREEN)============$(DEFAULT)"
 
 $(DATA_PATH)/tokens_dense_1GiB.in:
@@ -144,5 +154,5 @@ devinfo:
 	rm -f devinfo
 
 clean:
-	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM) $(CUDA_PROFILE_PROGRAM) $(FUTHARK_PROGRAM) *.out
+	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM) $(CUDA_PROFILE_PROGRAM) $(P1_BENCH_PROGRAM) $(FUTHARK_PROGRAM) *.out
 	rm -f $(DATA_PATH)/tokens_*_1GiB.in
