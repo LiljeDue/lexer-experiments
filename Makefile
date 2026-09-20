@@ -134,14 +134,12 @@ test: $(CUDA_DEBUG_PROGRAM)
 	@./$(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)==============================$(DEFAULT)"
 
-profile_p1: $(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
+profile_p1: $(P1_BENCH_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in
 	-ncu --set full \
 	    --import-source 1 \
 	    --source-folders . \
-	    --kernel-name-base function \
-	    --kernel-name regex:TwoPassV2P1 \
 	    --target-processes all \
-	    ./$(CUDA_PROFILE_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out \
+	    ./$(P1_BENCH_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in \
 	    > profile_p1.txt 2>&1
 
 scan_bench: scan_bench.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h
