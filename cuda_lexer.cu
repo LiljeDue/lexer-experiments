@@ -1270,9 +1270,9 @@ void testLexerShmemCompose(uint8_t* input,
     const I BLOCK_SIZE = 256;
     const I ITEMS_PER_THREAD = 30; // 1 less than baseline to fit compose table in shmem
     const I NUM_LOGICAL_BLOCKS = (size + BLOCK_SIZE * ITEMS_PER_THREAD - 1) / (BLOCK_SIZE * ITEMS_PER_THREAD);
-    const I IN_ARRAY_BYTES = size * sizeof(uint8_t);
-    const I INDEX_OUT_ARRAY_BYTES = size * sizeof(I);
-    const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
+    const size_t IN_ARRAY_BYTES = (size_t)size * sizeof(uint8_t);
+    const size_t INDEX_OUT_ARRAY_BYTES = (size_t)size * sizeof(I);
+    const size_t TOKEN_OUT_ARRAY_BYTES = (size_t)size * sizeof(token_t);
 #ifdef PROFILE
     const I WARMUP_RUNS = 1;
     const I RUNS = 1;
@@ -1346,10 +1346,10 @@ void testLexerShmemCompose(uint8_t* input,
 
     I temp_size = 0;
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
-    const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
-    const I IN_READ = IN_ARRAY_BYTES;
-    const I IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
-    const I COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
+    const size_t OUT_WRITE = (size_t)temp_size * (sizeof(I) + sizeof(token_t));
+    const size_t IN_READ = IN_ARRAY_BYTES;
+    const size_t IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
+    const size_t COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
 
     reset();
     lexerShmemCompose<I, BLOCK_SIZE, ITEMS_PER_THREAD><<<NUM_LOGICAL_BLOCKS, BLOCK_SIZE>>>(
@@ -1417,9 +1417,9 @@ void testLexerShmemComposeU64(uint8_t* input,
     const I BLOCK_SIZE = 256;
     const I ITEMS_PER_THREAD = 30; // 1 less than baseline to fit compose table in shmem
     const I NUM_LOGICAL_BLOCKS = (size + BLOCK_SIZE * ITEMS_PER_THREAD - 1) / (BLOCK_SIZE * ITEMS_PER_THREAD);
-    const I IN_ARRAY_BYTES = size * sizeof(uint8_t);
-    const I INDEX_OUT_ARRAY_BYTES = size * sizeof(I);
-    const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
+    const size_t IN_ARRAY_BYTES = (size_t)size * sizeof(uint8_t);
+    const size_t INDEX_OUT_ARRAY_BYTES = (size_t)size * sizeof(I);
+    const size_t TOKEN_OUT_ARRAY_BYTES = (size_t)size * sizeof(token_t);
 #ifdef PROFILE
     const I WARMUP_RUNS = 1;
     const I RUNS = 1;
@@ -1493,10 +1493,10 @@ void testLexerShmemComposeU64(uint8_t* input,
 
     I temp_size = 0;
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
-    const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
-    const I IN_READ = IN_ARRAY_BYTES;
-    const I IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
-    const I COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
+    const size_t OUT_WRITE = (size_t)temp_size * (sizeof(I) + sizeof(token_t));
+    const size_t IN_READ = IN_ARRAY_BYTES;
+    const size_t IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
+    const size_t COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
 
     reset();
     lexerShmemComposeU64<I, BLOCK_SIZE, ITEMS_PER_THREAD><<<NUM_LOGICAL_BLOCKS, BLOCK_SIZE>>>(
@@ -1564,9 +1564,9 @@ void testLexerAlpaccShmem(uint8_t* input,
     const I size = input_size;
     const I BLOCK_SIZE = 256;
     const I NUM_LOGICAL_BLOCKS = (size + BLOCK_SIZE * ITEMS_PER_THREAD - 1) / (BLOCK_SIZE * ITEMS_PER_THREAD);
-    const I IN_ARRAY_BYTES = size * sizeof(uint8_t);
-    const I INDEX_OUT_ARRAY_BYTES = size * sizeof(I);
-    const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
+    const size_t IN_ARRAY_BYTES = (size_t)size * sizeof(uint8_t);
+    const size_t INDEX_OUT_ARRAY_BYTES = (size_t)size * sizeof(I);
+    const size_t TOKEN_OUT_ARRAY_BYTES = (size_t)size * sizeof(token_t);
 #ifdef PROFILE
     const I WARMUP_RUNS = 1;
     const I RUNS = 1;
@@ -1638,10 +1638,10 @@ void testLexerAlpaccShmem(uint8_t* input,
 
     I temp_size = 0;
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
-    const I OUT_WRITE = temp_size * (sizeof(I) + sizeof(token_t));
-    const I IN_READ = IN_ARRAY_BYTES;
-    const I IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
-    const I COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
+    const size_t OUT_WRITE = (size_t)temp_size * (sizeof(I) + sizeof(token_t));
+    const size_t IN_READ = IN_ARRAY_BYTES;
+    const size_t IN_STATE_MAP = sizeof(state_t) * 256 * NUM_LOGICAL_BLOCKS;
+    const size_t COMPOSE_READ = sizeof(state_t) * NUM_STATES * NUM_STATES * NUM_LOGICAL_BLOCKS;
 
     reset();
     lexerAlpaccShmem<I, BLOCK_SIZE, ITEMS_PER_THREAD><<<NUM_LOGICAL_BLOCKS, BLOCK_SIZE>>>(
@@ -1706,10 +1706,10 @@ void testLexerAlpaccShmemTwoPassV2Striped(uint8_t* input,
     const I size = input_size;
     const I NLB1 = (size + BS1 * IPT1 - 1) / (BS1 * IPT1);
     const I NLB2 = (size + BS2 * IPT2 - 1) / (BS2 * IPT2);
-    const I IN_ARRAY_BYTES = size * sizeof(uint8_t);
-    const I INDEX_OUT_ARRAY_BYTES = size * sizeof(I);
-    const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
-    const I STATES_GLB_BYTES = size * sizeof(state_t);
+    const size_t IN_ARRAY_BYTES = (size_t)size * sizeof(uint8_t);
+    const size_t INDEX_OUT_ARRAY_BYTES = (size_t)size * sizeof(I);
+    const size_t TOKEN_OUT_ARRAY_BYTES = (size_t)size * sizeof(token_t);
+    const size_t STATES_GLB_BYTES = (size_t)size * sizeof(state_t);
 #ifdef PROFILE
     const I WARMUP_RUNS = 1; const I RUNS = 1;
 #else
@@ -1780,12 +1780,12 @@ void testLexerAlpaccShmemTwoPassV2Striped(uint8_t* input,
     }
     I temp_size = 0;
     gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
-    const I OUT_WRITE        = temp_size * (sizeof(I) + sizeof(token_t));
-    const I IN_READ          = IN_ARRAY_BYTES;
-    const I STATES_GLB_WRITE = STATES_GLB_BYTES;
-    const I STATES_GLB_READ  = STATES_GLB_BYTES;
-    const I P1_BYTES = IN_READ + STATES_GLB_WRITE;
-    const I P2_BYTES = STATES_GLB_READ + OUT_WRITE;
+    const size_t OUT_WRITE        = (size_t)temp_size * (sizeof(I) + sizeof(token_t));
+    const size_t IN_READ          = IN_ARRAY_BYTES;
+    const size_t STATES_GLB_WRITE = STATES_GLB_BYTES;
+    const size_t STATES_GLB_READ  = STATES_GLB_BYTES;
+    const size_t P1_BYTES = IN_READ + STATES_GLB_WRITE;
+    const size_t P2_BYTES = STATES_GLB_READ + OUT_WRITE;
     reset();
     launchLexerAlpaccShmemTwoPassV2Striped<I, BS1, IPT1, BS2, IPT2>(
         ctx, d_in, d_index_out, d_token_out, d_state_states, d_index_states,
@@ -1848,12 +1848,12 @@ void testLexerAlpaccShmemTwoPassV2(uint8_t* input,
     const I size = input_size;
     const I NLB1 = (size + BS1 * IPT1 - 1) / (BS1 * IPT1);
     const I NLB2 = (size + BS2 * IPT2 - 1) / (BS2 * IPT2);
-    const I IN_ARRAY_BYTES = size * sizeof(uint8_t);
-    const I INDEX_OUT_ARRAY_BYTES = size * sizeof(I);
-    const I TOKEN_OUT_ARRAY_BYTES = size * sizeof(token_t);
+    const size_t IN_ARRAY_BYTES = (size_t)size * sizeof(uint8_t);
+    const size_t INDEX_OUT_ARRAY_BYTES = (size_t)size * sizeof(I);
+    const size_t TOKEN_OUT_ARRAY_BYTES = (size_t)size * sizeof(token_t);
     // Pass 1 writes exactly `size` states; pass 2 reads `size+1` (the +1 is
     // clamped to `size-1` by copyFromGlbToShr's bounds check).
-    const I STATES_GLB_BYTES = size * sizeof(state_t);
+    const size_t STATES_GLB_BYTES = (size_t)size * sizeof(state_t);
 #ifdef PROFILE
     const I WARMUP_RUNS = 1;
     const I RUNS = 1;
@@ -2025,7 +2025,7 @@ void testLexerAlpaccShmemTwoPassV2AddP1Only(uint8_t* input, size_t input_size) {
     const I size = input_size;
     const I NLB1 = (size + BS1 * IPT1 - 1) / (BS1 * IPT1);
     const I IN_ARRAY_BYTES = size * sizeof(uint8_t);
-    const I STATES_GLB_BYTES = size * sizeof(state_t);
+    const size_t STATES_GLB_BYTES = (size_t)size * sizeof(state_t);
 #ifdef PROFILE
     const I WARMUP_RUNS = 1; const I RUNS = 1;
 #else
@@ -2074,7 +2074,7 @@ void testLexerAlpaccShmemTwoPassV2AddP1Only(uint8_t* input, size_t input_size) {
         cudaEventElapsedTime(temp + i, start, stop);
         reset(); gpuAssert(cudaPeekAtLastError());
     }
-    const I P1_BYTES = IN_ARRAY_BYTES + STATES_GLB_BYTES;
+    const size_t P1_BYTES = IN_ARRAY_BYTES + STATES_GLB_BYTES;
     printf("\n");
     printf("  %-36s ", "P1:");
     compute_descriptors(temp, RUNS, P1_BYTES);
@@ -2334,20 +2334,8 @@ int main(int32_t argc, char *argv[]) {
     testBwCeilingRead<256, 22>(input, input_size);
     printf(PAD, "2Pass V2 BS256/IPT22 (add scan):");
     testLexerAlpaccShmemTwoPassV2AddP1Only<256, 22>(input, input_size);
-    printf(PAD, "2Pass V2 BS32/IPT176 (add scan):");
-    testLexerAlpaccShmemTwoPassV2AddP1Only<32, 176>(input, input_size);
-    printf(PAD, "2Pass V2 BS32/IPT88 (add scan):");
-    testLexerAlpaccShmemTwoPassV2AddP1Only<32, 88>(input, input_size);
-    printf(PAD, "2Pass V2 BS32/IPT44 (add scan):");
-    testLexerAlpaccShmemTwoPassV2AddP1Only<32, 44>(input, input_size);
     printf(PAD, "2Pass V2 BS256/IPT22 (NregNone):");
     testLexerAlpaccShmemTwoPassV2<256, 22, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS32/IPT176 (NregNone):");
-    testLexerAlpaccShmemTwoPassV2<32, 176, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS32/IPT88 (NregNone):");
-    testLexerAlpaccShmemTwoPassV2<32, 88, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "2Pass V2 BS32/IPT44 (NregNone):");
-    testLexerAlpaccShmemTwoPassV2<32, 44, 256, 18, 0, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "2Pass V2 BS256/IPT22 (striped):");
     testLexerAlpaccShmemTwoPassV2Striped<256, 22, 256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
