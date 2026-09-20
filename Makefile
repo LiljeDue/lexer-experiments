@@ -11,7 +11,7 @@ DEFAULT=\033[39m
 
 default: bench
 
-.PHONY: clean bench test devinfo profile_p1
+.PHONY: clean bench bench1g test devinfo profile_p1
 
 $(DATA_PATH)/tokens_dense_500MiB.in:
 	(cd $(DATA_PATH) && make)
@@ -73,6 +73,52 @@ bench: $(FUTHARK_PROGRAM) \
 	@./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_sparse_500MiB.in tokens_indices_sparse_500MiB.out tokens_tokens_sparse_500MiB.out
 	@echo -e "$(GREEN)============$(DEFAULT)"
 
+$(DATA_PATH)/tokens_dense_1GiB.in:
+	$(DATA_PATH)/tokens 1073741824 0:10 > $@
+
+$(DATA_PATH)/tokens_moderate_1GiB.in:
+	$(DATA_PATH)/tokens 1073741824 100:110 > $@
+
+$(DATA_PATH)/tokens_sparse_1GiB.in:
+	$(DATA_PATH)/tokens 1073741824 1000:1010 > $@
+
+tokens_indices_dense_1GiB.out: $(DATA_PATH)/tokens_dense_1GiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'indices ($$loaddata "$<")' -b >$@
+
+tokens_indices_moderate_1GiB.out: $(DATA_PATH)/tokens_moderate_1GiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'indices ($$loaddata "$<")' -b >$@
+
+tokens_indices_sparse_1GiB.out: $(DATA_PATH)/tokens_sparse_1GiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'indices ($$loaddata "$<")' -b >$@
+
+tokens_tokens_dense_1GiB.out: $(DATA_PATH)/tokens_dense_1GiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'tokens ($$loaddata "$<")' -b >$@
+
+tokens_tokens_moderate_1GiB.out: $(DATA_PATH)/tokens_moderate_1GiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'tokens ($$loaddata "$<")' -b >$@
+
+tokens_tokens_sparse_1GiB.out: $(DATA_PATH)/tokens_sparse_1GiB.in $(FUTHARK_PROGRAM)
+	futhark script ./$(FUTHARK_PROGRAM) 'tokens ($$loaddata "$<")' -b >$@
+
+bench1g: $(FUTHARK_PROGRAM) \
+         $(DATA_PATH)/tokens_dense_1GiB.in \
+         $(DATA_PATH)/tokens_moderate_1GiB.in \
+         $(DATA_PATH)/tokens_sparse_1GiB.in \
+         tokens_indices_dense_1GiB.out \
+         tokens_indices_moderate_1GiB.out \
+         tokens_indices_sparse_1GiB.out \
+         tokens_tokens_dense_1GiB.out \
+         tokens_tokens_moderate_1GiB.out \
+         tokens_tokens_sparse_1GiB.out \
+         $(CUDA_PROGRAM)
+	@echo -e "$(GREEN)=== CUDA LEXER 1GiB ===$(DEFAULT)"
+	@./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_dense_1GiB.in tokens_indices_dense_1GiB.out tokens_tokens_dense_1GiB.out
+	@echo ""
+	@./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_moderate_1GiB.in tokens_indices_moderate_1GiB.out tokens_tokens_moderate_1GiB.out
+	@echo ""
+	@./$(CUDA_PROGRAM) $(DATA_PATH)/tokens_sparse_1GiB.in tokens_indices_sparse_1GiB.out tokens_tokens_sparse_1GiB.out
+	@echo -e "$(GREEN)============$(DEFAULT)"
+
 test: $(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)=== CUDA LEXER DEBUG TESTS ===$(DEFAULT)"
 	@./$(CUDA_DEBUG_PROGRAM)
@@ -99,3 +145,4 @@ devinfo:
 
 clean:
 	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM) $(CUDA_PROFILE_PROGRAM) $(FUTHARK_PROGRAM) *.out
+	rm -f $(DATA_PATH)/tokens_*_1GiB.in
