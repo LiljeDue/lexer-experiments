@@ -868,7 +868,7 @@ void lexerAlpaccShmemTwoPassV2P1(LEXER_TWO_PASS_V2_P1_PARAMS) {
 }
 
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__
+__global__ __launch_bounds__(256, 6)
 void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     LEXER_TWO_PASS_V2_P1_BODY
 }
@@ -915,7 +915,7 @@ void lexerAlpaccShmemTwoPassV2P1NregNone(LEXER_TWO_PASS_V2_P1_PARAMS) {
     volatile bool* is_valid, state_t identity
 
 template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
-__global__
+__global__ __launch_bounds__(256, 6)
 void lexerAlpaccShmemTwoPassV2P1Add(LEXER_TWO_PASS_V2_P1_ADD_PARAMS) {
     LEXER_TWO_PASS_V2_P1_ADD_BODY
 }
