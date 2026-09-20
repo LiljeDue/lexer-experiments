@@ -3,7 +3,6 @@ COMMON_PATH=./common
 FUTHARK_PROGRAM=futhark_lexer
 CUDA_PROGRAM=cuda_lexer
 CUDA_DEBUG_PROGRAM=cuda_lexer_debug
-CUDA_PROFILE_PROGRAM=cuda_lexer_profile
 COMPILER?=nvcc
 FLAGS?=-O3 --std=c++14 -diag-suppress 550 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80
 GREEN=[32m
@@ -52,9 +51,6 @@ $(CUDA_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h 
 
 $(CUDA_DEBUG_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h
 	$(COMPILER) $(FLAGS) -DDEBUG -o $@ $<
-
-$(CUDA_PROFILE_PROGRAM): cuda_lexer.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h Makefile
-	$(COMPILER) $(FLAGS) -DPROFILE -lineinfo -o $@ $<
 
 bench: $(FUTHARK_PROGRAM) \
        $(DATA_PATH)/tokens_dense_500MiB.in \
@@ -143,15 +139,11 @@ profile_p1: $(DATA_PATH)/tokens_dense_500MiB.in
 	    ./$(P1_BENCH_PROGRAM)_profile $(DATA_PATH)/tokens_dense_500MiB.in \
 	    > profile_p1.txt 2>&1
 
-scan_bench: scan_bench.cu $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h
-	$(COMPILER) $(FLAGS) -o scan_bench $<
-	./scan_bench
-
 devinfo:
 	$(COMPILER) $(FLAGS) -o devinfo devinfo.cu
 	./devinfo
 	rm -f devinfo
 
 clean:
-	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM) $(CUDA_PROFILE_PROGRAM) $(P1_BENCH_PROGRAM) $(P1_BENCH_PROGRAM)_profile $(FUTHARK_PROGRAM) *.out
+	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM) $(P1_BENCH_PROGRAM) $(P1_BENCH_PROGRAM)_profile $(FUTHARK_PROGRAM) *.out
 	rm -f $(DATA_PATH)/tokens_*_1GiB.in
