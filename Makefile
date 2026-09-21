@@ -12,7 +12,7 @@ default: bench
 
 P1_BENCH_PROGRAM=p1_bench
 
-.PHONY: clean bench test devinfo profile_p1 bench_p1
+.PHONY: clean bench test devinfo profile_p1 bench_p1 profile
 
 $(DATA_PATH)/tokens_dense_500MiB.in:
 	(cd $(DATA_PATH) && make)
@@ -129,6 +129,16 @@ test: $(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)=== CUDA LEXER DEBUG TESTS ===$(DEFAULT)"
 	@./$(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)==============================$(DEFAULT)"
+
+profile: $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
+	$(COMPILER) $(FLAGS) -DPROFILE -lineinfo -o $(CUDA_PROGRAM)_profile cuda_lexer.cu
+	-ncu --set full \
+	    --import-source 1 \
+	    --source-folders . \
+	    --target-processes all \
+	    --export profile_lexer \
+	    ./$(CUDA_PROGRAM)_profile $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out 2>&1
+	-ncu --import profile_lexer.ncu-rep > profile_lexer.txt 2>&1
 
 profile_p1: $(DATA_PATH)/tokens_dense_500MiB.in
 	$(COMPILER) $(FLAGS) -DPROFILE -lineinfo -o $(P1_BENCH_PROGRAM)_profile p1_bench.cu
