@@ -304,9 +304,12 @@ __device__ inline void loadTablesToShmem(
 
 // Load ITEMS_PER_THREAD bytes per thread from d_in[glb_offs..] using
 // 64-bit coalesced loads, map each byte through to_state[], write
-// results to shmem in blocked layout (thread t owns positions
-// [t*IPT, (t+1)*IPT)).  Out-of-bounds positions get `identity`.
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+// results to shmem in blocked layout. Thread t writes to
+// [t*SHMEM_STRIDE, t*SHMEM_STRIDE + ITEMS_PER_THREAD).
+// SHMEM_STRIDE == ITEMS_PER_THREAD gives the standard layout;
+// SHMEM_STRIDE == ITEMS_PER_THREAD + 1 pads to avoid bank conflicts.
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD,
+         uint32_t SHMEM_STRIDE = ITEMS_PER_THREAD>
 __device__ inline void loadBytesAsStates(
     const uint8_t* __restrict__ d_in,
     uint32_t glb_offs, uint32_t size,
@@ -334,43 +337,59 @@ __device__ inline void loadBytesAsStates(
         #pragma unroll
         for (uint32_t j = 0; j < U8; j++) {
             uint32_t lid = base_byte + j;
-            if (lid < TILE)
-                states[lid] = (glb_offs + lid < size)
-                              ? to_state[bytes[j]] : identity;
+            if (lid < TILE) {
+                uint32_t t   = lid / ITEMS_PER_THREAD;
+                uint32_t off = lid % ITEMS_PER_THREAD;
+                states[t * SHMEM_STRIDE + off] = (glb_offs + lid < size)
+                                                 ? to_state[bytes[j]] : identity;
+            }
         }
     }
 }
 
-// Write IPT*BLOCK_SIZE state_t values from shmem (blocked layout) to
-// global memory using 64-bit coalesced stores.
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+// Write IPT*BLOCK_SIZE state_t values from shmem to global memory.
+// When SHMEM_STRIDE == ITEMS_PER_THREAD (no padding): uses 64-bit
+// coalesced stores. When SHMEM_STRIDE > ITEMS_PER_THREAD (padded):
+// each thread writes its IPT items directly (simple but correct).
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD,
+         uint32_t SHMEM_STRIDE = ITEMS_PER_THREAD>
 __device__ inline void writeShmemToGlb(
     uint32_t glb_offs, uint32_t size,
     const volatile state_t* shmem,
     state_t* __restrict__ d_out)
 {
-    const uint32_t U8        = sizeof(uint64_t);
-    const uint32_t NUM_BYTES = min(ITEMS_PER_THREAD * BLOCK_SIZE,
-                                   size - glb_offs) * sizeof(state_t);
-    // glb_offs is in state_t units; convert to bytes for the u64 store base
-    uint8_t* d_out_bytes = reinterpret_cast<uint8_t*>(d_out) + glb_offs * sizeof(state_t);
-    const uint32_t TOTAL_STORES = 1 + (NUM_BYTES - 1) / U8;
-    const uint32_t ITERS        = 1 + (TOTAL_STORES - 1) / (ITEMS_PER_THREAD * BLOCK_SIZE);
-    #pragma unroll
-    for (uint32_t j = 0; j < ITERS; j++) {
+    if constexpr (SHMEM_STRIDE == ITEMS_PER_THREAD) {
+        // Standard path: u64 coalesced stores.
+        const uint32_t U8        = sizeof(uint64_t);
+        const uint32_t NUM_BYTES = min(ITEMS_PER_THREAD * BLOCK_SIZE,
+                                       size - glb_offs) * sizeof(state_t);
+        uint8_t* d_out_bytes = reinterpret_cast<uint8_t*>(d_out) + glb_offs * sizeof(state_t);
+        const uint32_t TOTAL_STORES = 1 + (NUM_BYTES - 1) / U8;
+        const uint32_t ITERS        = 1 + (TOTAL_STORES - 1) / (ITEMS_PER_THREAD * BLOCK_SIZE);
+        #pragma unroll
+        for (uint32_t j = 0; j < ITERS; j++) {
+            #pragma unroll
+            for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+                uint32_t lid      = j * ITEMS_PER_THREAD * BLOCK_SIZE + i * BLOCK_SIZE + threadIdx.x;
+                uint32_t lid_byte = lid * U8;
+                if (lid_byte + U8 < NUM_BYTES)
+                    reinterpret_cast<uint64_t*>(d_out_bytes)[lid] =
+                        reinterpret_cast<const volatile uint64_t*>(shmem)[lid];
+                else {
+                    #pragma unroll
+                    for (uint32_t k = lid_byte; k < NUM_BYTES; k++)
+                        d_out_bytes[k] =
+                            reinterpret_cast<const volatile uint8_t*>(shmem)[k];
+                }
+            }
+        }
+    } else {
+        // Padded path: each thread writes its own IPT items sequentially.
+        uint32_t base = glb_offs + threadIdx.x * ITEMS_PER_THREAD;
         #pragma unroll
         for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
-            uint32_t lid      = j * ITEMS_PER_THREAD * BLOCK_SIZE + i * BLOCK_SIZE + threadIdx.x;
-            uint32_t lid_byte = lid * U8;
-            if (lid_byte + U8 < NUM_BYTES)
-                reinterpret_cast<uint64_t*>(d_out_bytes)[lid] =
-                    reinterpret_cast<const volatile uint64_t*>(shmem)[lid];
-            else {
-                #pragma unroll
-                for (uint32_t k = lid_byte; k < NUM_BYTES; k++)
-                    d_out_bytes[k] =
-                        reinterpret_cast<const volatile uint8_t*>(shmem)[k];
-            }
+            if (base + i < size)
+                d_out[base + i] = shmem[threadIdx.x * SHMEM_STRIDE + i];
         }
     }
 }
@@ -402,7 +421,10 @@ static void initScanTileState(ScanTileState& ts, int num_tiles) {
 
 // Full P1: load bytes, map to states via to_state[], inclusive prefix scan
 // using DFA composition, write prefixed states to d_states_out.
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+// SHMEM_STRIDE == ITEMS_PER_THREAD: standard layout (may have bank conflicts).
+// SHMEM_STRIDE == ITEMS_PER_THREAD + 1: padded layout, eliminates bank conflicts.
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD,
+         uint32_t SHMEM_STRIDE = ITEMS_PER_THREAD>
 __global__ LB_P1
 void p1_nregnone(
     state_t* __restrict__ d_compose_glb,
@@ -430,14 +452,14 @@ void p1_nregnone(
     uint32_t tile_idx = dynamicIndex(dyn_index_ptr);
     uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
 
-    loadBytesAsStates<BLOCK_SIZE, ITEMS_PER_THREAD>(
+    loadBytesAsStates<BLOCK_SIZE, ITEMS_PER_THREAD, SHMEM_STRIDE>(
         d_in, glb_offs, size, shmem_to_state, states, IDENTITY);
     __syncthreads();
 
     state_t st[ITEMS_PER_THREAD];
     #pragma unroll
     for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++)
-        st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
+        st[i] = states[threadIdx.x * SHMEM_STRIDE + i];
 
     ComposeOp compose_op{shmem_compose};
     PrefixOp  prefix_op(tile_state, prefix_tmp, compose_op, (int)tile_idx, IDENTITY);
@@ -445,10 +467,10 @@ void p1_nregnone(
 
     #pragma unroll
     for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++)
-        states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
+        states[threadIdx.x * SHMEM_STRIDE + i] = st[i];
     __syncthreads();
 
-    writeShmemToGlb<BLOCK_SIZE, ITEMS_PER_THREAD>(glb_offs, size, states, d_states_out);
+    writeShmemToGlb<BLOCK_SIZE, ITEMS_PER_THREAD, SHMEM_STRIDE>(glb_offs, size, states, d_states_out);
 }
 
 // Add scan P1: identical to p1_nregnone but uses integer addition as the
@@ -739,13 +761,16 @@ int main(int argc, char** argv) {
     }
 
     // ------------------------------------------------------------------
-    // P1 NregNone IPT=21 (odd IPT eliminates shmem bank conflicts on stores)
+    // P1 NregNone IPT=21 padded (SHMEM_STRIDE=22 eliminates bank conflicts)
+    // gcd(22, 32) = 2 with IPT=22; padding to stride=22 with IPT=21
+    // gives gcd(22, 64) / 2 conflict-free layout at the same shmem footprint.
     // ------------------------------------------------------------------
     {
-        const uint32_t IPT21  = 21;
-        uint32_t nlb21        = (size + BLOCK_SIZE * IPT21 - 1) / (BLOCK_SIZE * IPT21);
-        auto     kernel       = p1_nregnone<BLOCK_SIZE, IPT21>;
-        size_t   shmem        = (size_t)IPT21 * BLOCK_SIZE * sizeof(state_t);
+        const uint32_t IPT21    = 21;
+        const uint32_t STRIDE21 = 22;  // IPT + 1
+        uint32_t nlb21          = (size + BLOCK_SIZE * IPT21 - 1) / (BLOCK_SIZE * IPT21);
+        auto     kernel         = p1_nregnone<BLOCK_SIZE, IPT21, STRIDE21>;
+        size_t   shmem          = (size_t)STRIDE21 * BLOCK_SIZE * sizeof(state_t);
         size_t   p1_bytes     = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
 
         ScanTileState ts21;
