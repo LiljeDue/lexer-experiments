@@ -136,6 +136,7 @@ profile_p1: $(DATA_PATH)/tokens_dense_500MiB.in
 	    --import-source 1 \
 	    --source-folders . \
 	    --target-processes all \
+	    --export profile_p1 \
 	    ./$(P1_BENCH_PROGRAM)_profile $(DATA_PATH)/tokens_dense_500MiB.in \
 	    > profile_p1.txt 2>&1
 
