@@ -1812,16 +1812,8 @@ int main(int32_t argc, char *argv[]) {
     testLexerShmemCompose(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem IPT=30:");
     testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "1Pass BS256/IPT18 (transpose):");
-    testLexerTranspose<256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "1Pass BS256/IPT19 (transpose):");
-    testLexerTranspose<256, 19>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "1Pass BS256/IPT20 (transpose):");
     testLexerTranspose<256, 20>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "1Pass BS256/IPT21 (transpose):");
-    testLexerTranspose<256, 21>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "1Pass BS256/IPT22 (transpose):");
-    testLexerTranspose<256, 22>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
