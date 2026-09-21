@@ -863,51 +863,6 @@ int main(int argc, char** argv) {
         gpuAssert(cudaFree(d_dyn_cub));
     }
 
-    // ------------------------------------------------------------------
-    // IPT sweep: p1_nregnone at different ITEMS_PER_THREAD values.
-    // Fewer tiles = shorter lookback chain; more IPT = more shmem/registers.
-    // ------------------------------------------------------------------
-    auto bench_ipt = [&](const char* label, uint32_t ipt, auto kernel_fn) {
-        uint32_t nlb_v    = (size + BLOCK_SIZE * ipt - 1) / (BLOCK_SIZE * ipt);
-        size_t   shmem    = (size_t)ipt * BLOCK_SIZE * sizeof(state_t);
-        size_t   p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
-
-        ScanTileState ts_v;
-        gpuAssert(cudaMalloc(&ts_v.d_tile_descriptors, ScanTileState::AllocationSize(nlb_v)));
-        uint32_t* d_dyn_v;
-        gpuAssert(cudaMalloc(&d_dyn_v, sizeof(uint32_t)));
-        gpuAssert(cudaFuncSetAttribute(kernel_fn,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
-
-        printf("%-38s \n  %-36s ", label, "P1:");
-        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
-            reset(ts_v, d_dyn_v, nlb_v);
-            kernel_fn<<<nlb_v, BLOCK_SIZE, shmem>>>(
-                d_compose_glb, d_to_state_glb, d_in, d_states_out,
-                ts_v, size, nlb_v, d_dyn_v);
-            gpuAssert(cudaDeviceSynchronize());
-        }
-        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
-            reset(ts_v, d_dyn_v, nlb_v);
-            gpuAssert(cudaEventRecord(t0));
-            kernel_fn<<<nlb_v, BLOCK_SIZE, shmem>>>(
-                d_compose_glb, d_to_state_glb, d_in, d_states_out,
-                ts_v, size, nlb_v, d_dyn_v);
-            gpuAssert(cudaDeviceSynchronize());
-            gpuAssert(cudaEventRecord(t1));
-            gpuAssert(cudaEventSynchronize(t1));
-            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
-        }
-        print_stats(ms, BENCH_RUNS, p1_bytes);
-        gpuAssert(cudaFree(ts_v.d_tile_descriptors));
-        gpuAssert(cudaFree(d_dyn_v));
-    };
-
-    bench_ipt("2Pass P1 BS256/IPT16 (NregNone):", 16, p1_nregnone<BLOCK_SIZE, 16>);
-    bench_ipt("2Pass P1 BS256/IPT20 (NregNone):", 20, p1_nregnone<BLOCK_SIZE, 20>);
-    bench_ipt("2Pass P1 BS256/IPT24 (NregNone):", 24, p1_nregnone<BLOCK_SIZE, 24>);
-    bench_ipt("2Pass P1 BS256/IPT28 (NregNone):", 28, p1_nregnone<BLOCK_SIZE, 28>);
-    bench_ipt("2Pass P1 BS256/IPT32 (NregNone):", 32, p1_nregnone<BLOCK_SIZE, 32>);
 
     // Cleanup
     free(ms); free(input);
