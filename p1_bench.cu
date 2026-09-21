@@ -738,6 +738,46 @@ int main(int argc, char** argv) {
         print_stats(ms, BENCH_RUNS, p1_bytes);
     }
 
+    // ------------------------------------------------------------------
+    // P1 NregNone IPT=21 (odd IPT eliminates shmem bank conflicts on stores)
+    // ------------------------------------------------------------------
+    {
+        const uint32_t IPT21  = 21;
+        uint32_t nlb21        = (size + BLOCK_SIZE * IPT21 - 1) / (BLOCK_SIZE * IPT21);
+        auto     kernel       = p1_nregnone<BLOCK_SIZE, IPT21>;
+        size_t   shmem        = (size_t)IPT21 * BLOCK_SIZE * sizeof(state_t);
+        size_t   p1_bytes     = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+
+        ScanTileState ts21;
+        gpuAssert(cudaMalloc(&ts21.d_tile_descriptors, ScanTileState::AllocationSize(nlb21)));
+        uint32_t* d_dyn21;
+        gpuAssert(cudaMalloc(&d_dyn21, sizeof(uint32_t)));
+
+        gpuAssert(cudaFuncSetAttribute(kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+
+        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT21 (NregNone):", "P1:");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            reset(ts21, d_dyn21, nlb21);
+            kernel<<<nlb21, BLOCK_SIZE, shmem>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts21, size, nlb21, d_dyn21);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            reset(ts21, d_dyn21, nlb21);
+            gpuAssert(cudaEventRecord(t0));
+            kernel<<<nlb21, BLOCK_SIZE, shmem>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts21, size, nlb21, d_dyn21);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, p1_bytes);
+        gpuAssert(cudaFree(ts21.d_tile_descriptors));
+        gpuAssert(cudaFree(d_dyn21));
+    }
+
     // Cleanup
     free(ms); free(input);
     gpuAssert(cudaFree(d_in));
