@@ -137,8 +137,8 @@ profile_p1: $(DATA_PATH)/tokens_dense_500MiB.in
 	    --source-folders . \
 	    --target-processes all \
 	    --export profile_p1 \
-	    ./$(P1_BENCH_PROGRAM)_profile $(DATA_PATH)/tokens_dense_500MiB.in \
-	    > profile_p1.txt 2>&1
+	    ./$(P1_BENCH_PROGRAM)_profile $(DATA_PATH)/tokens_dense_500MiB.in 2>&1
+	-ncu --import profile_p1.ncu-rep > profile_p1.txt 2>&1
 
 devinfo:
 	$(COMPILER) $(FLAGS) -o devinfo devinfo.cu
