@@ -618,9 +618,9 @@ void p1_transpose(
         BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
 }
 
-// Add scan P1: identical to p1_nregnone but uses integer addition as the
-// scan operator instead of DFA composition.  No compose table needed.
-// Output values are meaningless; timing isolates scan overhead vs composition.
+// Add scan P1: transpose load/store, warp scans, static tile assignment.
+// Uses AddOp instead of DFA composition — output values are meaningless;
+// timing isolates scan overhead vs composition cost.
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 __global__ LB_P1
 void p1_add(
@@ -629,45 +629,64 @@ void p1_add(
     state_t* __restrict__ d_states_out,
     ScanTileState tile_state,
     uint32_t size,
-    uint32_t num_tiles,
-    volatile uint32_t* dyn_index_ptr)
+    uint32_t num_tiles)
 {
-    using BlockScan  = cub::BlockScan<state_t, BLOCK_SIZE>;
-    using PrefixOp   = PrefixCallbackOp<AddOp>;
+    using TransformIter = thrust::transform_iterator<ByteToState, const uint8_t*>;
+    using BlockLoadT  = cub::BlockLoad <state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    using BlockStoreT = cub::BlockStore<state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_STORE_WARP_TRANSPOSE>;
+    using BlockScanT  = cub::BlockScan <state_t, BLOCK_SIZE,
+                                        cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp    = PrefixCallbackOp<AddOp>;
 
-    __shared__ typename BlockScan::TempStorage scan_tmp;
-    __shared__ typename PrefixOp::TempStorage  prefix_tmp;
+    __shared__ union {
+        typename BlockLoadT::TempStorage  load;
+        typename BlockStoreT::TempStorage store;
+        struct {
+            typename PrefixOp::TempStorage  prefix;
+            typename BlockScanT::TempStorage scan;
+        } scan_storage;
+    } temp;
+
     __shared__ __align__(8) state_t shmem_to_state[256];
-    extern __shared__ uint16_t dyn_shmem_add[];
-    volatile state_t* states = (volatile state_t*) dyn_shmem_add;
 
     for (uint32_t i = threadIdx.x; i < 256 / 4; i += BLOCK_SIZE)
         reinterpret_cast<volatile uint64_t*>(shmem_to_state)[i] =
             reinterpret_cast<uint64_t*>(d_to_state_glb)[i];
     __syncthreads();
 
-    uint32_t tile_idx = dynamicIndex(dyn_index_ptr);
+    uint32_t tile_idx = blockIdx.x;
     uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+    uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
+                                      (uint64_t)size - glb_offs);
 
-    loadBytesAsStates<BLOCK_SIZE, ITEMS_PER_THREAD>(
-        d_in, glb_offs, size, shmem_to_state, states, state_t(0));
-    __syncthreads();
-
+    ByteToState byte_to_state{shmem_to_state};
+    TransformIter d_in_states(d_in + glb_offs, byte_to_state);
     state_t st[ITEMS_PER_THREAD];
-    #pragma unroll
-    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++)
-        st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
-
-    AddOp    add_op;
-    PrefixOp prefix_op(tile_state, prefix_tmp, add_op, (int)tile_idx, state_t(0));
-    BlockScan(scan_tmp).InclusiveScan(st, st, add_op, prefix_op);
-
-    #pragma unroll
-    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++)
-        states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockLoadT(temp.load).Load(d_in_states, st);
+    else
+        BlockLoadT(temp.load).Load(d_in_states, st, valid, state_t(0));
     __syncthreads();
 
-    writeShmemToGlb<BLOCK_SIZE, ITEMS_PER_THREAD>(glb_offs, size, states, d_states_out);
+    AddOp add_op;
+
+    if (tile_idx == 0) {
+        state_t block_aggregate;
+        BlockScanT(temp.scan_storage.scan).InclusiveScan(st, st, add_op, block_aggregate);
+        if (threadIdx.x == 0)
+            tile_state.SetInclusive(0, block_aggregate);
+    } else {
+        PrefixOp prefix_op(tile_state, temp.scan_storage.prefix, add_op, (int)tile_idx, state_t(0));
+        BlockScanT(temp.scan_storage.scan).InclusiveScan(st, st, add_op, prefix_op);
+    }
+    __syncthreads();
+
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st);
+    else
+        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
 }
 
 // BW ceiling: reads input using the same u64 pattern as P1, XORs into a
@@ -724,11 +743,6 @@ static size_t p1_nregnone_shmem(uint32_t size) {
     return (size_t)ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(state_t);
 }
 
-// Shmem for p1_add: same, no compose table needed.
-static size_t p1_add_shmem(uint32_t size) {
-    (void)size;
-    return (size_t)ITEMS_PER_THREAD * BLOCK_SIZE * sizeof(state_t);
-}
 
 static void reset(ScanTileState& ts, uint32_t* d_dyn, uint32_t nlb) {
     gpuAssert(cudaMemset(d_dyn, 0, sizeof(uint32_t)));
@@ -813,34 +827,26 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     {
         auto kernel    = p1_add<BLOCK_SIZE, ITEMS_PER_THREAD>;
-        size_t shmem   = p1_add_shmem(size);
         size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
-
-        uint32_t* d_dyn_add;
-        gpuAssert(cudaMalloc(&d_dyn_add, sizeof(uint32_t)));
-
-        gpuAssert(cudaFuncSetAttribute(kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
 
         printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (add scan):", "P1:");
         for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
-            reset(ts, d_dyn_add, nlb);
-            kernel<<<nlb, BLOCK_SIZE, shmem>>>(
-                d_to_state_glb, d_in, d_states_out, ts, size, nlb, d_dyn_add);
+            reset(ts, nlb);
+            kernel<<<nlb, BLOCK_SIZE>>>(
+                d_to_state_glb, d_in, d_states_out, ts, size, nlb);
             gpuAssert(cudaDeviceSynchronize());
         }
         for (uint32_t i = 0; i < BENCH_RUNS; i++) {
-            reset(ts, d_dyn_add, nlb);
+            reset(ts, nlb);
             gpuAssert(cudaEventRecord(t0));
-            kernel<<<nlb, BLOCK_SIZE, shmem>>>(
-                d_to_state_glb, d_in, d_states_out, ts, size, nlb, d_dyn_add);
+            kernel<<<nlb, BLOCK_SIZE>>>(
+                d_to_state_glb, d_in, d_states_out, ts, size, nlb);
             gpuAssert(cudaDeviceSynchronize());
             gpuAssert(cudaEventRecord(t1));
             gpuAssert(cudaEventSynchronize(t1));
             gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
         }
         print_stats(ms, BENCH_RUNS, p1_bytes);
-        gpuAssert(cudaFree(d_dyn_add));
     }
 
     // ------------------------------------------------------------------
