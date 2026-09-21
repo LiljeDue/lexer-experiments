@@ -149,15 +149,17 @@ struct ScanTileState {
     }
 
     __device__ __forceinline__ void SetPartial(int tile_idx, state_t value) {
-        __threadfence();
-        d_tile_descriptors[TILE_STATUS_PADDING + tile_idx] =
-            (uint32_t(value) << 16) | uint32_t(SCAN_TILE_PARTIAL);
+        uint32_t word = (uint32_t(value) << 16) | uint32_t(SCAN_TILE_PARTIAL);
+        asm volatile("st.relaxed.gpu.u32 [%0], %1;"
+                     : : "l"(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx), "r"(word)
+                     : "memory");
     }
 
     __device__ __forceinline__ void SetInclusive(int tile_idx, state_t value) {
-        __threadfence();
-        d_tile_descriptors[TILE_STATUS_PADDING + tile_idx] =
-            (uint32_t(value) << 16) | uint32_t(SCAN_TILE_INCLUSIVE);
+        uint32_t word = (uint32_t(value) << 16) | uint32_t(SCAN_TILE_INCLUSIVE);
+        asm volatile("st.relaxed.gpu.u32 [%0], %1;"
+                     : : "l"(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx), "r"(word)
+                     : "memory");
     }
 
     __device__ __forceinline__ void WaitForValid(int tile_idx,
@@ -165,12 +167,17 @@ struct ScanTileState {
                                                   state_t& value,
                                                   uint32_t delay_ns = 450) {
         __nanosleep(delay_ns);
-        uint32_t w = *const_cast<const volatile uint32_t*>(
-                         d_tile_descriptors + TILE_STATUS_PADDING + tile_idx);
+        uint32_t w;
+        asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
+                     : "=r"(w)
+                     : "l"(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx)
+                     : "memory");
         while (__any_sync(0xffffffff, (w & 0xffffu) == uint32_t(SCAN_TILE_INVALID))) {
             __nanosleep(350);
-            w = *const_cast<const volatile uint32_t*>(
-                    d_tile_descriptors + TILE_STATUS_PADDING + tile_idx);
+            asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
+                         : "=r"(w)
+                         : "l"(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx)
+                         : "memory");
         }
         status = w & 0xffffu;
         value  = state_t(w >> 16);
