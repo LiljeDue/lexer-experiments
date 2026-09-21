@@ -1812,8 +1812,24 @@ int main(int32_t argc, char *argv[]) {
     testLexerShmemCompose(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Lexer Alpacc Shmem IPT=30:");
     testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "1Pass BS256/IPT16 (transpose):");
+    testLexerTranspose<256, 16>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "1Pass BS256/IPT18 (transpose):");
+    testLexerTranspose<256, 18>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "1Pass BS256/IPT20 (transpose):");
+    testLexerTranspose<256, 20>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "1Pass BS256/IPT22 (transpose):");
     testLexerTranspose<256, 22>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "1Pass BS256/IPT24 (transpose):");
+    testLexerTranspose<256, 24>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "1Pass BS256/IPT26 (transpose):");
+    testLexerTranspose<256, 26>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "1Pass BS256/IPT28 (transpose):");
+    testLexerTranspose<256, 28>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "1Pass BS256/IPT30 (transpose):");
+    testLexerTranspose<256, 30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "1Pass BS256/IPT32 (transpose):");
+    testLexerTranspose<256, 32>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
