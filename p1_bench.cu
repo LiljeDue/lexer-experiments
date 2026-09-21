@@ -312,11 +312,8 @@ __device__ inline void loadTablesToShmem(
 // Load ITEMS_PER_THREAD bytes per thread from d_in[glb_offs..] using
 // 64-bit coalesced loads, map each byte through to_state[], write
 // results to shmem in blocked layout. Thread t writes to
-// [t*SHMEM_STRIDE, t*SHMEM_STRIDE + ITEMS_PER_THREAD).
-// SHMEM_STRIDE == ITEMS_PER_THREAD gives the standard layout;
-// SHMEM_STRIDE == ITEMS_PER_THREAD + 1 pads to avoid bank conflicts.
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD,
-         uint32_t SHMEM_STRIDE = ITEMS_PER_THREAD>
+// [t*ITEMS_PER_THREAD, (t+1)*ITEMS_PER_THREAD).
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 __device__ inline void loadBytesAsStates(
     const uint8_t* __restrict__ d_in,
     uint32_t glb_offs, uint32_t size,
@@ -347,66 +344,10 @@ __device__ inline void loadBytesAsStates(
             if (lid < TILE) {
                 uint32_t t   = lid / ITEMS_PER_THREAD;
                 uint32_t off = lid % ITEMS_PER_THREAD;
-                states[t * SHMEM_STRIDE + off] = (glb_offs + lid < size)
+                states[t * ITEMS_PER_THREAD + off] = (glb_offs + lid < size)
                                                  ? to_state[bytes[j]] : identity;
             }
         }
-    }
-}
-
-// Same as loadBytesAsStates but avoids lid/IPT and lid%IPT (expensive when
-// IPT is not a power of two) by tracking (t, off) as running counters.
-// Each thread's first byte in the tile is at flat index
-//   first_lid = threadIdx.x * U8  (for i=0)
-// which maps to shmem slot t0 = first_lid / IPT, off0 = first_lid % IPT.
-// We compute those once per load round and carry (t, off) across j iterations.
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD,
-         uint32_t SHMEM_STRIDE = ITEMS_PER_THREAD>
-__device__ inline void loadBytesAsStatesNodiv(
-    const uint8_t* __restrict__ d_in,
-    uint32_t glb_offs, uint32_t size,
-    const volatile state_t* __restrict__ to_state,
-    volatile state_t* states,
-    state_t identity)
-{
-    const uint32_t U8    = sizeof(uint64_t);
-    const uint32_t TILE  = ITEMS_PER_THREAD * BLOCK_SIZE;
-    const uint32_t LOADS = 1 + ITEMS_PER_THREAD / U8;
-
-    // Compute starting (t, off) for this thread's first byte this round.
-    // base_byte for round i = (i * BLOCK_SIZE + threadIdx.x) * U8.
-    // We advance (t, off) by U8 each round instead of recomputing from lid.
-    uint32_t base_byte = threadIdx.x * U8;  // i=0 starting offset
-    uint32_t t   = base_byte / ITEMS_PER_THREAD;
-    uint32_t off = base_byte % ITEMS_PER_THREAD;
-
-    #pragma unroll
-    for (uint32_t i = 0; i < LOADS; i++) {
-        uint32_t gid = glb_offs + base_byte;
-        uint64_t reg;
-        uint8_t* bytes = (uint8_t*)&reg;
-        if (gid + U8 <= size)
-            reg = *reinterpret_cast<const uint64_t*>(d_in + gid);
-        else {
-            reg = 0;
-            #pragma unroll
-            for (uint32_t j = 0; j < U8; j++)
-                if (gid + j < size) bytes[j] = d_in[gid + j];
-        }
-        #pragma unroll
-        for (uint32_t j = 0; j < U8; j++) {
-            uint32_t lid = base_byte + j;
-            if (lid < TILE) {
-                states[t * SHMEM_STRIDE + off] = (glb_offs + lid < size)
-                                                 ? to_state[bytes[j]] : identity;
-                // Advance (t, off) without division.
-                off++;
-                if (off == ITEMS_PER_THREAD) { off = 0; t++; }
-            }
-        }
-        // Advance base_byte and (t, off) by one full round stride.
-        base_byte += BLOCK_SIZE * U8;
-        // off and t already track correctly from inner loop.
     }
 }
 
@@ -443,23 +384,6 @@ __device__ inline void writeShmemToGlb(
     }
 }
 
-// Write st[ITEMS_PER_THREAD] directly from registers to global memory in
-// blocked layout (thread t owns output[glb_offs + t*IPT .. t*IPT+IPT-1]).
-// Coalesced: consecutive threads write consecutive addresses, no shmem needed.
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
-__device__ inline void writeRegsToGlb(
-    const state_t (&st)[ITEMS_PER_THREAD],
-    uint32_t glb_offs, uint32_t size,
-    state_t* __restrict__ d_out)
-{
-    uint32_t base = glb_offs + threadIdx.x * ITEMS_PER_THREAD;
-    #pragma unroll
-    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
-        if (base + i < size)
-            d_out[base + i] = st[i];
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Init kernel for tile state array
 // ---------------------------------------------------------------------------
@@ -487,10 +411,7 @@ static void initScanTileState(ScanTileState& ts, int num_tiles) {
 
 // Full P1: load bytes, map to states via to_state[], inclusive prefix scan
 // using DFA composition, write prefixed states to d_states_out.
-// SHMEM_STRIDE == ITEMS_PER_THREAD: standard layout (may have bank conflicts).
-// SHMEM_STRIDE == ITEMS_PER_THREAD + 1: padded layout, eliminates bank conflicts.
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD,
-         uint32_t SHMEM_STRIDE = ITEMS_PER_THREAD>
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 __global__ LB_P1
 void p1_nregnone(
     state_t* __restrict__ d_compose_glb,
@@ -518,87 +439,24 @@ void p1_nregnone(
     uint32_t tile_idx = dynamicIndex(dyn_index_ptr);
     uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
 
-    loadBytesAsStates<BLOCK_SIZE, ITEMS_PER_THREAD, SHMEM_STRIDE>(
+    loadBytesAsStates<BLOCK_SIZE, ITEMS_PER_THREAD>(
         d_in, glb_offs, size, shmem_to_state, states, IDENTITY);
     __syncthreads();
 
     state_t st[ITEMS_PER_THREAD];
     #pragma unroll
     for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++)
-        st[i] = states[threadIdx.x * SHMEM_STRIDE + i];
+        st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
 
     ComposeOp compose_op{shmem_compose};
     PrefixOp  prefix_op(tile_state, prefix_tmp, compose_op, (int)tile_idx, IDENTITY);
     BlockScan(scan_tmp).InclusiveScan(st, st, compose_op, prefix_op);
 
-    if constexpr (SHMEM_STRIDE == ITEMS_PER_THREAD) {
-        // Standard path: store results back to shmem, then coalesced u64 write.
-        #pragma unroll
-        for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++)
-            states[threadIdx.x * SHMEM_STRIDE + i] = st[i];
-        __syncthreads();
-        writeShmemToGlb<BLOCK_SIZE, ITEMS_PER_THREAD>(glb_offs, size, states, d_states_out);
-    } else {
-        // Padded path: write directly from registers, bypassing shmem entirely.
-        // Coalesced: blocked layout, thread t writes d_out[glb_offs + t*IPT + i].
-        writeRegsToGlb<BLOCK_SIZE, ITEMS_PER_THREAD>(st, glb_offs, size, d_states_out);
-    }
-}
-
-// Like p1_nregnone but uses loadBytesAsStatesNodiv — avoids lid/IPT and
-// lid%IPT integer divisions in the load phase by tracking (t,off) with counters.
-// Used with padded SHMEM_STRIDE > ITEMS_PER_THREAD to avoid bank conflicts.
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD,
-         uint32_t SHMEM_STRIDE = ITEMS_PER_THREAD>
-__global__ LB_P1
-void p1_nodiv(
-    state_t* __restrict__ d_compose_glb,
-    state_t* __restrict__ d_to_state_glb,
-    const uint8_t* __restrict__ d_in,
-    state_t* __restrict__ d_states_out,
-    ScanTileState tile_state,
-    uint32_t size,
-    uint32_t num_tiles,
-    volatile uint32_t* dyn_index_ptr)
-{
-    using BlockScan  = cub::BlockScan<state_t, BLOCK_SIZE>;
-    using PrefixOp   = PrefixCallbackOp<ComposeOp>;
-
-    __shared__ typename BlockScan::TempStorage scan_tmp;
-    __shared__ typename PrefixOp::TempStorage  prefix_tmp;
-    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
-    __shared__ __align__(8) state_t shmem_to_state[256];
-    extern __shared__ uint16_t dyn_shmem_nodiv[];
-    volatile state_t* states = (volatile state_t*) dyn_shmem_nodiv;
-
-    loadTablesToShmem<BLOCK_SIZE>(
-        d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
-
-    uint32_t tile_idx = dynamicIndex(dyn_index_ptr);
-    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
-
-    loadBytesAsStatesNodiv<BLOCK_SIZE, ITEMS_PER_THREAD, SHMEM_STRIDE>(
-        d_in, glb_offs, size, shmem_to_state, states, IDENTITY);
-    __syncthreads();
-
-    state_t st[ITEMS_PER_THREAD];
     #pragma unroll
     for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++)
-        st[i] = states[threadIdx.x * SHMEM_STRIDE + i];
-
-    ComposeOp compose_op{shmem_compose};
-    PrefixOp  prefix_op(tile_state, prefix_tmp, compose_op, (int)tile_idx, IDENTITY);
-    BlockScan(scan_tmp).InclusiveScan(st, st, compose_op, prefix_op);
-
-    if constexpr (SHMEM_STRIDE == ITEMS_PER_THREAD) {
-        #pragma unroll
-        for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++)
-            states[threadIdx.x * SHMEM_STRIDE + i] = st[i];
-        __syncthreads();
-        writeShmemToGlb<BLOCK_SIZE, ITEMS_PER_THREAD>(glb_offs, size, states, d_states_out);
-    } else {
-        writeRegsToGlb<BLOCK_SIZE, ITEMS_PER_THREAD>(st, glb_offs, size, d_states_out);
-    }
+        states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
+    __syncthreads();
+    writeShmemToGlb<BLOCK_SIZE, ITEMS_PER_THREAD>(glb_offs, size, states, d_states_out);
 }
 
 // P1 kernel matching CUB DeviceScan DefaultPolicy exactly:
@@ -964,60 +822,6 @@ int main(int argc, char** argv) {
     }
 
     // ------------------------------------------------------------------
-    // Helper lambda to bench a padded p1_nodiv variant.
-    // ------------------------------------------------------------------
-    auto bench_nodiv = [&](const char* label,
-                           uint32_t ipt, uint32_t stride,
-                           auto kernel_fn) {
-        uint32_t nlb_v = (size + BLOCK_SIZE * ipt - 1) / (BLOCK_SIZE * ipt);
-        size_t   shmem = (size_t)stride * BLOCK_SIZE * sizeof(state_t);
-        size_t   p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
-
-        ScanTileState ts_v;
-        gpuAssert(cudaMalloc(&ts_v.d_tile_descriptors, ScanTileState::AllocationSize(nlb_v)));
-        uint32_t* d_dyn_v;
-        gpuAssert(cudaMalloc(&d_dyn_v, sizeof(uint32_t)));
-        gpuAssert(cudaFuncSetAttribute(kernel_fn,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
-
-        printf("%-38s \n  %-36s ", label, "P1:");
-        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
-            reset(ts_v, d_dyn_v, nlb_v);
-            kernel_fn<<<nlb_v, BLOCK_SIZE, shmem>>>(
-                d_compose_glb, d_to_state_glb, d_in, d_states_out,
-                ts_v, size, nlb_v, d_dyn_v);
-            gpuAssert(cudaDeviceSynchronize());
-        }
-        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
-            reset(ts_v, d_dyn_v, nlb_v);
-            gpuAssert(cudaEventRecord(t0));
-            kernel_fn<<<nlb_v, BLOCK_SIZE, shmem>>>(
-                d_compose_glb, d_to_state_glb, d_in, d_states_out,
-                ts_v, size, nlb_v, d_dyn_v);
-            gpuAssert(cudaDeviceSynchronize());
-            gpuAssert(cudaEventRecord(t1));
-            gpuAssert(cudaEventSynchronize(t1));
-            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
-        }
-        print_stats(ms, BENCH_RUNS, p1_bytes);
-        gpuAssert(cudaFree(ts_v.d_tile_descriptors));
-        gpuAssert(cudaFree(d_dyn_v));
-    };
-
-    // Option 1: IPT=32, SHMEM_STRIDE=33 — power-of-two IPT, division becomes shifts.
-    bench_nodiv("2Pass P1 BS256/IPT32 (padded+regs):", 32, 33,
-                p1_nodiv<BLOCK_SIZE, 32, 33>);
-
-    // Option 2: IPT=24, SHMEM_STRIDE=25 — smaller tile overhead than IPT=21.
-    bench_nodiv("2Pass P1 BS256/IPT24 (padded+regs):", 24, 25,
-                p1_nodiv<BLOCK_SIZE, 24, 25>);
-
-    // Option 3: IPT=21, SHMEM_STRIDE=22 — same geometry as before, but
-    // loadBytesAsStatesNodiv avoids the costly lid/21 integer division.
-    bench_nodiv("2Pass P1 BS256/IPT21 (nodiv+regs):", 21, 22,
-                p1_nodiv<BLOCK_SIZE, 21, 22>);
-
-    // ------------------------------------------------------------------
     // P1 CUB-style: matches DeviceScan DefaultPolicy exactly
     //   128 threads, 15 IPT, BLOCK_LOAD_WARP_TRANSPOSE,
     //   BLOCK_STORE_WARP_TRANSPOSE, BLOCK_SCAN_WARP_SCANS
@@ -1058,6 +862,52 @@ int main(int argc, char** argv) {
         gpuAssert(cudaFree(ts_cub.d_tile_descriptors));
         gpuAssert(cudaFree(d_dyn_cub));
     }
+
+    // ------------------------------------------------------------------
+    // IPT sweep: p1_nregnone at different ITEMS_PER_THREAD values.
+    // Fewer tiles = shorter lookback chain; more IPT = more shmem/registers.
+    // ------------------------------------------------------------------
+    auto bench_ipt = [&](const char* label, uint32_t ipt, auto kernel_fn) {
+        uint32_t nlb_v    = (size + BLOCK_SIZE * ipt - 1) / (BLOCK_SIZE * ipt);
+        size_t   shmem    = (size_t)ipt * BLOCK_SIZE * sizeof(state_t);
+        size_t   p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+
+        ScanTileState ts_v;
+        gpuAssert(cudaMalloc(&ts_v.d_tile_descriptors, ScanTileState::AllocationSize(nlb_v)));
+        uint32_t* d_dyn_v;
+        gpuAssert(cudaMalloc(&d_dyn_v, sizeof(uint32_t)));
+        gpuAssert(cudaFuncSetAttribute(kernel_fn,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+
+        printf("%-38s \n  %-36s ", label, "P1:");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            reset(ts_v, d_dyn_v, nlb_v);
+            kernel_fn<<<nlb_v, BLOCK_SIZE, shmem>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out,
+                ts_v, size, nlb_v, d_dyn_v);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            reset(ts_v, d_dyn_v, nlb_v);
+            gpuAssert(cudaEventRecord(t0));
+            kernel_fn<<<nlb_v, BLOCK_SIZE, shmem>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out,
+                ts_v, size, nlb_v, d_dyn_v);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, p1_bytes);
+        gpuAssert(cudaFree(ts_v.d_tile_descriptors));
+        gpuAssert(cudaFree(d_dyn_v));
+    };
+
+    bench_ipt("2Pass P1 BS256/IPT16 (NregNone):", 16, p1_nregnone<BLOCK_SIZE, 16>);
+    bench_ipt("2Pass P1 BS256/IPT20 (NregNone):", 20, p1_nregnone<BLOCK_SIZE, 20>);
+    bench_ipt("2Pass P1 BS256/IPT24 (NregNone):", 24, p1_nregnone<BLOCK_SIZE, 24>);
+    bench_ipt("2Pass P1 BS256/IPT28 (NregNone):", 28, p1_nregnone<BLOCK_SIZE, 28>);
+    bench_ipt("2Pass P1 BS256/IPT32 (NregNone):", 32, p1_nregnone<BLOCK_SIZE, 32>);
 
     // Cleanup
     free(ms); free(input);
