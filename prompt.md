@@ -194,6 +194,46 @@ available to hide the lookback latency, and it ends up slower overall.
 dominant bottleneck is the CTA barrier stall from the decoupled lookback
 algorithm: ~47% of warp cycles stalled at barriers.
 
+## Why 841 GB/s Is the Practical Ceiling
+
+Two optimisations were investigated after `p1_transpose` was established as the
+best variant:
+
+### 1. Removing the post-load `__syncthreads()`
+
+`p1_transpose` has 4 `__syncthreads()` per tile vs 3 for `p1_nregnone`. The
+extra sync sits between `BlockLoad` and `BlockScan`. Investigation of the CUB
+source confirmed this sync is **load-bearing and cannot be removed**:
+
+- `BlockLoad(WARP_TRANSPOSE)` calls `BlockExchange::WarpStripedToBlocked`,
+  which uses only `__syncwarp()` (intra-warp), not `__syncthreads()`.
+- The post-load `__syncthreads()` is required to safely transition the union
+  shmem from `temp.load` to `temp.scan_storage` before the scan phase writes
+  to it. Without it, warps could race the union access.
+
+### 2. Switching to `BLOCK_SCAN_RAKING_MEMOIZE`
+
+Counted `__syncthreads()` calls in the two `BlockScan` specialisations:
+
+| Algorithm | Internal `__syncthreads()` calls |
+|---|---|
+| `BLOCK_SCAN_WARP_SCANS` | 3 |
+| `BLOCK_SCAN_RAKING` / `RAKING_MEMOIZE` | 16 |
+
+`BLOCK_SCAN_WARP_SCANS` is already the minimum-barrier option. Switching to
+raking would add 13 more barriers per tile and make performance worse.
+
+### Conclusion
+
+All `__syncthreads()` calls in `p1_transpose` are load-bearing. The 47% CTA
+barrier stall is the minimum achievable for decoupled lookback at 256T/22IPT.
+**841 GB/s is the practical ceiling for this algorithm on A100.**
+
+The only path to further improvement is a fundamentally different scan
+algorithm — e.g. a two-kernel reduce-then-scan — but that adds a second
+kernel launch and a full extra pass over the input, which is unlikely to
+improve end-to-end throughput.
+
 ## What We Tried and Why It Didn't Help
 
 ### BS=32 (warp-scan, no intra-block barriers)
@@ -243,19 +283,21 @@ The final gain (warp-transpose) works by eliminating shmem store bank conflicts
 and reducing total instruction count, at the cost of more barrier stall per
 instruction. The net effect is strongly positive.
 
-## Conclusion
+## Conclusion — P1 is Done
 
-P1 is limited by the decoupled lookback scan algorithm itself:
+`p1_transpose` at **841 GB/s** is the final optimised P1 kernel. All known
+optimisation levers have been exhausted:
 
-- ~90% of P1 time is scan synchronisation overhead (CTA barrier stalls from
-  the intra-block `BlockScan` and the cross-tile lookback).
-- ~10% is the DFA composition operator cost.
-- IPT=22, BS=256 is the optimal tile configuration.
+- IPT=22, BS=256 is the optimal tile configuration (sweep confirmed).
 - `BLOCK_LOAD/STORE_WARP_TRANSPOSE` eliminates shmem bank conflicts and
-  reduces instruction count vs the manual blocked layout, giving +144 GB/s.
-- The gap to BW ceiling (841 vs 1332 GB/s) is irreducible with decoupled
-  lookback.
+  reduces instruction count, giving +144 GB/s over the manual blocked layout.
+- `st.relaxed.gpu` tile state stores replace `__threadfence()`, giving +54 GB/s.
+- Static shmem for tables and `__launch_bounds__(256,6)` gave earlier gains.
+- All `__syncthreads()` calls are load-bearing — none can be removed.
+- `BLOCK_SCAN_WARP_SCANS` is already the minimum-barrier BlockScan algorithm.
+- Static `blockIdx.x` assignment and tile-0 fast path have no measurable effect.
 
-Meaningful improvement would require a fundamentally different scan algorithm
-that avoids cross-tile synchronisation, which is not possible for a general
-prefix scan with a data-dependent operator.
+The remaining 37% gap to the BW ceiling (841 vs 1332 GB/s) is the irreducible
+cost of the decoupled lookback algorithm: ~47% of warp cycles stall at CTA
+barriers from the intra-block scan and cross-tile lookback. This is
+fundamental to any single-pass prefix scan with a data-dependent operator.
