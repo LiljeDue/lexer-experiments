@@ -1806,12 +1806,12 @@ int main(int32_t argc, char *argv[]) {
 
     printf("%s:\n", argv[1]);
 
-    //printf(PAD, "Lexer Shmem Compose (u64 orig):");
-    //testLexerShmemComposeU64(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    //printf(PAD, "Lexer Shmem Compose:");
-    //testLexerShmemCompose(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    //printf(PAD, "Lexer Alpacc Shmem IPT=30:");
-    //testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Lexer Shmem Compose (u64 orig):");
+    testLexerShmemComposeU64(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Lexer Shmem Compose:");
+    testLexerShmemCompose(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Lexer Alpacc Shmem IPT=30:");
+    testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "1Pass BS256/IPT22 (transpose):");
     testLexerTranspose<256, 22>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
