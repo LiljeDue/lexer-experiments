@@ -165,8 +165,8 @@ struct ScanTileState {
     __device__ __forceinline__ void WaitForValid(int tile_idx,
                                                   uint32_t& status,
                                                   state_t& value,
-                                                  uint32_t delay_ns = 450) {
-        __nanosleep(delay_ns);
+                                                  uint32_t initial_delay_ns = 450) {
+        __nanosleep(initial_delay_ns);
         uint32_t w;
         asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
                      : "=r"(w)
@@ -228,7 +228,9 @@ struct PrefixCallbackOp {
         }
         int      predecessor_idx = tile_idx - threadIdx.x - 1;
         uint32_t predecessor_status;
-        exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status, 450);
+        // Seed initial delay with tile_idx to spread out thundering-herd polling.
+        uint32_t initial_delay = 200 + (uint32_t)(tile_idx % 8) * 50;
+        exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status, initial_delay);
         while (__all_sync(0xffffffff,
                           predecessor_status != uint32_t(SCAN_TILE_INCLUSIVE) &&
                           predecessor_status != uint32_t(SCAN_TILE_OOB))) {
@@ -411,6 +413,8 @@ static void initScanTileState(ScanTileState& ts, int num_tiles) {
 
 // Full P1: load bytes, map to states via to_state[], inclusive prefix scan
 // using DFA composition, write prefixed states to d_states_out.
+// Uses static blockIdx.x tile assignment (no atomic counter) and a tile-0
+// fast path (no lookback needed for the first tile).
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 __global__ LB_P1
 void p1_nregnone(
@@ -420,8 +424,7 @@ void p1_nregnone(
     state_t* __restrict__ d_states_out,
     ScanTileState tile_state,
     uint32_t size,
-    uint32_t num_tiles,
-    volatile uint32_t* dyn_index_ptr)
+    uint32_t num_tiles)
 {
     using BlockScan  = cub::BlockScan<state_t, BLOCK_SIZE>;
     using PrefixOp   = PrefixCallbackOp<ComposeOp>;
@@ -436,7 +439,7 @@ void p1_nregnone(
     loadTablesToShmem<BLOCK_SIZE>(
         d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
 
-    uint32_t tile_idx = dynamicIndex(dyn_index_ptr);
+    uint32_t tile_idx = blockIdx.x;
     uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
 
     loadBytesAsStates<BLOCK_SIZE, ITEMS_PER_THREAD>(
@@ -449,8 +452,17 @@ void p1_nregnone(
         st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
 
     ComposeOp compose_op{shmem_compose};
-    PrefixOp  prefix_op(tile_state, prefix_tmp, compose_op, (int)tile_idx, IDENTITY);
-    BlockScan(scan_tmp).InclusiveScan(st, st, compose_op, prefix_op);
+
+    if (tile_idx == 0) {
+        // First tile: no lookback needed — scan and publish inclusive aggregate.
+        state_t block_aggregate;
+        BlockScan(scan_tmp).InclusiveScan(st, st, compose_op, block_aggregate);
+        if (threadIdx.x == 0)
+            tile_state.SetInclusive(0, block_aggregate);
+    } else {
+        PrefixOp prefix_op(tile_state, prefix_tmp, compose_op, (int)tile_idx, IDENTITY);
+        BlockScan(scan_tmp).InclusiveScan(st, st, compose_op, prefix_op);
+    }
 
     #pragma unroll
     for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++)
@@ -650,6 +662,9 @@ static void reset(ScanTileState& ts, uint32_t* d_dyn, uint32_t nlb) {
     gpuAssert(cudaMemset(d_dyn, 0, sizeof(uint32_t)));
     initScanTileState(ts, (int)nlb);
 }
+static void reset(ScanTileState& ts, uint32_t nlb) {
+    initScanTileState(ts, (int)nlb);
+}
 
 // ---------------------------------------------------------------------------
 // main
@@ -683,7 +698,6 @@ int main(int argc, char** argv) {
     state_t*  d_compose_glb;
     state_t*  d_to_state_glb;
     uint64_t* d_bw_out;
-    uint32_t* d_dyn;
     ScanTileState ts;
 
     gpuAssert(cudaMalloc(&d_in,           (size_t)size * sizeof(uint8_t)));
@@ -691,7 +705,6 @@ int main(int argc, char** argv) {
     gpuAssert(cudaMalloc(&d_compose_glb,  sizeof(h_compose)));
     gpuAssert(cudaMalloc(&d_to_state_glb, sizeof(h_to_state)));
     gpuAssert(cudaMalloc(&d_bw_out,       (size_t)nlb * BLOCK_SIZE * sizeof(uint64_t)));
-    gpuAssert(cudaMalloc(&d_dyn,          sizeof(uint32_t)));
     gpuAssert(cudaMalloc(&ts.d_tile_descriptors, ScanTileState::AllocationSize(nlb)));
 
     gpuAssert(cudaMemcpy(d_in,           input,      (size_t)size * sizeof(uint8_t), cudaMemcpyHostToDevice));
@@ -731,27 +744,31 @@ int main(int argc, char** argv) {
         size_t shmem   = p1_add_shmem(size);
         size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
 
+        uint32_t* d_dyn_add;
+        gpuAssert(cudaMalloc(&d_dyn_add, sizeof(uint32_t)));
+
         gpuAssert(cudaFuncSetAttribute(kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
 
         printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (add scan):", "P1:");
         for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
-            reset(ts, d_dyn, nlb);
+            reset(ts, d_dyn_add, nlb);
             kernel<<<nlb, BLOCK_SIZE, shmem>>>(
-                d_to_state_glb, d_in, d_states_out, ts, size, nlb, d_dyn);
+                d_to_state_glb, d_in, d_states_out, ts, size, nlb, d_dyn_add);
             gpuAssert(cudaDeviceSynchronize());
         }
         for (uint32_t i = 0; i < BENCH_RUNS; i++) {
-            reset(ts, d_dyn, nlb);
+            reset(ts, d_dyn_add, nlb);
             gpuAssert(cudaEventRecord(t0));
             kernel<<<nlb, BLOCK_SIZE, shmem>>>(
-                d_to_state_glb, d_in, d_states_out, ts, size, nlb, d_dyn);
+                d_to_state_glb, d_in, d_states_out, ts, size, nlb, d_dyn_add);
             gpuAssert(cudaDeviceSynchronize());
             gpuAssert(cudaEventRecord(t1));
             gpuAssert(cudaEventSynchronize(t1));
             gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
         }
         print_stats(ms, BENCH_RUNS, p1_bytes);
+        gpuAssert(cudaFree(d_dyn_add));
     }
 
     // ------------------------------------------------------------------
@@ -803,16 +820,16 @@ int main(int argc, char** argv) {
 
         printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (NregNone):", "P1:");
         for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
-            reset(ts, d_dyn, nlb);
+            reset(ts, nlb);
             kernel<<<nlb, BLOCK_SIZE, shmem>>>(
-                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb, d_dyn);
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
             gpuAssert(cudaDeviceSynchronize());
         }
         for (uint32_t i = 0; i < BENCH_RUNS; i++) {
-            reset(ts, d_dyn, nlb);
+            reset(ts, nlb);
             gpuAssert(cudaEventRecord(t0));
             kernel<<<nlb, BLOCK_SIZE, shmem>>>(
-                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb, d_dyn);
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
             gpuAssert(cudaDeviceSynchronize());
             gpuAssert(cudaEventRecord(t1));
             gpuAssert(cudaEventSynchronize(t1));
@@ -871,7 +888,6 @@ int main(int argc, char** argv) {
     gpuAssert(cudaFree(d_compose_glb));
     gpuAssert(cudaFree(d_to_state_glb));
     gpuAssert(cudaFree(d_bw_out));
-    gpuAssert(cudaFree(d_dyn));
     gpuAssert(cudaFree(ts.d_tile_descriptors));
     return 0;
 }
