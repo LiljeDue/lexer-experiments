@@ -317,29 +317,26 @@ __device__ inline void loadBytesAsStates(
     const uint32_t U8    = sizeof(uint64_t);
     const uint32_t TILE  = ITEMS_PER_THREAD * BLOCK_SIZE;
     const uint32_t LOADS = 1 + ITEMS_PER_THREAD / U8;
-    uint64_t regs[LOADS];
-    uint8_t* bytes = (uint8_t*)regs;
     #pragma unroll
     for (uint32_t i = 0; i < LOADS; i++) {
         uint32_t base_byte = (i * BLOCK_SIZE + threadIdx.x) * U8;
         uint32_t gid       = glb_offs + base_byte;
+        uint64_t reg;
+        uint8_t* bytes = (uint8_t*)&reg;
         if (gid + U8 <= size)
-            regs[i] = *reinterpret_cast<const uint64_t*>(d_in + gid);
+            reg = *reinterpret_cast<const uint64_t*>(d_in + gid);
         else {
-            regs[i] = 0;
+            reg = 0;
             #pragma unroll
             for (uint32_t j = 0; j < U8; j++)
-                if (gid + j < size) bytes[i * U8 + j] = d_in[gid + j];
+                if (gid + j < size) bytes[j] = d_in[gid + j];
         }
-    }
-    #pragma unroll
-    for (uint32_t i = 0; i < LOADS; i++) {
         #pragma unroll
         for (uint32_t j = 0; j < U8; j++) {
-            uint32_t lid = (i * BLOCK_SIZE + threadIdx.x) * U8 + j;
+            uint32_t lid = base_byte + j;
             if (lid < TILE)
                 states[lid] = (glb_offs + lid < size)
-                              ? to_state[bytes[i * U8 + j]] : identity;
+                              ? to_state[bytes[j]] : identity;
         }
     }
 }
