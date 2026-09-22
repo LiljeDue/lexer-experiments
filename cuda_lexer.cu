@@ -1126,17 +1126,15 @@ void lexerShfl32(
             .InclusiveScan(st, st, ctx, state_prefix_op);
     }
 
-    // Scan produces warp-striped results; convert to block-blocked so that
-    // states[] indices and lid computations match produce-detection expectations.
+    // Warp-striped: lane l slot s = warp-local pos l+s*WARP.
+    // Block-blocked: lane l slot s = warp-local pos l*IPT+s.
+    // With IPT=WARP=32: source (lane=l, slot=s) -> dest (lane=s, slot=l).
+    // dest[s] of lane l = source[LANE] of lane s.
     {
         state_t tmp[ITEMS_PER_THREAD];
         #pragma unroll
-        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
-            uint32_t src_pos  = LANE * ITEMS_PER_THREAD + s;
-            uint32_t src_lane = src_pos % WARP;
-            uint32_t src_slot = src_pos / WARP;
-            tmp[s] = __shfl_sync(0xffffffff, st[src_slot], src_lane);
-        }
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++)
+            tmp[s] = __shfl_sync(0xffffffff, st[LANE], s);
         #pragma unroll
         for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++)
             st[s] = tmp[s];
