@@ -751,6 +751,75 @@ int main(int argc, char** argv) {
     }
 
 
+    // ------------------------------------------------------------------
+    // P1 transpose IPT=16: power-of-two IPT triggers CUB shmem padding
+    // -> zero bank conflicts in BlockExchange.
+    // ------------------------------------------------------------------
+    {
+        static const uint32_t IPT16 = 16;
+        uint32_t nlb16 = (size + BLOCK_SIZE * IPT16 - 1) / (BLOCK_SIZE * IPT16);
+        ScanTileState ts16;
+        gpuAssert(cudaMalloc(&ts16.d_tile_descriptors, ScanTileState::AllocationSize(nlb16)));
+
+        auto kernel    = p1_transpose<BLOCK_SIZE, IPT16>;
+        size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+
+        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT16 (transpose):", "P1:");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            reset(ts16, nlb16);
+            kernel<<<nlb16, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts16, size, nlb16);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            reset(ts16, nlb16);
+            gpuAssert(cudaEventRecord(t0));
+            kernel<<<nlb16, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts16, size, nlb16);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, p1_bytes);
+        gpuAssert(cudaFree(ts16.d_tile_descriptors));
+    }
+
+    // ------------------------------------------------------------------
+    // P1 transpose IPT=32: power-of-two IPT triggers CUB shmem padding
+    // -> zero bank conflicts; larger tile reduces lookback overhead.
+    // ------------------------------------------------------------------
+    {
+        static const uint32_t IPT32 = 32;
+        uint32_t nlb32 = (size + BLOCK_SIZE * IPT32 - 1) / (BLOCK_SIZE * IPT32);
+        ScanTileState ts32;
+        gpuAssert(cudaMalloc(&ts32.d_tile_descriptors, ScanTileState::AllocationSize(nlb32)));
+
+        auto kernel    = p1_transpose<BLOCK_SIZE, IPT32>;
+        size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+
+        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT32 (transpose):", "P1:");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            reset(ts32, nlb32);
+            kernel<<<nlb32, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts32, size, nlb32);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            reset(ts32, nlb32);
+            gpuAssert(cudaEventRecord(t0));
+            kernel<<<nlb32, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts32, size, nlb32);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, p1_bytes);
+        gpuAssert(cudaFree(ts32.d_tile_descriptors));
+    }
+
+
     // Cleanup
     free(ms); free(input);
     gpuAssert(cudaFree(d_in));
