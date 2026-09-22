@@ -523,7 +523,7 @@ fusedLoadTranspose(
     for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
         uint32_t abs        = glb_offs + WARP_OFFSET + LANE + s * WARP;
         uint8_t  byte       = (abs < size) ? __ldg(d_in + abs) : uint8_t(0);
-        state_t  val        = (abs < size) ? __ldg(d_to_state + byte) : state_t(IDENTITY);
+        state_t  val        = (abs < size) ? d_to_state[byte] : state_t(IDENTITY);
         uint32_t shmem_idx  = WARP_OFFSET + s * WARP + LANE;
         if (INSERT_PADDING) shmem_idx += shmem_idx >> 5;  // LOG_SMEM_BANKS=5 on A100
         shmem[shmem_idx] = val;
@@ -606,7 +606,7 @@ fusedTransposeStoreFull(
 // ---------------------------------------------------------------------------
 // p1_fused22: IPT=22, fused global-read+shmem-write (no intermediate regs),
 // fused shmem-read+global-write on store. No CUB BlockLoad/BlockStore.
-// Uses __ldg for DFA tables. No padding (IPT=22 not power-of-2).
+// DFA tables in shmem. No padding (IPT=22 not power-of-2).
 // ---------------------------------------------------------------------------
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 __global__ LB_P1
@@ -620,7 +620,7 @@ void p1_fused22(
     uint32_t num_tiles)
 {
     using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
-    using PrefixOp   = PrefixCallbackOp<ComposeOpLdg>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOp>;
 
     // Shmem: transpose buffer (no padding for IPT=22) unioned with scan temp.
     __shared__ union {
@@ -631,16 +631,23 @@ void p1_fused22(
         } scan_storage;
     } temp;
 
+    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    __shared__ __align__(8) state_t shmem_to_state[256];
+
+    loadTablesToShmem<BLOCK_SIZE>(
+        d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
+    // __syncthreads() inside loadTablesToShmem
+
     uint32_t tile_idx = blockIdx.x;
     uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
 
     state_t st[ITEMS_PER_THREAD];
     fusedLoadTranspose<BLOCK_SIZE, ITEMS_PER_THREAD, false>(
-        d_in, d_to_state_glb, temp.transpose, st, glb_offs, size);
+        d_in, shmem_to_state, temp.transpose, st, glb_offs, size);
 
     __syncthreads();  // transpose -> scan_storage union transition
 
-    ComposeOpLdg compose_op{d_compose_glb};
+    ComposeOp compose_op{shmem_compose};
 
     if (tile_idx == 0) {
         state_t block_aggregate;
@@ -663,9 +670,8 @@ void p1_fused22(
 }
 
 // ---------------------------------------------------------------------------
-// p1_fused32: IPT=32, same fused approach. IPT=32 is power-of-2 so padding
-// is applied (shmem_idx += shmem_idx >> 5) to avoid bank conflicts.
-// Shmem = 32*32*2 + padding = 2048 + 64 = 2112 bytes per block.
+// p1_fused32: IPT=power-of-2, same fused approach with bank-conflict padding.
+// DFA tables in shmem.
 // ---------------------------------------------------------------------------
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 __global__ LB_P1
@@ -679,10 +685,9 @@ void p1_fused32(
     uint32_t num_tiles)
 {
     using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
-    using PrefixOp   = PrefixCallbackOp<ComposeOpLdg>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOp>;
 
     // Padding to avoid bank conflicts for power-of-2 IPT.
-    // Each warp owns WARP*IPT items; padding adds (warp_items >> LOG_SMEM_BANKS) slots.
     static constexpr uint32_t PADDED_WARP_ITEMS = WARP * ITEMS_PER_THREAD
         + (WARP * ITEMS_PER_THREAD >> 5);
 
@@ -694,16 +699,22 @@ void p1_fused32(
         } scan_storage;
     } temp;
 
+    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    __shared__ __align__(8) state_t shmem_to_state[256];
+
+    loadTablesToShmem<BLOCK_SIZE>(
+        d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
+
     uint32_t tile_idx = blockIdx.x;
     uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
 
     state_t st[ITEMS_PER_THREAD];
     fusedLoadTranspose<BLOCK_SIZE, ITEMS_PER_THREAD, true>(
-        d_in, d_to_state_glb, temp.transpose, st, glb_offs, size);
+        d_in, shmem_to_state, temp.transpose, st, glb_offs, size);
 
     __syncthreads();
 
-    ComposeOpLdg compose_op{d_compose_glb};
+    ComposeOp compose_op{shmem_compose};
 
     if (tile_idx == 0) {
         state_t block_aggregate;
