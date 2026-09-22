@@ -476,88 +476,6 @@ void p1_add(
 
 
 // ---------------------------------------------------------------------------
-// p1_shfl32: IPT=32, striped == blocked (no shuffle needed), no shmem for
-// load/store. Larger tile (32KB/block vs 22KB), fewer tiles, longer lookback.
-// ---------------------------------------------------------------------------
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
-__global__ LB_P1
-void p1_shfl32(
-    state_t* __restrict__ d_compose_glb,
-    state_t* __restrict__ d_to_state_glb,
-    const uint8_t* __restrict__ d_in,
-    state_t* __restrict__ d_states_out,
-    ScanTileState tile_state,
-    uint32_t size,
-    uint32_t num_tiles)
-{
-    static_assert(ITEMS_PER_THREAD == WARP,
-        "p1_shfl32 requires ITEMS_PER_THREAD == WARP (32)");
-
-    using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
-    using PrefixOp   = PrefixCallbackOp<ComposeOp>;
-
-    __shared__ struct {
-        typename PrefixOp::TempStorage  prefix;
-        typename BlockScanT::TempStorage scan;
-    } temp;
-
-    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
-    __shared__ __align__(8) state_t shmem_to_state[256];
-
-    loadTablesToShmem<BLOCK_SIZE>(
-        d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
-
-    uint32_t tile_idx = blockIdx.x;
-    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
-    uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
-                                      (uint64_t)size - glb_offs);
-
-    // With IPT==WARP, warp-striped == warp-blocked: no shuffle needed.
-    const uint32_t WARP_ID = threadIdx.x / WARP;
-    const uint32_t LANE    = threadIdx.x % WARP;
-
-    state_t st[ITEMS_PER_THREAD];
-    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size) {
-        #pragma unroll
-        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
-            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
-            st[s] = shmem_to_state[__ldg(d_in + abs)];
-        }
-    } else {
-        #pragma unroll
-        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
-            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
-            st[s] = (abs < size) ? shmem_to_state[__ldg(d_in + abs)] : state_t(IDENTITY);
-        }
-    }
-
-    ComposeOp compose_op{shmem_compose};
-
-    if (tile_idx == 0) {
-        state_t block_aggregate;
-        BlockScanT(temp.scan).InclusiveScan(st, st, compose_op, block_aggregate);
-        if (threadIdx.x == 0)
-            tile_state.SetInclusive(0, block_aggregate);
-    } else {
-        PrefixOp prefix_op(tile_state, temp.prefix, compose_op, (int)tile_idx, IDENTITY);
-        BlockScanT(temp.scan).InclusiveScan(st, st, compose_op, prefix_op);
-    }
-
-    // Store: warp-striped = warp-blocked for IPT=WARP, so write directly.
-    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size) {
-        #pragma unroll
-        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
-            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
-            d_states_out[abs] = st[s];
-        }
-    } else {
-        #pragma unroll
-        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
-            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
-            if (abs < size) d_states_out[abs] = st[s];
-        }
-    }
-}
 
 // BW ceiling: reads input using the same u64 pattern as P1, XORs into a
 // per-thread accumulator, writes one u64 per thread to prevent DCE.
@@ -734,40 +652,6 @@ int main(int argc, char** argv) {
             gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
         }
         print_stats(ms, BENCH_RUNS, p1_bytes);
-    }
-
-
-    // ------------------------------------------------------------------
-    // P1 shfl32: IPT=32, no shuffle (warp-striped=warp-blocked), __ldg tables.
-    // ------------------------------------------------------------------
-    {
-        static const uint32_t IPT32 = 32;
-        uint32_t nlb32 = (size + BLOCK_SIZE * IPT32 - 1) / (BLOCK_SIZE * IPT32);
-        ScanTileState ts32;
-        gpuAssert(cudaMalloc(&ts32.d_tile_descriptors, ScanTileState::AllocationSize(nlb32)));
-
-        auto kernel    = p1_shfl32<BLOCK_SIZE, IPT32>;
-        size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
-
-        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT32 (shfl32):", "P1:");
-        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
-            initScanTileState(ts32, (int)nlb32);
-            kernel<<<nlb32, BLOCK_SIZE>>>(
-                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts32, size, nlb32);
-            gpuAssert(cudaDeviceSynchronize());
-        }
-        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
-            initScanTileState(ts32, (int)nlb32);
-            gpuAssert(cudaEventRecord(t0));
-            kernel<<<nlb32, BLOCK_SIZE>>>(
-                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts32, size, nlb32);
-            gpuAssert(cudaDeviceSynchronize());
-            gpuAssert(cudaEventRecord(t1));
-            gpuAssert(cudaEventSynchronize(t1));
-            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
-        }
-        print_stats(ms, BENCH_RUNS, p1_bytes);
-        gpuAssert(cudaFree(ts32.d_tile_descriptors));
     }
 
 
