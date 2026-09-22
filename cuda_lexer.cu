@@ -1126,6 +1126,22 @@ void lexerShfl32(
             .InclusiveScan(st, st, ctx, state_prefix_op);
     }
 
+    // Scan produces warp-striped results; convert to block-blocked so that
+    // states[] indices and lid computations match produce-detection expectations.
+    {
+        state_t tmp[ITEMS_PER_THREAD];
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t src_pos  = LANE * ITEMS_PER_THREAD + s;
+            uint32_t src_lane = src_pos % WARP;
+            uint32_t src_slot = src_pos / WARP;
+            tmp[s] = __shfl_sync(0xffffffff, st[src_slot], src_lane);
+        }
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++)
+            st[s] = tmp[s];
+    }
+
     // Write scanned states to flat shmem for produce-detection lookups.
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
