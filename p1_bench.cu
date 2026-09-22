@@ -399,12 +399,15 @@ void p1_transpose(
         BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
 }
 
-// P1 timesliced: same as p1_transpose but uses BLOCK_LOAD_WARP_TRANSPOSE_TIMESLICED.
-// Processes the warp→block transpose in warp-sized time slices, reducing peak
-// shmem usage at the cost of more syncs. May reduce barrier wait imbalance.
+// P1 padded transpose: replaces CUB BlockExchange with a manual padded shmem
+// buffer (stride = IPT+1, prime for IPT=22 -> stride=23) to eliminate bank
+// conflicts that CUB's unpadded exchange causes for non-power-of-two IPT.
+//
+// Load path:  warp-striped __ldg bytes -> shmem[warp_striped_idx] -> block-blocked st[]
+// Store path: block-blocked st[] -> shmem[block_blocked_idx] -> warp-striped global write
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 __global__ LB_P1
-void p1_timesliced(
+void p1_padded(
     state_t* __restrict__ d_compose_glb,
     state_t* __restrict__ d_to_state_glb,
     const uint8_t* __restrict__ d_in,
@@ -413,24 +416,19 @@ void p1_timesliced(
     uint32_t size,
     uint32_t num_tiles)
 {
-    using TransformIter = thrust::transform_iterator<ByteToState, const uint8_t*>;
-    using BlockLoadT  = cub::BlockLoad <state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
-                                        cub::BLOCK_LOAD_WARP_TRANSPOSE_TIMESLICED>;
-    using BlockStoreT = cub::BlockStore<state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
-                                        cub::BLOCK_STORE_WARP_TRANSPOSE_TIMESLICED>;
-    using BlockScanT  = cub::BlockScan <state_t, BLOCK_SIZE,
-                                        cub::BLOCK_SCAN_WARP_SCANS>;
-    using PrefixOp    = PrefixCallbackOp<ComposeOp>;
+    // Padded stride: IPT+1. For IPT=22, stride=23 (prime) -> no bank conflicts.
+    static constexpr uint32_t STRIDE = ITEMS_PER_THREAD + 1;
 
-    __shared__ union {
-        typename BlockLoadT::TempStorage  load;
-        typename BlockStoreT::TempStorage store;
-        struct {
-            typename PrefixOp::TempStorage  prefix;
-            typename BlockScanT::TempStorage scan;
-        } scan_storage;
-    } temp;
+    using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOp>;
 
+    __shared__ struct {
+        typename PrefixOp::TempStorage  prefix;
+        typename BlockScanT::TempStorage scan;
+    } scan_temp;
+
+    // Padded exchange buffer: BLOCK_SIZE rows × STRIDE cols.
+    __shared__ state_t xpose[BLOCK_SIZE * STRIDE];
     __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
     __shared__ __align__(8) state_t shmem_to_state[256];
 
@@ -442,32 +440,76 @@ void p1_timesliced(
     uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
                                       (uint64_t)size - glb_offs);
 
-    ByteToState byte_to_state{shmem_to_state};
-    TransformIter d_in_states(d_in + glb_offs, byte_to_state);
-    state_t st[ITEMS_PER_THREAD];
-    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
-        BlockLoadT(temp.load).Load(d_in_states, st);
-    else
-        BlockLoadT(temp.load).Load(d_in_states, st, valid, IDENTITY);
+    const uint32_t WARP_ID = threadIdx.x / WARP;
+    const uint32_t LANE    = threadIdx.x % WARP;
+
+    // Load: warp-striped coalesced __ldg, write to padded shmem in warp-striped layout.
+    // Warp-striped index for slot s: abs = WARP_ID*WARP*IPT + LANE + s*WARP
+    // Map to padded shmem: thread t, slot s -> row t, col s -> xpose[t*STRIDE + s]
+    // But we write in warp-striped order to global, so we write to
+    // xpose[(WARP_ID*WARP + s)*STRIDE + LANE] = xpose[abs_thread * STRIDE + slot]
+    // where abs_thread = WARP_ID*WARP + s, slot = LANE.
+    // Actually simpler: write warp-striped directly, read block-blocked.
+    // Warp-striped pos p = WARP_ID*WARP*IPT + LANE + s*WARP
+    //   -> thread owning output slot: thread=(WARP_ID*WARP+s), item=LANE? No.
+    // Standard warp-striped->block-blocked:
+    //   write: xpose[(WARP_ID * WARP + s) * STRIDE + LANE] = shmem_to_state[byte]
+    //   read:  st[s] = xpose[threadIdx.x * STRIDE + s]
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size) {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            xpose[(WARP_ID * WARP + s) * STRIDE + LANE] =
+                shmem_to_state[__ldg(d_in + abs)];
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            xpose[(WARP_ID * WARP + s) * STRIDE + LANE] =
+                (abs < size) ? shmem_to_state[__ldg(d_in + abs)] : state_t(IDENTITY);
+        }
+    }
     __syncthreads();
+
+    state_t st[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++)
+        st[s] = xpose[threadIdx.x * STRIDE + s];
 
     ComposeOp compose_op{shmem_compose};
 
     if (tile_idx == 0) {
         state_t block_aggregate;
-        BlockScanT(temp.scan_storage.scan).InclusiveScan(st, st, compose_op, block_aggregate);
+        BlockScanT(scan_temp.scan).InclusiveScan(st, st, compose_op, block_aggregate);
         if (threadIdx.x == 0)
             tile_state.SetInclusive(0, block_aggregate);
     } else {
-        PrefixOp prefix_op(tile_state, temp.scan_storage.prefix, compose_op, (int)tile_idx, IDENTITY);
-        BlockScanT(temp.scan_storage.scan).InclusiveScan(st, st, compose_op, prefix_op);
+        PrefixOp prefix_op(tile_state, scan_temp.prefix, compose_op, (int)tile_idx, IDENTITY);
+        BlockScanT(scan_temp.scan).InclusiveScan(st, st, compose_op, prefix_op);
     }
     __syncthreads();
 
-    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
-        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st);
-    else
-        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
+    // Store: block-blocked st[] -> padded shmem -> warp-striped global write.
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++)
+        xpose[threadIdx.x * STRIDE + s] = st[s];
+    __syncthreads();
+
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size) {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            d_states_out[abs] = xpose[(WARP_ID * WARP + s) * STRIDE + LANE];
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            if (abs < size)
+                d_states_out[abs] = xpose[(WARP_ID * WARP + s) * STRIDE + LANE];
+        }
+    }
 }
 
 // Add scan P1: transpose load/store, warp scans, static tile assignment.
@@ -724,11 +766,15 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     // P1 timesliced: BLOCK_LOAD_WARP_TRANSPOSE_TIMESLICED variant.
     // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // P1 padded: manual warp-striped↔block-blocked transpose with
+    // stride=IPT+1=23 (prime) to eliminate shmem bank conflicts.
+    // ------------------------------------------------------------------
     {
-        auto kernel    = p1_timesliced<BLOCK_SIZE, ITEMS_PER_THREAD>;
+        auto kernel    = p1_padded<BLOCK_SIZE, ITEMS_PER_THREAD>;
         size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
 
-        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (timesliced):", "P1:");
+        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (padded):", "P1:");
         for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
             reset(ts, nlb);
             kernel<<<nlb, BLOCK_SIZE>>>(
