@@ -653,6 +653,52 @@ void bw_ceiling_xpose(const uint8_t* __restrict__ d_in,
         BlockStoreT(temp.store).Store(d_out + glb_offs, st, valid);
 }
 
+// BW ceiling with BLOCK_LOAD_VECTORIZE: reads using vectorized LDG (no shmem
+// transpose).  Output in blocked layout.  Tests pure read+write BW with wider
+// load instructions but no bank-conflict overhead.
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__global__ LB_P1
+void bw_ceiling_vectorize(const state_t* __restrict__ d_in,
+                          state_t*       __restrict__ d_out,
+                          uint32_t size)
+{
+    using BlockLoadT  = cub::BlockLoad <state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_LOAD_VECTORIZE>;
+    using BlockStoreT = cub::BlockStore<state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_STORE_VECTORIZE>;
+
+    uint32_t glb_offs = blockIdx.x * BLOCK_SIZE * ITEMS_PER_THREAD;
+    uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
+                                      (uint64_t)size - glb_offs);
+
+    state_t st[ITEMS_PER_THREAD];
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockLoadT().Load(d_in + glb_offs, st);
+    else
+        BlockLoadT().Load(d_in + glb_offs, st, valid, (state_t)0);
+
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockStoreT().Store(d_out + glb_offs, st);
+    else
+        BlockStoreT().Store(d_out + glb_offs, st, valid);
+}
+
+// BW ceiling with manual uint4 loads: casts input to uint4* (128-bit loads),
+// reads 16 bytes per transaction, stores back as uint4.  No shmem at all.
+// Each thread handles BLOCK_SIZE*ITEMS_PER_THREAD*2 / (BLOCK_SIZE*16) = IPT/8
+// uint4 loads; we tile manually.
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__global__ LB_P1
+void bw_ceiling_u4(const uint4* __restrict__ d_in,
+                   uint4*       __restrict__ d_out,
+                   uint32_t size4)   // size in uint4 elements
+{
+    uint32_t tid = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    uint32_t stride = gridDim.x * BLOCK_SIZE;
+    for (uint32_t i = tid; i < size4; i += stride)
+        d_out[i] = __ldg(d_in + i);
+}
+
 // ---------------------------------------------------------------------------
 // Launch / bench helpers
 // ---------------------------------------------------------------------------
@@ -766,6 +812,67 @@ int main(int argc, char** argv) {
     print_stats(ms, BENCH_RUNS,
                 (size_t)size * sizeof(uint8_t) +
                 (size_t)size * sizeof(state_t));
+
+    // ------------------------------------------------------------------
+    // BW ceiling + vectorize (no shmem transpose)
+    // ------------------------------------------------------------------
+    {
+        // Reuse d_states_out as both in and out (same type, same size).
+        // Counts same bytes as xpose: size*2 in + size*2 out.
+        const state_t* d_sv_in  = reinterpret_cast<const state_t*>(d_in);
+        size_t sv_bytes = (size_t)size * sizeof(state_t);  // in + out each
+        uint32_t sv_elems = size / 2;  // uint8 buffer reinterpreted as uint16
+
+        printf("%-38s ", "BW ceiling BS256/IPT22 (vectorize):");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            bw_ceiling_vectorize<BLOCK_SIZE, ITEMS_PER_THREAD><<<nlb, BLOCK_SIZE>>>(
+                d_sv_in, d_states_out, sv_elems);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            gpuAssert(cudaEventRecord(t0));
+            bw_ceiling_vectorize<BLOCK_SIZE, ITEMS_PER_THREAD><<<nlb, BLOCK_SIZE>>>(
+                d_sv_in, d_states_out, sv_elems);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, sv_bytes + sv_bytes);
+    }
+
+    // ------------------------------------------------------------------
+    // BW ceiling + uint4 (128-bit loads, persistent grid)
+    // ------------------------------------------------------------------
+    {
+        // Use d_states_out as output, d_in as input, both cast to uint4*.
+        // Read 524 MB as uint4 (32.75 M elements), write same count.
+        // Total: 524 MB read + 524 MB write = 1048 MB (same as p1 in+out).
+        const uint4* d_u4_in  = reinterpret_cast<const uint4*>(d_in);
+        uint4*       d_u4_out = reinterpret_cast<uint4*>(d_states_out);
+        uint32_t size4 = size / sizeof(uint4);  // floor, ignore tail bytes
+
+        // Persistent grid: 108 SMs × 4 blocks/SM = 432 blocks
+        uint32_t u4_grid = 432;
+        size_t u4_bytes = (size_t)size4 * sizeof(uint4);
+
+        printf("%-38s ", "BW ceiling BS256/IPT22 (uint4):");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            bw_ceiling_u4<BLOCK_SIZE, ITEMS_PER_THREAD><<<u4_grid, BLOCK_SIZE>>>(
+                d_u4_in, d_u4_out, size4);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            gpuAssert(cudaEventRecord(t0));
+            bw_ceiling_u4<BLOCK_SIZE, ITEMS_PER_THREAD><<<u4_grid, BLOCK_SIZE>>>(
+                d_u4_in, d_u4_out, size4);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, u4_bytes + u4_bytes);
+    }
 
     // ------------------------------------------------------------------
     // P1 add scan
