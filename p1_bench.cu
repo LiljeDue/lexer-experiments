@@ -266,6 +266,17 @@ struct ComposeOp {
     }
 };
 
+// Same as ComposeOp but uses __ldg for global read-only cache access.
+// Use when d_compose points to global memory rather than shmem.
+struct ComposeOpLdg {
+    const state_t* __restrict__ d_compose;
+
+    __device__ __forceinline__ state_t
+    operator()(state_t a, state_t b) const {
+        return __ldg(d_compose + (b & 15u) * NUM_STATES + (a & 15u));
+    }
+};
+
 // Functor for TransformInputIterator: maps a raw byte to its initial state.
 struct ByteToState {
     state_t* d_to_state;
@@ -473,6 +484,279 @@ void p1_add(
         BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
 }
 
+// ---------------------------------------------------------------------------
+// Warp-level shuffle transpose helpers
+// ---------------------------------------------------------------------------
+
+// Coalesced (striped) load of ITEMS_PER_THREAD state_t items per thread,
+// then redistribute into blocked layout using __shfl_sync.
+//
+// Striped layout: thread t owns items t, t+BS, t+2*BS, ...
+// Blocked layout: thread t owns items t*IPT, t*IPT+1, ..., t*IPT+IPT-1
+//
+// Item at absolute index i is in striped thread (i % BS) slot (i / BS).
+// Thread t blocked slot k needs absolute index t*IPT+k, which lives in
+// striped thread (t*IPT+k) % BS at slot (t*IPT+k) / BS.
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__device__ __forceinline__ void
+warpShflLoad(const state_t* __restrict__ base, state_t (&items)[ITEMS_PER_THREAD],
+             uint32_t glb_offs, uint32_t size)
+{
+    const uint32_t TILE = BLOCK_SIZE * ITEMS_PER_THREAD;
+    const uint32_t WARP_ID = threadIdx.x / WARP;
+    const uint32_t LANE    = threadIdx.x % WARP;
+
+    // Each thread loads ITEMS_PER_THREAD items in striped layout into regs.
+    state_t striped[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+        striped[s] = (abs < size) ? __ldg(base + abs) : state_t(IDENTITY);
+    }
+
+    // Shuffle striped → blocked within each warp.
+    // Thread t blocked slot k needs absolute warp-local index t*IPT+k,
+    // which lives in striped lane (t*IPT+k) % WARP, slot (t*IPT+k) / WARP.
+    #pragma unroll
+    for (uint32_t k = 0; k < ITEMS_PER_THREAD; k++) {
+        uint32_t abs_local = LANE * ITEMS_PER_THREAD + k;
+        uint32_t src_lane  = abs_local % WARP;
+        uint32_t src_slot  = abs_local / WARP;
+        items[k] = __shfl_sync(0xffffffff, striped[src_slot], src_lane);
+    }
+    (void)TILE;
+}
+
+// Blocked → striped shuffle then coalesced store.
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__device__ __forceinline__ void
+warpShflStore(state_t* __restrict__ base, state_t (&items)[ITEMS_PER_THREAD],
+              uint32_t glb_offs, uint32_t size)
+{
+    const uint32_t WARP_ID = threadIdx.x / WARP;
+    const uint32_t LANE    = threadIdx.x % WARP;
+
+    // Shuffle blocked → striped within each warp.
+    // Striped slot s of lane t holds absolute warp-local index t + s*WARP,
+    // which lives in blocked lane (t+s*WARP)/IPT slot (t+s*WARP)%IPT.
+    state_t striped[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t abs_local = LANE + s * WARP;
+        uint32_t src_lane  = abs_local / ITEMS_PER_THREAD;
+        uint32_t src_slot  = abs_local % ITEMS_PER_THREAD;
+        striped[s] = __shfl_sync(0xffffffff, items[src_slot], src_lane);
+    }
+
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+        if (abs < size) base[abs] = striped[s];
+    }
+}
+
+// Variant with full-tile fast path (avoids branch per element when in bounds).
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__device__ __forceinline__ void
+warpShflStoreFull(state_t* __restrict__ base, state_t (&items)[ITEMS_PER_THREAD],
+                  uint32_t glb_offs)
+{
+    const uint32_t WARP_ID = threadIdx.x / WARP;
+    const uint32_t LANE    = threadIdx.x % WARP;
+
+    state_t striped[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t abs_local = LANE + s * WARP;
+        uint32_t src_lane  = abs_local / ITEMS_PER_THREAD;
+        uint32_t src_slot  = abs_local % ITEMS_PER_THREAD;
+        striped[s] = __shfl_sync(0xffffffff, items[src_slot], src_lane);
+    }
+
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+        base[abs] = striped[s];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// p1_shfl22: IPT=22, register-shuffle transpose, no shmem for load/store.
+// Same tile size as p1_transpose. Uses __ldg for tables.
+// ---------------------------------------------------------------------------
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__global__ LB_P1
+void p1_shfl22(
+    state_t* __restrict__ d_compose_glb,
+    state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_states_out,
+    ScanTileState tile_state,
+    uint32_t size,
+    uint32_t num_tiles)
+{
+    using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOpLdg>;
+
+    __shared__ struct {
+        typename PrefixOp::TempStorage  prefix;
+        typename BlockScanT::TempStorage scan;
+    } temp;
+
+    uint32_t tile_idx = blockIdx.x;
+    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+
+    const uint32_t WARP_ID = threadIdx.x / WARP;
+    const uint32_t LANE    = threadIdx.x % WARP;
+
+    // Striped byte load + to_state lookup via __ldg.
+    state_t striped[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+        uint8_t byte = (abs < size) ? __ldg(d_in + abs) : uint8_t(0);
+        striped[s] = (abs < size) ? __ldg(d_to_state_glb + byte) : state_t(IDENTITY);
+    }
+
+    // Shuffle striped → blocked.
+    state_t st[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (uint32_t k = 0; k < ITEMS_PER_THREAD; k++) {
+        uint32_t abs_local = LANE * ITEMS_PER_THREAD + k;
+        uint32_t src_lane  = abs_local % WARP;
+        uint32_t src_slot  = abs_local / WARP;
+        st[k] = __shfl_sync(0xffffffff, striped[src_slot], src_lane);
+    }
+
+    ComposeOpLdg compose_op{d_compose_glb};
+
+    if (tile_idx == 0) {
+        state_t block_aggregate;
+        BlockScanT(temp.scan).InclusiveScan(st, st, compose_op, block_aggregate);
+        if (threadIdx.x == 0)
+            tile_state.SetInclusive(0, block_aggregate);
+    } else {
+        PrefixOp prefix_op(tile_state, temp.prefix, compose_op, (int)tile_idx, IDENTITY);
+        BlockScanT(temp.scan).InclusiveScan(st, st, compose_op, prefix_op);
+    }
+
+    // Shuffle blocked → striped and store.
+    state_t out_striped[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t abs_local = LANE + s * WARP;
+        uint32_t src_lane  = abs_local / ITEMS_PER_THREAD;
+        uint32_t src_slot  = abs_local % ITEMS_PER_THREAD;
+        out_striped[s] = __shfl_sync(0xffffffff, st[src_slot], src_lane);
+    }
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size) {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            d_states_out[abs] = out_striped[s];
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            if (abs < size) d_states_out[abs] = out_striped[s];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// p1_shfl32: IPT=32, striped == blocked (no shuffle needed), no shmem for
+// load/store. Larger tile (32KB/block vs 22KB), fewer tiles, longer lookback.
+// ---------------------------------------------------------------------------
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__global__ LB_P1
+void p1_shfl32(
+    state_t* __restrict__ d_compose_glb,
+    state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_states_out,
+    ScanTileState tile_state,
+    uint32_t size,
+    uint32_t num_tiles)
+{
+    static_assert(ITEMS_PER_THREAD == WARP,
+        "p1_shfl32 requires ITEMS_PER_THREAD == WARP (32)");
+
+    using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOpLdg>;
+
+    __shared__ struct {
+        typename PrefixOp::TempStorage  prefix;
+        typename BlockScanT::TempStorage scan;
+    } temp;
+
+    uint32_t tile_idx = blockIdx.x;
+    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+    uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
+                                      (uint64_t)size - glb_offs);
+
+    // With IPT=WARP=32, striped layout IS blocked layout:
+    // thread t owns items t, t+BS, t+2*BS, ... = t*32, t*32+1, ... (for BS=256, WARP=32).
+    // Wait — striped: thread t slot s = abs index t + s*BS.
+    // Blocked: thread t slot s = abs index t*IPT + s.
+    // These are equal only if BS==IPT. BS=256, IPT=32: not equal.
+    // But within a warp (32 threads): warp-striped thread t slot s = warp_base + t + s*WARP.
+    // Warp-blocked thread t slot s = warp_base + t*WARP + s. These ARE equal when IPT==WARP.
+    // BlockScan with WARP_SCANS operates per-warp in warp-blocked layout.
+    // So load striped per-warp = load blocked per-warp. No shuffle needed.
+
+    const uint32_t WARP_ID = threadIdx.x / WARP;
+    const uint32_t LANE    = threadIdx.x % WARP;
+
+    state_t st[ITEMS_PER_THREAD];
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size) {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            uint8_t byte = __ldg(d_in + abs);
+            st[s] = __ldg(d_to_state_glb + byte);
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            if (abs < size) {
+                uint8_t byte = __ldg(d_in + abs);
+                st[s] = __ldg(d_to_state_glb + byte);
+            } else {
+                st[s] = IDENTITY;
+            }
+        }
+    }
+
+    ComposeOpLdg compose_op{d_compose_glb};
+
+    if (tile_idx == 0) {
+        state_t block_aggregate;
+        BlockScanT(temp.scan).InclusiveScan(st, st, compose_op, block_aggregate);
+        if (threadIdx.x == 0)
+            tile_state.SetInclusive(0, block_aggregate);
+    } else {
+        PrefixOp prefix_op(tile_state, temp.prefix, compose_op, (int)tile_idx, IDENTITY);
+        BlockScanT(temp.scan).InclusiveScan(st, st, compose_op, prefix_op);
+    }
+
+    // Store: warp-striped = warp-blocked for IPT=WARP, so write directly.
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size) {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            d_states_out[abs] = st[s];
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            if (abs < size) d_states_out[abs] = st[s];
+        }
+    }
+}
+
 // BW ceiling: reads input using the same u64 pattern as P1, XORs into a
 // per-thread accumulator, writes one u64 per thread to prevent DCE.
 // No scan, no shmem tables.  Establishes an upper bound for P1 throughput.
@@ -648,6 +932,66 @@ int main(int argc, char** argv) {
             gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
         }
         print_stats(ms, BENCH_RUNS, p1_bytes);
+    }
+
+    // ------------------------------------------------------------------
+    // P1 shfl22: register-shuffle transpose, IPT=22, __ldg for tables.
+    // ------------------------------------------------------------------
+    {
+        auto kernel    = p1_shfl22<BLOCK_SIZE, ITEMS_PER_THREAD>;
+        size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+
+        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (shfl22):", "P1:");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            reset(ts, nlb);
+            kernel<<<nlb, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            reset(ts, nlb);
+            gpuAssert(cudaEventRecord(t0));
+            kernel<<<nlb, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, p1_bytes);
+    }
+
+    // ------------------------------------------------------------------
+    // P1 shfl32: IPT=32, no shuffle (warp-striped=warp-blocked), __ldg tables.
+    // ------------------------------------------------------------------
+    {
+        static const uint32_t IPT32 = 32;
+        uint32_t nlb32 = (size + BLOCK_SIZE * IPT32 - 1) / (BLOCK_SIZE * IPT32);
+        ScanTileState ts32;
+        gpuAssert(cudaMalloc(&ts32.d_tile_descriptors, ScanTileState::AllocationSize(nlb32)));
+
+        auto kernel    = p1_shfl32<BLOCK_SIZE, IPT32>;
+        size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+
+        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT32 (shfl32):", "P1:");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            initScanTileState(ts32, (int)nlb32);
+            kernel<<<nlb32, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts32, size, nlb32);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            initScanTileState(ts32, (int)nlb32);
+            gpuAssert(cudaEventRecord(t0));
+            kernel<<<nlb32, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts32, size, nlb32);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, p1_bytes);
+        gpuAssert(cudaFree(ts32.d_tile_descriptors));
     }
 
     // Cleanup
