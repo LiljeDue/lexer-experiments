@@ -817,22 +817,23 @@ int main(int argc, char** argv) {
     // BW ceiling + vectorize (no shmem transpose)
     // ------------------------------------------------------------------
     {
-        // Reuse d_states_out as both in and out (same type, same size).
-        // Counts same bytes as xpose: size*2 in + size*2 out.
-        const state_t* d_sv_in  = reinterpret_cast<const state_t*>(d_in);
-        size_t sv_bytes = (size_t)size * sizeof(state_t);  // in + out each
-        uint32_t sv_elems = size / 2;  // uint8 buffer reinterpreted as uint16
+        // d_states_out has size uint16 elements (same byte count as d_in reinterpreted).
+        // Use it as both source and sink so in+out are the same size.
+        uint32_t sv_elems = size;  // size uint16 elements allocated in d_states_out
+        uint32_t nlb_v    = (sv_elems + BLOCK_SIZE * ITEMS_PER_THREAD - 1)
+                            / (BLOCK_SIZE * ITEMS_PER_THREAD);
+        size_t sv_bytes = (size_t)sv_elems * sizeof(state_t);
 
         printf("%-38s ", "BW ceiling BS256/IPT22 (vectorize):");
         for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
-            bw_ceiling_vectorize<BLOCK_SIZE, ITEMS_PER_THREAD><<<nlb, BLOCK_SIZE>>>(
-                d_sv_in, d_states_out, sv_elems);
+            bw_ceiling_vectorize<BLOCK_SIZE, ITEMS_PER_THREAD><<<nlb_v, BLOCK_SIZE>>>(
+                d_states_out, d_states_out, sv_elems);
             gpuAssert(cudaDeviceSynchronize());
         }
         for (uint32_t i = 0; i < BENCH_RUNS; i++) {
             gpuAssert(cudaEventRecord(t0));
-            bw_ceiling_vectorize<BLOCK_SIZE, ITEMS_PER_THREAD><<<nlb, BLOCK_SIZE>>>(
-                d_sv_in, d_states_out, sv_elems);
+            bw_ceiling_vectorize<BLOCK_SIZE, ITEMS_PER_THREAD><<<nlb_v, BLOCK_SIZE>>>(
+                d_states_out, d_states_out, sv_elems);
             gpuAssert(cudaDeviceSynchronize());
             gpuAssert(cudaEventRecord(t1));
             gpuAssert(cudaEventSynchronize(t1));
@@ -845,12 +846,11 @@ int main(int argc, char** argv) {
     // BW ceiling + uint4 (128-bit loads, persistent grid)
     // ------------------------------------------------------------------
     {
-        // Use d_states_out as output, d_in as input, both cast to uint4*.
-        // Read 524 MB as uint4 (32.75 M elements), write same count.
-        // Total: 524 MB read + 524 MB write = 1048 MB (same as p1 in+out).
-        const uint4* d_u4_in  = reinterpret_cast<const uint4*>(d_in);
+        // d_states_out: size * sizeof(state_t) = size*2 bytes.
+        // Use it as both in and out (in-place) to keep read+write symmetric.
+        const uint4* d_u4_in  = reinterpret_cast<const uint4*>(d_states_out);
         uint4*       d_u4_out = reinterpret_cast<uint4*>(d_states_out);
-        uint32_t size4 = size / sizeof(uint4);  // floor, ignore tail bytes
+        uint32_t size4 = (uint32_t)((size_t)size * sizeof(state_t) / sizeof(uint4));
 
         // Persistent grid: 108 SMs × 4 blocks/SM = 432 blocks
         uint32_t u4_grid = 432;
