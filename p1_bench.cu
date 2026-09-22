@@ -485,6 +485,250 @@ void p1_add(
 }
 
 // ---------------------------------------------------------------------------
+// Fused load+transpose and transpose+store helpers
+//
+// CUB BLOCK_LOAD_WARP_TRANSPOSE does:
+//   global[striped] -> registers[striped]   (LoadDirectWarpStriped)
+//   registers[striped] -> shmem[striped]    \
+//   __syncwarp                               > WarpStripedToBlocked
+//   shmem[blocked] -> registers[blocked]   /
+//
+// The fused version skips the intermediate registers:
+//   global[striped] -> shmem[striped]
+//   __syncwarp
+//   shmem[blocked] -> registers[blocked]
+//
+// Same for store (reverse). Saves IPT register writes + reads per thread.
+//
+// For IPT that is a power of 2 and > 4, CUB inserts padding
+// (item_offset += item_offset >> LOG_SMEM_BANKS) to avoid bank conflicts.
+// We replicate that here. For IPT=22 (not power of 2), no padding needed.
+// ---------------------------------------------------------------------------
+
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool INSERT_PADDING>
+__device__ __forceinline__ void
+fusedLoadTranspose(
+    const uint8_t* __restrict__ d_in,
+    const state_t* __restrict__ d_to_state,
+    volatile state_t* shmem,   // BLOCK_SIZE * ITEMS_PER_THREAD [+ padding] entries
+    state_t (&st)[ITEMS_PER_THREAD],
+    uint32_t glb_offs, uint32_t size)
+{
+    const uint32_t WARP_ID     = threadIdx.x / WARP;
+    const uint32_t LANE        = threadIdx.x % WARP;
+    const uint32_t WARP_OFFSET = WARP_ID * WARP * ITEMS_PER_THREAD;
+
+    // Global -> shmem in warp-striped order (coalesced global read).
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t abs        = glb_offs + WARP_OFFSET + LANE + s * WARP;
+        uint8_t  byte       = (abs < size) ? __ldg(d_in + abs) : uint8_t(0);
+        state_t  val        = (abs < size) ? __ldg(d_to_state + byte) : state_t(IDENTITY);
+        uint32_t shmem_idx  = WARP_OFFSET + s * WARP + LANE;
+        if (INSERT_PADDING) shmem_idx += shmem_idx >> 5;  // LOG_SMEM_BANKS=5 on A100
+        shmem[shmem_idx] = val;
+    }
+
+    __syncwarp(0xffffffff);
+
+    // Shmem -> registers in blocked order.
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t shmem_idx = WARP_OFFSET + LANE * ITEMS_PER_THREAD + s;
+        if (INSERT_PADDING) shmem_idx += shmem_idx >> 5;
+        st[s] = shmem[shmem_idx];
+    }
+}
+
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool INSERT_PADDING>
+__device__ __forceinline__ void
+fusedTransposeStore(
+    state_t* __restrict__ d_out,
+    volatile state_t* shmem,
+    state_t (&st)[ITEMS_PER_THREAD],
+    uint32_t glb_offs, uint32_t size)
+{
+    const uint32_t WARP_ID     = threadIdx.x / WARP;
+    const uint32_t LANE        = threadIdx.x % WARP;
+    const uint32_t WARP_OFFSET = WARP_ID * WARP * ITEMS_PER_THREAD;
+
+    // Registers -> shmem in blocked order.
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t shmem_idx = WARP_OFFSET + LANE * ITEMS_PER_THREAD + s;
+        if (INSERT_PADDING) shmem_idx += shmem_idx >> 5;
+        shmem[shmem_idx] = st[s];
+    }
+
+    __syncwarp(0xffffffff);
+
+    // Shmem -> global in warp-striped order (coalesced global write).
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t abs       = glb_offs + WARP_OFFSET + LANE + s * WARP;
+        uint32_t shmem_idx = WARP_OFFSET + s * WARP + LANE;
+        if (INSERT_PADDING) shmem_idx += shmem_idx >> 5;
+        if (abs < size) d_out[abs] = shmem[shmem_idx];
+    }
+}
+
+// Full-tile fast path for store (no bounds check).
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool INSERT_PADDING>
+__device__ __forceinline__ void
+fusedTransposeStoreFull(
+    state_t* __restrict__ d_out,
+    volatile state_t* shmem,
+    state_t (&st)[ITEMS_PER_THREAD],
+    uint32_t glb_offs)
+{
+    const uint32_t WARP_ID     = threadIdx.x / WARP;
+    const uint32_t LANE        = threadIdx.x % WARP;
+    const uint32_t WARP_OFFSET = WARP_ID * WARP * ITEMS_PER_THREAD;
+
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t shmem_idx = WARP_OFFSET + LANE * ITEMS_PER_THREAD + s;
+        if (INSERT_PADDING) shmem_idx += shmem_idx >> 5;
+        shmem[shmem_idx] = st[s];
+    }
+
+    __syncwarp(0xffffffff);
+
+    #pragma unroll
+    for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+        uint32_t abs       = glb_offs + WARP_OFFSET + LANE + s * WARP;
+        uint32_t shmem_idx = WARP_OFFSET + s * WARP + LANE;
+        if (INSERT_PADDING) shmem_idx += shmem_idx >> 5;
+        d_out[abs] = shmem[shmem_idx];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// p1_fused22: IPT=22, fused global-read+shmem-write (no intermediate regs),
+// fused shmem-read+global-write on store. No CUB BlockLoad/BlockStore.
+// Uses __ldg for DFA tables. No padding (IPT=22 not power-of-2).
+// ---------------------------------------------------------------------------
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__global__ LB_P1
+void p1_fused22(
+    state_t* __restrict__ d_compose_glb,
+    state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_states_out,
+    ScanTileState tile_state,
+    uint32_t size,
+    uint32_t num_tiles)
+{
+    using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOpLdg>;
+
+    // Shmem: transpose buffer (no padding for IPT=22) unioned with scan temp.
+    __shared__ union {
+        volatile state_t transpose[BLOCK_SIZE * ITEMS_PER_THREAD];
+        struct {
+            typename PrefixOp::TempStorage   prefix;
+            typename BlockScanT::TempStorage scan;
+        } scan_storage;
+    } temp;
+
+    uint32_t tile_idx = blockIdx.x;
+    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+
+    state_t st[ITEMS_PER_THREAD];
+    fusedLoadTranspose<BLOCK_SIZE, ITEMS_PER_THREAD, false>(
+        d_in, d_to_state_glb, temp.transpose, st, glb_offs, size);
+
+    __syncthreads();  // transpose -> scan_storage union transition
+
+    ComposeOpLdg compose_op{d_compose_glb};
+
+    if (tile_idx == 0) {
+        state_t block_aggregate;
+        BlockScanT(temp.scan_storage.scan).InclusiveScan(st, st, compose_op, block_aggregate);
+        if (threadIdx.x == 0)
+            tile_state.SetInclusive(0, block_aggregate);
+    } else {
+        PrefixOp prefix_op(tile_state, temp.scan_storage.prefix, compose_op, (int)tile_idx, IDENTITY);
+        BlockScanT(temp.scan_storage.scan).InclusiveScan(st, st, compose_op, prefix_op);
+    }
+
+    __syncthreads();  // scan_storage -> transpose union transition
+
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        fusedTransposeStoreFull<BLOCK_SIZE, ITEMS_PER_THREAD, false>(
+            d_states_out, temp.transpose, st, glb_offs);
+    else
+        fusedTransposeStore<BLOCK_SIZE, ITEMS_PER_THREAD, false>(
+            d_states_out, temp.transpose, st, glb_offs, size);
+}
+
+// ---------------------------------------------------------------------------
+// p1_fused32: IPT=32, same fused approach. IPT=32 is power-of-2 so padding
+// is applied (shmem_idx += shmem_idx >> 5) to avoid bank conflicts.
+// Shmem = 32*32*2 + padding = 2048 + 64 = 2112 bytes per block.
+// ---------------------------------------------------------------------------
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__global__ LB_P1
+void p1_fused32(
+    state_t* __restrict__ d_compose_glb,
+    state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_states_out,
+    ScanTileState tile_state,
+    uint32_t size,
+    uint32_t num_tiles)
+{
+    static_assert(ITEMS_PER_THREAD == WARP, "p1_fused32 requires IPT == WARP (32)");
+
+    using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOpLdg>;
+
+    // Padding: CUB adds (item_offset >> LOG_SMEM_BANKS) extra slots.
+    // For IPT=32, WARP=32: TIME_SLICED_ITEMS = WARP*IPT = 1024 per warp.
+    // PADDING_ITEMS = 1024 >> 5 = 32 per warp. 8 warps: 8*(1024+32) = 8448 bytes.
+    static constexpr uint32_t PADDED_WARP_ITEMS = WARP * ITEMS_PER_THREAD
+        + (WARP * ITEMS_PER_THREAD >> 5);
+
+    __shared__ union {
+        volatile state_t transpose[BLOCK_SIZE / WARP * PADDED_WARP_ITEMS];
+        struct {
+            typename PrefixOp::TempStorage   prefix;
+            typename BlockScanT::TempStorage scan;
+        } scan_storage;
+    } temp;
+
+    uint32_t tile_idx = blockIdx.x;
+    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+
+    state_t st[ITEMS_PER_THREAD];
+    fusedLoadTranspose<BLOCK_SIZE, ITEMS_PER_THREAD, true>(
+        d_in, d_to_state_glb, temp.transpose, st, glb_offs, size);
+
+    __syncthreads();
+
+    ComposeOpLdg compose_op{d_compose_glb};
+
+    if (tile_idx == 0) {
+        state_t block_aggregate;
+        BlockScanT(temp.scan_storage.scan).InclusiveScan(st, st, compose_op, block_aggregate);
+        if (threadIdx.x == 0)
+            tile_state.SetInclusive(0, block_aggregate);
+    } else {
+        PrefixOp prefix_op(tile_state, temp.scan_storage.prefix, compose_op, (int)tile_idx, IDENTITY);
+        BlockScanT(temp.scan_storage.scan).InclusiveScan(st, st, compose_op, prefix_op);
+    }
+
+    __syncthreads();
+
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        fusedTransposeStoreFull<BLOCK_SIZE, ITEMS_PER_THREAD, true>(
+            d_states_out, temp.transpose, st, glb_offs);
+    else
+        fusedTransposeStore<BLOCK_SIZE, ITEMS_PER_THREAD, true>(
+            d_states_out, temp.transpose, st, glb_offs, size);
+}
+
+// ---------------------------------------------------------------------------
 // Warp-level shuffle transpose helpers
 // ---------------------------------------------------------------------------
 
@@ -974,6 +1218,66 @@ int main(int argc, char** argv) {
         size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
 
         printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT32 (shfl32):", "P1:");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            initScanTileState(ts32, (int)nlb32);
+            kernel<<<nlb32, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts32, size, nlb32);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            initScanTileState(ts32, (int)nlb32);
+            gpuAssert(cudaEventRecord(t0));
+            kernel<<<nlb32, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts32, size, nlb32);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, p1_bytes);
+        gpuAssert(cudaFree(ts32.d_tile_descriptors));
+    }
+
+    // ------------------------------------------------------------------
+    // P1 fused22: fused global-read+shmem-write, IPT=22, __ldg tables.
+    // ------------------------------------------------------------------
+    {
+        auto kernel    = p1_fused22<BLOCK_SIZE, ITEMS_PER_THREAD>;
+        size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+
+        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (fused22):", "P1:");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            reset(ts, nlb);
+            kernel<<<nlb, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            reset(ts, nlb);
+            gpuAssert(cudaEventRecord(t0));
+            kernel<<<nlb, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, p1_bytes);
+    }
+
+    // ------------------------------------------------------------------
+    // P1 fused32: fused global-read+shmem-write, IPT=32, padding, __ldg tables.
+    // ------------------------------------------------------------------
+    {
+        static const uint32_t IPT32 = 32;
+        uint32_t nlb32 = (size + BLOCK_SIZE * IPT32 - 1) / (BLOCK_SIZE * IPT32);
+        ScanTileState ts32;
+        gpuAssert(cudaMalloc(&ts32.d_tile_descriptors, ScanTileState::AllocationSize(nlb32)));
+
+        auto kernel    = p1_fused32<BLOCK_SIZE, IPT32>;
+        size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+
+        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT32 (fused32):", "P1:");
         for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
             initScanTileState(ts32, (int)nlb32);
             kernel<<<nlb32, BLOCK_SIZE>>>(
