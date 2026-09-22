@@ -1126,24 +1126,15 @@ void lexerShfl32(
             .InclusiveScan(st, st, ctx, state_prefix_op);
     }
 
-    // Warp-striped: lane l slot s = warp-local pos l+s*WARP.
-    // Block-blocked: lane l slot s = warp-local pos l*IPT+s.
-    // With IPT=WARP=32: source (lane=l, slot=s) -> dest (lane=s, slot=l).
-    // dest[s] of lane l = source[LANE] of lane s.
-    {
-        state_t tmp[ITEMS_PER_THREAD];
-        #pragma unroll
-        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++)
-            tmp[s] = __shfl_sync(0xffffffff, st[LANE], s);
-        #pragma unroll
-        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++)
-            st[s] = tmp[s];
-    }
-
-    // Write scanned states to flat shmem for produce-detection lookups.
+    // st[] is warp-striped (lane l slot s = warp-local pos l+s*WARP).
+    // Transpose to block-blocked via states[] shmem: write warp-striped, sync, read block-blocked.
     #pragma unroll
     for (I i = 0; i < ITEMS_PER_THREAD; i++)
-        states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
+        states[WARP_ID * WARP * ITEMS_PER_THREAD + LANE + i * WARP] = st[i];
+    __syncthreads();
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++)
+        st[i] = states[threadIdx.x * ITEMS_PER_THREAD + i];
     __syncthreads();
 
     I prod[ITEMS_PER_THREAD];
