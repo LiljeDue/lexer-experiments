@@ -1029,6 +1029,160 @@ void lexerTranspose(
     }
 }
 
+// lexerShfl32: IPT=32 (must equal WARP), no shmem transpose buffer.
+// With IPT==WARP, warp-striped layout == warp-blocked layout, so threads
+// load directly into the layout expected by BLOCK_SCAN_WARP_SCANS without
+// going through shmem. Shmem tables are still used for table lookups.
+template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+__global__ LB_P1
+void lexerShfl32(
+    LexerCtxShmem ctx,
+    uint8_t* d_in,
+    uint32_t* d_index_out,
+    token_t* d_token_out,
+    ScanTileState<state_t> state_states,
+    ScanTileState<I> index_states,
+    I size,
+    I num_logical_blocks,
+    volatile I* new_size,
+    volatile bool* is_valid)
+{
+    static_assert(ITEMS_PER_THREAD == 32, "lexerShfl32 requires IPT == 32 (== WARP)");
+    static_assert(ITEMS_PER_THREAD <= 64, "ITEMS_PER_THREAD exceeds 64-bit is_produce_state capacity");
+
+    using BlockScanState = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using BlockScanI     = cub::BlockScan<I, BLOCK_SIZE>;
+    using PrefixOpState  = TilePrefixCallbackOp<state_t, LexerCtxShmem>;
+    using PrefixOpIdx    = TilePrefixCallbackOp<I, Add<I>>;
+
+    __shared__ union {
+        struct {
+            typename PrefixOpState::TempStorage state_prefix;
+            typename BlockScanState::TempStorage state_scan;
+        } state_scan_storage;
+        struct {
+            typename PrefixOpIdx::TempStorage idx_prefix;
+            typename BlockScanI::TempStorage  idx_scan;
+        } idx_scan_storage;
+    } temp;
+
+    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    __shared__ __align__(8) state_t shmem_to_state[256];
+    __shared__ state_t states[ITEMS_PER_THREAD * BLOCK_SIZE];
+    __shared__ uint8_t tok_stage[ITEMS_PER_THREAD * BLOCK_SIZE];
+    __shared__ state_t next_block_first_state;
+
+    for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES / 4; i += BLOCK_SIZE)
+        reinterpret_cast<volatile uint64_t*>(shmem_compose)[i] =
+            reinterpret_cast<uint64_t*>(ctx.d_compose_glb)[i];
+    for (uint32_t i = threadIdx.x; i < 256 / 4; i += BLOCK_SIZE)
+        reinterpret_cast<volatile uint64_t*>(shmem_to_state)[i] =
+            reinterpret_cast<uint64_t*>(ctx.d_to_state)[i];
+    ctx.d_compose = shmem_compose;
+
+    if (threadIdx.x == 0)
+        next_block_first_state = IDENTITY;
+    __syncthreads();
+
+    I tile_idx = (I) blockIdx.x;
+    I glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+
+    const uint32_t WARP_ID = threadIdx.x / WARP;
+    const uint32_t LANE    = threadIdx.x % WARP;
+
+    // Direct warp-striped load: with IPT==WARP, this is warp-blocked for WARP_SCANS.
+    state_t st[ITEMS_PER_THREAD];
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size) {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            st[s] = shmem_to_state[__ldg(d_in + abs)];
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t s = 0; s < ITEMS_PER_THREAD; s++) {
+            uint32_t abs = glb_offs + WARP_ID * WARP * ITEMS_PER_THREAD + LANE + s * WARP;
+            st[s] = (abs < size) ? shmem_to_state[__ldg(d_in + abs)] : state_t(IDENTITY);
+        }
+    }
+
+    // Load boundary byte for produce-detection at tile edge.
+    if (threadIdx.x == 0) {
+        I boundary = glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD;
+        if (boundary < size)
+            next_block_first_state = shmem_to_state[d_in[boundary]];
+    }
+
+    if (tile_idx == 0) {
+        state_t block_aggregate;
+        BlockScanState(temp.state_scan_storage.state_scan)
+            .InclusiveScan(st, st, ctx, block_aggregate);
+        if (threadIdx.x == 0)
+            state_states.SetInclusive(0, block_aggregate);
+    } else {
+        PrefixOpState state_prefix_op(state_states, temp.state_scan_storage.state_prefix,
+                                      ctx, (int)tile_idx, state_t(IDENTITY));
+        BlockScanState(temp.state_scan_storage.state_scan)
+            .InclusiveScan(st, st, ctx, state_prefix_op);
+    }
+
+    // Write scanned states to flat shmem for produce-detection lookups.
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++)
+        states[threadIdx.x * ITEMS_PER_THREAD + i] = st[i];
+    __syncthreads();
+
+    I prod[ITEMS_PER_THREAD];
+    uint64_t is_produce_state = 0;
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+        I lid = threadIdx.x * ITEMS_PER_THREAD + i;
+        I gid = glb_offs + lid;
+        bool temp_flag = false;
+        if (gid < size) {
+            if (lid == ITEMS_PER_THREAD * BLOCK_SIZE - 1) {
+                temp_flag = gid == size - 1 || is_produce(ctx(st[i], next_block_first_state));
+            } else {
+                temp_flag = gid == size - 1 || is_produce(states[lid + 1]);
+            }
+        }
+        is_produce_state |= (uint64_t)temp_flag << i;
+        prod[i] = (I)temp_flag;
+    }
+
+    PrefixOpIdx index_prefix_op(index_states, temp.idx_scan_storage.idx_prefix,
+                                 Add<I>(), (int)tile_idx, I(0));
+    BlockScanI(temp.idx_scan_storage.idx_scan)
+        .InclusiveScan(prod, prod, Add<I>(), index_prefix_op);
+    I idx_pfx  = index_prefix_op.GetExclusivePrefix();
+    I prod_agg = index_prefix_op.GetBlockAggregate();
+
+    volatile uint16_t* lid_stage = (volatile uint16_t*) states;
+
+    #pragma unroll
+    for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+        if ((is_produce_state >> i) & 1) {
+            I slot = prod[i] - 1 - idx_pfx;
+            I lid  = threadIdx.x * ITEMS_PER_THREAD + i;
+            tok_stage[slot] = get_token(st[i]);
+            lid_stage[slot] = (uint16_t) lid;
+        }
+    }
+
+    __syncthreads();
+
+    for (I slot = threadIdx.x; slot < prod_agg; slot += BLOCK_SIZE) {
+        I out_idx = idx_pfx + slot;
+        d_index_out[out_idx] = glb_offs + lid_stage[slot];
+        d_token_out[out_idx] = tok_stage[slot];
+    }
+
+    if (tile_idx == num_logical_blocks - 1 && threadIdx.x == BLOCK_SIZE - 1) {
+        *new_size = Add<I>()(idx_pfx, prod_agg);
+        *is_valid = is_accept(st[ITEMS_PER_THREAD - 1]);
+    }
+}
+
 template<typename T>
 __global__ void initScanTileStateKernel(ScanTileState<T> state, int num_tiles) {
     state.InitializeStatus(num_tiles);
@@ -1589,6 +1743,131 @@ void testLexerTranspose(uint8_t* input,
     ctx.Cleanup();
 }
 
+template<uint32_t BS, uint32_t IPT>
+void testLexerShfl32(uint8_t* input,
+                     size_t input_size,
+                     uint32_t* expected_indices,
+                     token_t* expected_tokens,
+                     size_t expected_size) {
+    using I = uint32_t;
+    const I size = input_size;
+    const I NLB  = (size + BS * IPT - 1) / (BS * IPT);
+    const size_t IN_ARRAY_BYTES  = (size_t)size * sizeof(uint8_t);
+    const size_t INDEX_OUT_BYTES = (size_t)size * sizeof(I);
+    const size_t TOKEN_OUT_BYTES = (size_t)size * sizeof(token_t);
+#ifdef PROFILE
+    const I WARMUP_RUNS = 1; const I RUNS = 1;
+#else
+    const I WARMUP_RUNS = 500; const I RUNS = 100;
+#endif
+    std::vector<token_t> h_token_out(size, 0);
+    std::vector<I>       h_index_out(size, 0);
+
+    I*       d_new_size;
+    bool*    d_is_valid;
+    uint8_t* d_in;
+    I*       d_index_out;
+    token_t* d_token_out;
+    ScanTileState<state_t> d_state_states;
+    ScanTileState<I>       d_index_states;
+
+    gpuAssert(cudaMalloc((void**)&d_new_size,  sizeof(I)));
+    gpuAssert(cudaMalloc((void**)&d_is_valid,  sizeof(bool)));
+    gpuAssert(cudaMalloc((void**)&d_state_states.d_tile_descriptors,
+        ScanTileState<state_t>::AllocationSize(NLB)));
+    gpuAssert(cudaMalloc((void**)&d_index_states.d_tile_descriptors,
+        ScanTileState<I>::AllocationSize(NLB)));
+    gpuAssert(cudaMalloc((void**)&d_in,        IN_ARRAY_BYTES));
+    gpuAssert(cudaMalloc((void**)&d_index_out, INDEX_OUT_BYTES));
+    gpuAssert(cudaMalloc((void**)&d_token_out, TOKEN_OUT_BYTES));
+    gpuAssert(cudaMemcpy(d_in, input, IN_ARRAY_BYTES, cudaMemcpyHostToDevice));
+
+    LexerCtxShmem ctx = LexerCtxShmem();
+
+    auto reset = [&]() {
+        cudaMemset(d_is_valid, 0, sizeof(bool));
+        initScanTileState(d_state_states, (int)NLB);
+        initScanTileState(d_index_states, (int)NLB);
+    };
+    reset();
+
+    float* temp_total = (float*) malloc(sizeof(float) * RUNS);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start); cudaEventCreate(&stop);
+
+    for (I i = 0; i < WARMUP_RUNS; ++i) {
+        lexerShfl32<I, BS, IPT><<<NLB, BS>>>(
+            ctx, d_in, d_index_out, d_token_out,
+            d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid);
+        cudaDeviceSynchronize(); reset();
+        gpuAssert(cudaPeekAtLastError());
+    }
+    for (I i = 0; i < RUNS; ++i) {
+        cudaEventRecord(start, 0);
+        lexerShfl32<I, BS, IPT><<<NLB, BS>>>(
+            ctx, d_in, d_index_out, d_token_out,
+            d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid);
+        gpuAssert(cudaDeviceSynchronize());
+        cudaEventRecord(stop, 0); cudaEventSynchronize(stop);
+        cudaEventElapsedTime(temp_total + i, start, stop);
+        reset(); gpuAssert(cudaPeekAtLastError());
+    }
+
+    I temp_size = 0;
+    gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
+
+    // Correctness run.
+    reset();
+    lexerShfl32<I, BS, IPT><<<NLB, BS>>>(
+        ctx, d_in, d_index_out, d_token_out,
+        d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid);
+    cudaDeviceSynchronize(); gpuAssert(cudaPeekAtLastError());
+
+    bool is_valid = false;
+    gpuAssert(cudaMemcpy(h_index_out.data(), d_index_out, INDEX_OUT_BYTES, cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(h_token_out.data(), d_token_out, TOKEN_OUT_BYTES, cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(&is_valid,  d_is_valid, sizeof(bool), cudaMemcpyDeviceToHost));
+
+    bool test_passes = is_valid;
+    if (!test_passes)
+        std::cout << "Lexer Test Failed: The input given to the lexer does not result in an accepting state." << std::endl;
+    if (test_passes && temp_size != (I)expected_size) {
+        printf("Lexer Test Failed: Expected size=%zu but got size=%u\n", expected_size, temp_size);
+        test_passes = false;
+    }
+    if (test_passes) {
+        for (I i = 0; i < (I)expected_size; ++i) {
+            if (h_index_out[i] != expected_indices[i]) {
+                printf("Lexer Test Failed: index mismatch at i=%u: expected=%u got=%u\n",
+                       i, expected_indices[i], h_index_out[i]);
+                test_passes = false; break;
+            }
+            if (h_token_out[i] != expected_tokens[i]) {
+                printf("Lexer Test Failed: token mismatch at i=%u: expected=%u got=%u\n",
+                       i, (unsigned)expected_tokens[i], (unsigned)h_token_out[i]);
+                test_passes = false; break;
+            }
+        }
+    }
+
+    if (test_passes) {
+        const size_t TOTAL_BYTES = IN_ARRAY_BYTES
+            + (size_t)temp_size * (sizeof(I) + sizeof(token_t));
+        printf("\n");
+        printf("  %-36s ", "Total:");
+        compute_descriptors(temp_total, RUNS, TOTAL_BYTES);
+    }
+
+    free(temp_total);
+    gpuAssert(cudaFree(d_in)); gpuAssert(cudaFree(d_index_out));
+    gpuAssert(cudaFree(d_token_out));
+    gpuAssert(cudaFree(d_index_states.d_tile_descriptors));
+    gpuAssert(cudaFree(d_state_states.d_tile_descriptors));
+    gpuAssert(cudaFree(d_new_size)); gpuAssert(cudaFree(d_is_valid));
+    ctx.Cleanup();
+}
+
 #ifdef DEBUG
 #define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
 #else
@@ -1814,6 +2093,8 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "1Pass BS256/IPT20 (transpose):");
     testLexerTranspose<256, 20>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "1Pass BS256/IPT32 (shfl32):");
+    testLexerShfl32<256, 32>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
 
     free(input);
     free(expected_indices);
