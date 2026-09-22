@@ -616,6 +616,43 @@ bw_ceiling(const uint8_t* __restrict__ d_in, uint32_t size, uint64_t* d_out)
     d_out[blockIdx.x * BLOCK_SIZE + threadIdx.x] = acc;
 }
 
+// BW ceiling with transpose: same read pattern as bw_ceiling, but routes data
+// through a CUB BLOCK_LOAD_WARP_TRANSPOSE / BLOCK_STORE_WARP_TRANSPOSE round-
+// trip so the shmem bank-conflict cost of the transpose is included.
+// No scan, no DFA tables.  Isolates transpose overhead vs pure BW ceiling.
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__global__ LB_P1
+void bw_ceiling_xpose(const uint8_t* __restrict__ d_in,
+                      state_t*       __restrict__ d_out,
+                      uint32_t size)
+{
+    using BlockLoadT  = cub::BlockLoad <state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    using BlockStoreT = cub::BlockStore<state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_STORE_WARP_TRANSPOSE>;
+
+    __shared__ union {
+        typename BlockLoadT::TempStorage  load;
+        typename BlockStoreT::TempStorage store;
+    } temp;
+
+    uint32_t glb_offs = blockIdx.x * BLOCK_SIZE * ITEMS_PER_THREAD;
+    uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
+                                      (uint64_t)size - glb_offs);
+
+    state_t st[ITEMS_PER_THREAD];
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockLoadT(temp.load).Load(d_in + glb_offs, st);
+    else
+        BlockLoadT(temp.load).Load(d_in + glb_offs, st, valid, (state_t)0);
+    __syncthreads();
+
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockStoreT(temp.store).Store(d_out + glb_offs, st);
+    else
+        BlockStoreT(temp.store).Store(d_out + glb_offs, st, valid);
+}
+
 // ---------------------------------------------------------------------------
 // Launch / bench helpers
 // ---------------------------------------------------------------------------
@@ -707,6 +744,28 @@ int main(int argc, char** argv) {
     print_stats(ms, BENCH_RUNS,
                 (size_t)size * sizeof(uint8_t) +
                 (size_t)nlb * BLOCK_SIZE * sizeof(uint64_t));
+
+    // ------------------------------------------------------------------
+    // BW ceiling + transpose
+    // ------------------------------------------------------------------
+    printf("%-38s ", "BW ceiling BS256/IPT22 (xpose):");
+    for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+        bw_ceiling_xpose<BLOCK_SIZE, ITEMS_PER_THREAD><<<nlb, BLOCK_SIZE>>>(
+            d_in, d_states_out, size);
+        gpuAssert(cudaDeviceSynchronize());
+    }
+    for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+        gpuAssert(cudaEventRecord(t0));
+        bw_ceiling_xpose<BLOCK_SIZE, ITEMS_PER_THREAD><<<nlb, BLOCK_SIZE>>>(
+            d_in, d_states_out, size);
+        gpuAssert(cudaDeviceSynchronize());
+        gpuAssert(cudaEventRecord(t1));
+        gpuAssert(cudaEventSynchronize(t1));
+        gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+    }
+    print_stats(ms, BENCH_RUNS,
+                (size_t)size * sizeof(uint8_t) +
+                (size_t)size * sizeof(state_t));
 
     // ------------------------------------------------------------------
     // P1 add scan
