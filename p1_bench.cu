@@ -336,6 +336,74 @@ static void initScanTileState(ScanTileState& ts, int num_tiles) {
 // instead of manual u64 coalesced loads + shmem blocked layout.
 // Static blockIdx.x assignment, tile-0 fast path — matches p1_nregnone structure.
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+__global__ __launch_bounds__(256, 8)
+void p1_transpose_lb8(
+    state_t* __restrict__ d_compose_glb,
+    state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_states_out,
+    ScanTileState tile_state,
+    uint32_t size,
+    uint32_t num_tiles)
+{
+    using TransformIter = thrust::transform_iterator<ByteToState, const uint8_t*>;
+    using BlockLoadT  = cub::BlockLoad <state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    using BlockStoreT = cub::BlockStore<state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_STORE_WARP_TRANSPOSE>;
+    using BlockScanT  = cub::BlockScan <state_t, BLOCK_SIZE,
+                                        cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp    = PrefixCallbackOp<ComposeOp>;
+
+    __shared__ union {
+        typename BlockLoadT::TempStorage  load;
+        typename BlockStoreT::TempStorage store;
+        struct {
+            typename PrefixOp::TempStorage  prefix;
+            typename BlockScanT::TempStorage scan;
+        } scan_storage;
+    } temp;
+
+    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    __shared__ __align__(8) state_t shmem_to_state[256];
+
+    loadTablesToShmem<BLOCK_SIZE>(
+        d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
+
+    uint32_t tile_idx = blockIdx.x;
+    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+    uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
+                                      (uint64_t)size - glb_offs);
+
+    ByteToState byte_to_state{shmem_to_state};
+    TransformIter d_in_states(d_in + glb_offs, byte_to_state);
+    state_t st[ITEMS_PER_THREAD];
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockLoadT(temp.load).Load(d_in_states, st);
+    else
+        BlockLoadT(temp.load).Load(d_in_states, st, valid, IDENTITY);
+    __syncthreads();
+
+    ComposeOp compose_op{shmem_compose};
+
+    if (tile_idx == 0) {
+        state_t block_aggregate;
+        BlockScanT(temp.scan_storage.scan).InclusiveScan(st, st, compose_op, block_aggregate);
+        if (threadIdx.x == 0)
+            tile_state.SetInclusive(0, block_aggregate);
+    } else {
+        PrefixOp prefix_op(tile_state, temp.scan_storage.prefix, compose_op, (int)tile_idx, IDENTITY);
+        BlockScanT(temp.scan_storage.scan).InclusiveScan(st, st, compose_op, prefix_op);
+    }
+    __syncthreads();
+
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st);
+    else
+        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
+}
+
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
 __global__ LB_P1
 void p1_transpose(
     state_t* __restrict__ d_compose_glb,
@@ -635,6 +703,34 @@ int main(int argc, char** argv) {
         size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
 
         printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (transpose):", "P1:");
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            reset(ts, nlb);
+            kernel<<<nlb, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            reset(ts, nlb);
+            gpuAssert(cudaEventRecord(t0));
+            kernel<<<nlb, BLOCK_SIZE>>>(
+                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, p1_bytes);
+    }
+
+    // ------------------------------------------------------------------
+    // P1 transpose lb8: same as transpose but __launch_bounds__(256, 8)
+    // forces compiler to <=32 regs/thread to hit 100% theoretical occupancy.
+    // ------------------------------------------------------------------
+    {
+        auto kernel    = p1_transpose_lb8<BLOCK_SIZE, ITEMS_PER_THREAD>;
+        size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+
+        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (lb8):", "P1:");
         for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
             reset(ts, nlb);
             kernel<<<nlb, BLOCK_SIZE>>>(
