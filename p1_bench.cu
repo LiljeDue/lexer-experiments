@@ -36,16 +36,18 @@ static void _gpuAssert(cudaError_t code, const char* file, int line) {
 // and the total bytes transferred.
 // ---------------------------------------------------------------------------
 static void print_stats(float* ms, int runs, size_t bytes) {
-    double mean = 0, var = 0, gbps = 0;
+    double mean = 0, sq_mean = 0, gbps = 0;
     double factor = (double)bytes / (1000.0 * runs);
     for (int i = 0; i < runs; i++) {
         double t = fmax(ms[i] * 1e3, 0.5);   // microseconds
-        mean += t / runs;
-        var  += (t * t) / runs;
-        gbps += factor / t;
+        mean    += t / runs;
+        sq_mean += (t * t) / runs;
+        gbps    += factor / t;
     }
-    double std  = sqrt(var);
-    double bound = 0.95 * std / sqrt((double)runs);
+    // Sample standard deviation (Bessel-corrected), 95% CI = 1.96 * std / sqrt(n).
+    double var   = (sq_mean - mean * mean) * runs / fmax(runs - 1, 1);
+    double std   = sqrt(fmax(var, 0.0));
+    double bound = 1.96 * std / sqrt((double)runs);
     printf("%.0fμs (95%% CI: [%.1fμs, %.1fμs]); %.0fGB/s\n",
            mean, mean - bound, mean + bound, gbps);
 }

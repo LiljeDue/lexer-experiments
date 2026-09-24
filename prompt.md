@@ -73,6 +73,23 @@ node has is not recorded here.
 All timings are mean over 100 runs with 500 warmup iterations, reported as
 `μs` with 95% CI and effective GB/s (input bytes read + output bytes written).
 
+**Bug (fixed): benchmark statistics and byte counts.**
+- *What / how it manifested:* the 95% CIs printed by `print_stats`
+  (`p1_bench.cu`) and `compute_descriptors` (`common/util.cu.h`) were always
+  about ±9.5% of the mean, whatever the run-to-run spread. The "variance"
+  was the mean of t² (not E[t²] − mean²), so the "standard deviation" was
+  roughly the mean itself, and the multiplier was 0.95 instead of 1.96.
+  Separately, in `cuda_lexer.cu` the ladder step "Big tile S1 (load only)"
+  was credited with the full lexer's traffic (input + outputs) and reported
+  an impossible 3378 GB/s, and the (now removed) older lexer tests counted
+  every block's shared-memory table copy (served from L2) as DRAM traffic.
+- *How it was identified:* identical ±9.5% intervals on every line
+  regardless of variance, and GB/s above the A100's physical bandwidth.
+- *Fix:* Bessel-corrected sample variance, 1.96 multiplier, floating-point
+  byte factor; every line counts only the bytes that variant moves (S1:
+  input only). All earlier CIs in this document are the old, meaningless
+  ones; run-to-run spread was judged from repeated runs instead (~±5 μs).
+
 ```
 make bench_p1    # builds and runs p1_bench on dense 500MiB input
 make profile_p1  # builds with -lineinfo -DPROFILE, runs ncu --set full,
