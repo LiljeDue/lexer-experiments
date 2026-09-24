@@ -147,18 +147,23 @@ struct ScanTileState {
                      : "memory");
     }
 
+    // SLEEP_FIRST: sleep initial_delay_ns before the first poll.
+    // POLL_NS: sleep between polls (0 = spin).
+    template<bool SLEEP_FIRST, uint32_t POLL_NS>
     __device__ __forceinline__ void WaitForValid(int tile_idx,
                                                   uint32_t& status,
                                                   state_t& value,
-                                                  uint32_t initial_delay_ns = 450) {
-        __nanosleep(initial_delay_ns);
+                                                  uint32_t initial_delay_ns) {
+        if (SLEEP_FIRST)
+            __nanosleep(initial_delay_ns);
         uint32_t w;
         asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
                      : "=r"(w)
                      : "l"(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx)
                      : "memory");
         while (__any_sync(0xffffffff, (w & 0xffffu) == uint32_t(SCAN_TILE_INVALID))) {
-            __nanosleep(350);
+            if (POLL_NS != 0)
+                __nanosleep(POLL_NS);
             asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
                          : "=r"(w)
                          : "l"(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx)
@@ -169,9 +174,20 @@ struct ScanTileState {
     }
 };
 
+// Lookback polling delays, selected by the SLEEP template parameter:
+//   0: sleep before every poll window (first window 200 + 50*(tile%8) ns,
+//      later windows 350 ns), 350 ns between polls
+//   1: no sleep before the first poll, 350 ns between polls
+//   2: no sleep before the first poll, 32 ns between polls
+template<uint32_t SLEEP> struct LookbackDelays;
+template<> struct LookbackDelays<0> { static constexpr bool sleep_first = true;  static constexpr uint32_t poll_ns = 350; };
+template<> struct LookbackDelays<1> { static constexpr bool sleep_first = false; static constexpr uint32_t poll_ns = 350; };
+template<> struct LookbackDelays<2> { static constexpr bool sleep_first = false; static constexpr uint32_t poll_ns = 32;  };
+
 // Prefix callback used with CUB BlockScan (decoupled lookback).
-template<typename ScanOpT>
+template<typename ScanOpT, uint32_t SLEEP = 0>
 struct PrefixCallbackOp {
+    using Delays      = LookbackDelays<SLEEP>;
     using WarpReduceT = cub::WarpReduce<state_t, WARP>;
 
     ScanTileState& tile_state;
@@ -197,7 +213,8 @@ struct PrefixCallbackOp {
     ProcessWindow(int predecessor_idx, uint32_t& predecessor_status,
                   uint32_t delay_ns = 350) {
         state_t value;
-        tile_state.WaitForValid(predecessor_idx, predecessor_status, value, delay_ns);
+        tile_state.WaitForValid<Delays::sleep_first, Delays::poll_ns>(
+            predecessor_idx, predecessor_status, value, delay_ns);
         int is_oob    = (predecessor_status == uint32_t(SCAN_TILE_OOB));
         int tail_flag = (predecessor_status == uint32_t(SCAN_TILE_INCLUSIVE)) | is_oob;
         state_t eff   = is_oob ? identity : value;
@@ -311,7 +328,7 @@ static void initScanTileState(ScanTileState& ts, int num_tiles) {
 #endif
 
 
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD>
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t SLEEP = 0>
 __global__ LB_P1
 void p1_transpose(
     state_t* __restrict__ d_compose_glb,
@@ -329,7 +346,7 @@ void p1_transpose(
                                         cub::BLOCK_STORE_WARP_TRANSPOSE>;
     using BlockScanT  = cub::BlockScan <state_t, BLOCK_SIZE,
                                         cub::BLOCK_SCAN_WARP_SCANS>;
-    using PrefixOp    = PrefixCallbackOp<ComposeOp>;
+    using PrefixOp    = PrefixCallbackOp<ComposeOp, SLEEP>;
 
     __shared__ union {
         typename BlockLoadT::TempStorage  load;
@@ -603,6 +620,138 @@ void p1_ladder(
         BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
 }
 
+// ---------------------------------------------------------------------------
+// Column compose
+//
+// For a fixed right operand x, compose(a, x) over the 12 state indices a is a
+// vector of 12 nibbles, packed into a uint64_t "column" (nibble a = index of
+// compose(a, x)). The in-thread chain acc = compose(acc, x_i) then becomes
+// acc = (col[x_i] >> 4*acc) & 15: the col[] load address depends only on the
+// input, so the dependent chain is ALU-only instead of a chain of dependent
+// shmem lookups. The state index determines the full state_t, so the chain
+// runs on indices and idx_state[] restores the full value on output.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ uint32_t col_apply(uint64_t col, uint32_t acc) {
+    return (uint32_t)(col >> (4 * acc)) & 15u;
+}
+
+// Builds col[16] and idx_state[16] (entries 12..15 unused) from h_compose.
+static void build_column_tables(uint64_t* col, state_t* idx_state) {
+    for (uint32_t x = 0; x < 16; x++) { col[x] = 0; idx_state[x] = 0; }
+    bool seen[16] = {};
+    for (uint32_t x = 0; x < NUM_STATES; x++)
+        for (uint32_t a = 0; a < NUM_STATES; a++) {
+            state_t s = h_compose[x * NUM_STATES + a];   // compose(a, x)
+            col[x] |= (uint64_t)(s & 15u) << (4 * a);
+            idx_state[s & 15u] = s;
+            seen[s & 15u] = true;
+        }
+    for (uint32_t i = 0; i < NUM_STATES; i++)
+        assert(seen[i] && "every state index must appear in h_compose");
+}
+
+// p1_transpose with the two in-thread compose chains (reduce, then apply the
+// exclusive prefix) done by column compose. BlockScan only scans the
+// per-thread aggregates (one item per thread).
+//   LOOKBACK = false: every tile scans from IDENTITY independently (like
+//                     p1_ladder STEP 2; output is not valid P1).
+//   LOOKBACK = true:  full P1 with decoupled lookback, polling per SLEEP.
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool LOOKBACK, uint32_t SLEEP = 0>
+__global__ LB_P1
+void p1_column(
+    state_t* __restrict__ d_compose_glb,
+    state_t* __restrict__ d_to_state_glb,
+    const uint64_t* __restrict__ d_col_glb,       // 16 entries
+    const state_t* __restrict__ d_idx_state_glb,  // 16 entries
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_states_out,
+    ScanTileState tile_state,
+    uint32_t size)
+{
+    using TransformIter = thrust::transform_iterator<ByteToState, const uint8_t*>;
+    using BlockLoadT  = cub::BlockLoad <state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    using BlockStoreT = cub::BlockStore<state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_STORE_WARP_TRANSPOSE>;
+    using BlockScanT  = cub::BlockScan <state_t, BLOCK_SIZE,
+                                        cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp    = PrefixCallbackOp<ComposeOp, SLEEP>;
+
+    __shared__ union {
+        typename BlockLoadT::TempStorage  load;
+        typename BlockStoreT::TempStorage store;
+        struct {
+            typename PrefixOp::TempStorage  prefix;
+            typename BlockScanT::TempStorage scan;
+        } scan_storage;
+    } temp;
+
+    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    __shared__ __align__(8) state_t shmem_to_state[256];
+    __shared__ uint64_t shmem_col[16];
+    __shared__ state_t  shmem_idx_state[16];
+
+    // loadTablesToShmem's trailing __syncthreads() also covers these.
+    if (threadIdx.x < 16) {
+        shmem_col[threadIdx.x]       = d_col_glb[threadIdx.x];
+        shmem_idx_state[threadIdx.x] = d_idx_state_glb[threadIdx.x];
+    }
+    loadTablesToShmem<BLOCK_SIZE>(
+        d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
+
+    uint32_t tile_idx = blockIdx.x;
+    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+    uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
+                                      (uint64_t)size - glb_offs);
+
+    ByteToState byte_to_state{shmem_to_state};
+    TransformIter d_in_states(d_in + glb_offs, byte_to_state);
+    state_t st[ITEMS_PER_THREAD];
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockLoadT(temp.load).Load(d_in_states, st);
+    else
+        BlockLoadT(temp.load).Load(d_in_states, st, valid, IDENTITY);
+    __syncthreads();
+
+    // Thread reduce: ALU-only chain. Out-of-range items are IDENTITY, whose
+    // column maps every index to itself.
+    uint32_t agg = IDENTITY & 15u;
+    #pragma unroll
+    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++)
+        agg = col_apply(shmem_col[st[i] & 15u], agg);
+
+    // Block-wide exclusive scan of the per-thread aggregates.
+    ComposeOp compose_op{shmem_compose};
+    state_t prefix;
+    if (!LOOKBACK || tile_idx == 0) {
+        state_t block_aggregate;
+        BlockScanT(temp.scan_storage.scan).ExclusiveScan(
+            (state_t)agg, prefix, IDENTITY, compose_op, block_aggregate);
+        if (LOOKBACK && threadIdx.x == 0)
+            tile_state.SetInclusive(0, block_aggregate);
+    } else {
+        PrefixOp prefix_op(tile_state, temp.scan_storage.prefix, compose_op, (int)tile_idx, IDENTITY);
+        BlockScanT(temp.scan_storage.scan).ExclusiveScan(
+            (state_t)agg, prefix, compose_op, prefix_op);
+    }
+
+    // Thread scan seeded with the exclusive prefix: ALU-only chain, then
+    // index -> full state_t.
+    uint32_t acc = prefix & 15u;
+    #pragma unroll
+    for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+        acc   = col_apply(shmem_col[st[i] & 15u], acc);
+        st[i] = shmem_idx_state[acc];
+    }
+    __syncthreads();
+
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st);
+    else
+        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
+}
+
 // Host reference for ladder / P1 output. scan == false: plain byte->state map.
 // scan == true: inclusive compose scan that restarts every tile_len elements
 // (tile_len == 0: one scan over the whole input, i.e. real P1 output).
@@ -691,6 +840,16 @@ int main(int argc, char** argv) {
     gpuAssert(cudaMemcpy(d_compose_glb,  h_compose, sizeof(h_compose),              cudaMemcpyHostToDevice));
     gpuAssert(cudaMemcpy(d_to_state_glb, h_to_state, sizeof(h_to_state),            cudaMemcpyHostToDevice));
 
+    uint64_t  h_col[16];
+    state_t   h_idx_state[16];
+    uint64_t* d_col_glb;
+    state_t*  d_idx_state_glb;
+    build_column_tables(h_col, h_idx_state);
+    gpuAssert(cudaMalloc(&d_col_glb,       sizeof(h_col)));
+    gpuAssert(cudaMalloc(&d_idx_state_glb, sizeof(h_idx_state)));
+    gpuAssert(cudaMemcpy(d_col_glb,       h_col,       sizeof(h_col),       cudaMemcpyHostToDevice));
+    gpuAssert(cudaMemcpy(d_idx_state_glb, h_idx_state, sizeof(h_idx_state), cudaMemcpyHostToDevice));
+
     float* ms = (float*)malloc(BENCH_RUNS * sizeof(float));
     cudaEvent_t t0, t1;
     gpuAssert(cudaEventCreate(&t0));
@@ -766,15 +925,35 @@ int main(int argc, char** argv) {
         bench("L2 + block scan (no lookback):", u16_bytes, no_prep, launch);
     }
 
-    // L3: + decoupled lookback = p1_transpose
-    {
-        auto kernel = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD>;
+    // L3: + decoupled lookback = p1_transpose, one line per lookback SLEEP mode
+    auto run_l3 = [&](auto kernel, const char* name) {
         auto prep   = [&] { reset(ts, nlb); };
         auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb); };
         poison_out(); prep(); launch(); fetch_states();
-        if (!check_states(input, size, h_states, true, 0, "L3")) exit(1);
-        bench("L3 + lookback (p1_transpose):", u16_bytes, prep, launch);
-    }
+        if (!check_states(input, size, h_states, true, 0, name)) exit(1);
+        bench(name, u16_bytes, prep, launch);
+    };
+    run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, 0>, "L3 + lookback (p1_transpose):");
+    run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, 1>, "L3 sleep=1 (no initial sleep):");
+    run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, 2>, "L3 sleep=2 (no initial, 32ns poll):");
+
+    // Column compose variants: C2 = L2 with column compose, C3 = L3 with
+    // column compose (per lookback SLEEP mode).
+    printf("\nColumn compose (u16 out):\n");
+    auto run_col = [&](auto kernel, bool lookback, const char* name) {
+        auto prep   = [&] { if (lookback) reset(ts, nlb); };
+        auto launch = [&] {
+            kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_col_glb, d_idx_state_glb,
+                                        d_in, d_states_out, ts, size);
+        };
+        poison_out(); prep(); launch(); fetch_states();
+        if (!check_states(input, size, h_states, true, lookback ? 0 : BLOCK_SIZE * ITEMS_PER_THREAD, name)) exit(1);
+        bench(name, u16_bytes, prep, launch);
+    };
+    run_col(p1_column<BLOCK_SIZE, ITEMS_PER_THREAD, false>,   false, "C2 block scan, column (no lookback):");
+    run_col(p1_column<BLOCK_SIZE, ITEMS_PER_THREAD, true, 0>, true,  "C3 + lookback, sleep=0:");
+    run_col(p1_column<BLOCK_SIZE, ITEMS_PER_THREAD, true, 1>, true,  "C3 + lookback, sleep=1:");
+    run_col(p1_column<BLOCK_SIZE, ITEMS_PER_THREAD, true, 2>, true,  "C3 + lookback, sleep=2:");
     free(h_states);
 
     // ------------------------------------------------------------------
@@ -815,6 +994,8 @@ int main(int argc, char** argv) {
     gpuAssert(cudaFree(d_states_out));
     gpuAssert(cudaFree(d_compose_glb));
     gpuAssert(cudaFree(d_to_state_glb));
+    gpuAssert(cudaFree(d_col_glb));
+    gpuAssert(cudaFree(d_idx_state_glb));
     gpuAssert(cudaFree(ts.d_tile_descriptors));
     return 0;
 }
