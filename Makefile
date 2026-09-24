@@ -146,6 +146,8 @@ profile_p1: $(DATA_PATH)/tokens_dense_500MiB.in
 	    --import-source 1 \
 	    --source-folders . \
 	    --target-processes all \
+	    --kernel-name-base demangled \
+	    --kernel-id '::regex:(p1_ladder|p1_transpose)<:1' \
 	    --export profile_p1 \
 	    ./$(P1_BENCH_PROGRAM)_profile $(DATA_PATH)/tokens_dense_500MiB.in 2>&1
 	-ncu --import profile_p1.ncu-rep > profile_p1.txt 2>&1
