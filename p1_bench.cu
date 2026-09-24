@@ -956,12 +956,26 @@ void p1_vec_pipe(
 // ---------------------------------------------------------------------------
 // Named barriers (bar.sync waits; bar.arrive signals without waiting). Both
 // order prior shared-memory accesses for the threads waiting on the barrier.
+// The id is an immediate: with a register id ptxas cannot tell which
+// barriers are used and reserves all 16 per block, which can limit how many
+// blocks are resident per SM (and a persistent grid then deadlocks).
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void named_bar_sync(uint32_t id, uint32_t threads) {
-    asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(threads) : "memory");
+template<uint32_t ID, uint32_t THREADS>
+__device__ __forceinline__ void named_bar_sync() {
+    asm volatile("bar.sync %0, %1;" :: "n"(ID), "n"(THREADS) : "memory");
 }
-__device__ __forceinline__ void named_bar_arrive(uint32_t id, uint32_t threads) {
-    asm volatile("bar.arrive %0, %1;" :: "r"(id), "r"(threads) : "memory");
+template<uint32_t ID, uint32_t THREADS>
+__device__ __forceinline__ void named_bar_arrive() {
+    asm volatile("bar.arrive %0, %1;" :: "n"(ID), "n"(THREADS) : "memory");
+}
+// Parity-selected variants: barrier ID0 for par == 0, ID0 + 1 for par == 1.
+template<uint32_t ID0, uint32_t THREADS>
+__device__ __forceinline__ void named_bar_sync_par(uint32_t par) {
+    if (par) named_bar_sync<ID0 + 1, THREADS>(); else named_bar_sync<ID0, THREADS>();
+}
+template<uint32_t ID0, uint32_t THREADS>
+__device__ __forceinline__ void named_bar_arrive_par(uint32_t par) {
+    if (par) named_bar_arrive<ID0 + 1, THREADS>(); else named_bar_arrive<ID0, THREADS>();
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,7 +1051,7 @@ void p1_vec_lbwarp(
     if (warp == COMPUTE_WARPS) {
         uint32_t par = 0;
         for (uint32_t tile = blockIdx.x; tile < num_tiles; tile += gridDim.x, par ^= 1) {
-            named_bar_sync(LBW_BAR_A0 + par, ALL_THREADS);
+            named_bar_sync_par<LBW_BAR_A0, ALL_THREADS>(par);
             state_t p = IDENTITY;   // tile 0 published INCLUSIVE directly
             if (tile != 0) {
                 PrefixOp prefix_op(tile_state, prefix_temp, compose_op, (int)tile, IDENTITY);
@@ -1045,7 +1059,7 @@ void p1_vec_lbwarp(
             }
             if (lane == 0)
                 prefix_slot[par] = p;
-            named_bar_arrive(LBW_BAR_B0 + par, ALL_THREADS);
+            named_bar_arrive_par<LBW_BAR_B0, ALL_THREADS>(par);
         }
         return;
     }
@@ -1136,7 +1150,7 @@ void p1_vec_lbwarp(
         state_t excl = (state_t)__shfl_up_sync(0xffffffff, (uint32_t)incl, 1);
         if (lane == WARP - 1)
             warp_agg[par][warp] = incl;
-        named_bar_sync(LBW_BAR_COMPUTE, BLOCK_SIZE);
+        named_bar_sync<LBW_BAR_COMPUTE, BLOCK_SIZE>();
         state_t warp_prefix = IDENTITY, block_aggregate = IDENTITY;
         #pragma unroll
         for (uint32_t w = 0; w < COMPUTE_WARPS; w++) {
@@ -1159,11 +1173,11 @@ void p1_vec_lbwarp(
                 tile_state.SetPartial(tile, block_aggregate);
             agg_slot[par] = block_aggregate;
         }
-        named_bar_arrive(LBW_BAR_A0 + par, ALL_THREADS);
+        named_bar_arrive_par<LBW_BAR_A0, ALL_THREADS>(par);
 
         // Finish the previous tile while this tile's lookback runs.
         if (have_pend) {
-            named_bar_sync(LBW_BAR_B0 + (par ^ 1), ALL_THREADS);
+            named_bar_sync_par<LBW_BAR_B0, ALL_THREADS>(par ^ 1);
             store_pending(pend, prefix_slot[par ^ 1]);
         }
 
@@ -1180,7 +1194,7 @@ void p1_vec_lbwarp(
         have_pend = true;
     }
     if (have_pend) {
-        named_bar_sync(LBW_BAR_B0 + (par ^ 1), ALL_THREADS);
+        named_bar_sync_par<LBW_BAR_B0, ALL_THREADS>(par ^ 1);
         store_pending(pend, prefix_slot[par ^ 1]);
     }
     cp_async_wait<0>();
@@ -1325,6 +1339,7 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     auto bench = [&](const char* name, size_t bytes, auto prep, auto launch) {
         printf("%-40s ", name);
+        fflush(stdout);   // so a hanging kernel is identifiable from the output
         for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
             prep();
             launch();

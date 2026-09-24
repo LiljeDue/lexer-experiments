@@ -515,6 +515,43 @@ Why they failed:
 IPT=24 at 6 blocks/SM is the sweet spot. V3's lookback behaves like L3's
 (~3 windows per tile, depth ~68, re-polls 1.13).
 
+### Bug: persistent kernel deadlock from named-barrier usage (`p1_vec_lbwarp`)
+
+**What:** the first A100 run of `p1_vec_lbwarp` (dedicated lookback warp,
+persistent grid) hung; it passed every check locally.
+
+**How it manifested:** `make bench_p1` stopped after the
+"V3 persistent + cp.async" line and never finished (the next kernel's name
+was not printed because stdout was not flushed before running it).
+
+**How it was identified:**
+1. `compute-sanitizer --tool synccheck` on a debug build: 0 errors, so the
+   barrier protocol itself was correct.
+2. `ptxas -v` reported `used 16 barriers` for the kernel: the named barrier
+   ids were passed as registers (`bar.sync %0, %1` with `"r"(id)`), so ptxas
+   could not tell which ids are used and reserved all 16 per block.
+3. `cuda_occupancy.h`: sm_80 has 2 × 32 = 64 barriers per SM, so at 16 per
+   block only 4 blocks fit — but `cudaOccupancyMaxActiveBlocksPerMultiprocessor`
+   only applies the barrier limit for compute capability ≥ 9.0 and reported
+   5. The persistent grid (5 × 108 = 540 blocks) therefore had 108 blocks
+   that could never become resident; tiles waiting on their predecessors
+   spun forever. Locally (sm_75: 32 barriers/SM, 2 blocks of 16) every block
+   was resident, so it passed.
+
+**How it was solved:** barrier ids are compile-time immediates
+(`named_bar_sync<ID, THREADS>()`, parity selected with a branch), so ptxas
+reserves only ids 0–5 (`used 6 barriers`; 64 / 6 = 10 blocks/SM, no limit
+at 5). `bench` now flushes stdout before each kernel so a hang is
+attributable.
+
+**Trade-offs:** the parity choice becomes a (block-uniform) branch instead
+of an id computed in a register. Persistent grids still rely on the
+occupancy API, which does not model barrier limits on sm_80 — any kernel
+that uses more named barriers must be checked against 64 / barriers-used by
+hand. **Alternative:** dynamic tile tickets (`atomicAdd` for the next tile)
+would make the persistent kernels safe even if not all blocks are resident,
+at the cost of an atomic per tile and broadcasting the tile index.
+
 ### 4-chain reduce and deferred lookback (on top of `p1_vec_pipe`)
 
 | Variant | Time | vs pipe (1491 μs) |
