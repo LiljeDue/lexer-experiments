@@ -521,6 +521,18 @@ __device__ __forceinline__ void cp_async_wait() {
 // Output staging for coalesced index/token writes reuses the consumed input
 // buffer (tokens) plus a u16 buffer (positions within the tile).
 // ---------------------------------------------------------------------------
+// Position of the k-th (0-based) set bit of m, k < popc(m): branchless binary
+// search with popc on halves, quarters, ... (~25 instructions).
+__device__ __forceinline__ uint32_t select_bit(uint32_t m, uint32_t k) {
+    uint32_t pos = 0, c;
+    c = __popc(m & 0xffffu); if (k >= c) { k -= c; m >>= 16; pos += 16; }
+    c = __popc(m & 0xffu);   if (k >= c) { k -= c; m >>= 8;  pos += 8;  }
+    c = __popc(m & 0xfu);    if (k >= c) { k -= c; m >>= 4;  pos += 4;  }
+    c = __popc(m & 0x3u);    if (k >= c) { k -= c; m >>= 2;  pos += 2;  }
+    c = m & 0x1u;            if (k >= c) {                   pos += 1;  }
+    return pos;
+}
+
 // Compose functor over the block's shared-memory table (one pointer, instead of
 // the three-pointer LexerCtxShmem, to keep register pressure down).
 struct ShmemCompose {
@@ -907,24 +919,16 @@ void lexerBig(
             const I o_incl  = __shfl_sync(0xffffffff, incl, o);
             const I o_count = __shfl_sync(0xffffffff, count, o);
             I k = r - (o_incl - o_count);   // rank within the owner's tokens
-            I pos = 0;
-            bool found = false;
-            const uint32_t om[3] = {__shfl_sync(0xffffffff, m0, o),
-                                    __shfl_sync(0xffffffff, m1, o),
-                                    __shfl_sync(0xffffffff, m2, o)};
-            #pragma unroll
-            for (I w = 0; w < MASK_WORDS; w++) {
-                const uint32_t m = om[w];
-                const I c = __popc(m);
-                if (!found) {
-                    if (k < c) {
-                        pos   = 32 * w + __fns(m, 0, (int)k + 1);
-                        found = true;
-                    } else {
-                        k -= c;
-                    }
-                }
-            }
+            const uint32_t om0 = __shfl_sync(0xffffffff, m0, o);
+            const uint32_t om1 = __shfl_sync(0xffffffff, m1, o);
+            const uint32_t om2 = __shfl_sync(0xffffffff, m2, o);
+            // Word holding the k-th set bit, then the bit within it
+            // (select_bit, not __fns: __fns expands to ~140 instructions).
+            const I c0 = __popc(om0), c01 = c0 + __popc(om1);
+            const uint32_t m = k < c0 ? om0 : k < c01 ? om1 : om2;
+            const I base     = k < c0 ? 0   : k < c01 ? 32  : 64;
+            k               -= k < c0 ? 0   : k < c01 ? c0  : c01;
+            const I pos = base + select_bit(m, k);
             if (r < warp_total) {
                 const I elem = o * CHUNK + pos;   // within the warp's segment
                 d_index_out[warp_base + r] = tile_offs + warp * WARP_BYTES + elem;

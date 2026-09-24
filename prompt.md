@@ -843,3 +843,41 @@ tuning:
 Two-kernel reduce-then-scan is no option: its traffic floor (~1574 μs) is
 above the result. `p1_vec_pipe`'s techniques have also been ported into the
 single-pass lexer (`lexerVecPipe` in `cuda_lexer.cu`).
+
+## Single-pass Lexer (`cuda_lexer.cu`)
+
+Speed of light: 1 B read per input byte + 5 B written per token (u32 index +
+u8 token). At memcpy bandwidth (1356 GB/s): dense 940 μs (150.1M tokens),
+moderate 428 μs (11.3M), sparse 391 μs (1.2M). At 6144-byte tiles that is
+90–218M tiles/s — 3–8× P1's tile rate — with two look-backs (state, index)
+per tile. The two look-backs cannot simply be merged: a tile's token count
+depends on its incoming state.
+
+### `lexerBig` (large tiles)
+
+Tile = 256 threads × 96 bytes (24 KB) kept in shared memory. Pass A: per-thread
+state reduction, block scan + state look-back. Pass B: rescan, produce flags
+in registers, tokens written in place over the consumed bytes; block scan of
+counts + index look-back. Pass C: warp-cooperative coalesced emission (owner
+lane by binary search over lane counts, element by k-th set bit). DFA tables
+are still copied from global into shared memory at kernel start.
+
+A100 (μs):
+
+| | transpose | vecPipe | Big S1 (load) | Big S2 (no look-backs) | Big S3 (full) |
+|---|---|---|---|---|---|
+| dense | 3324 | 3074 | 377 | 3126 | 3183 |
+| moderate | 2995 | 2436 | 378 | 1171 | 1258 |
+| sparse | 2823 | 2319 | 378 | 1071 | 1132 |
+
+`lexerBig` halves moderate/sparse vs `lexerVecPipe`; look-backs now cost only
+60–90 μs. Dense was no better.
+
+**Performance issue: `__fns` in the emission.** ncu (dense, S2): 1418M warp
+instructions (~87 per input byte), issue slots 78.5% busy, almost no stalls —
+instruction-bound. `__fns` (k-th set bit) was a subroutine call (`CALL` in
+SASS) costing ~676M warp instructions (45% of the kernel), once per output
+token — hence dense (150M tokens) was slow and sparse was not. Replaced by
+`select_bit`: word chosen with two `popc`, then a 5-step branchless `popc`
+binary search (~25 instructions, no call; checked against a naive select on
+~32M (mask, k) pairs). A100 numbers pending.
