@@ -515,6 +515,33 @@ Why they failed:
 IPT=24 at 6 blocks/SM is the sweet spot. V3's lookback behaves like L3's
 (~3 windows per tile, depth ~68, re-polls 1.13).
 
+### 4-chain reduce and deferred lookback (on top of `p1_vec_pipe`)
+
+| Variant | Time | vs pipe (1491 μs) |
+|---|---|---|
+| 4-chain reduce (per-thread aggregate from 4 interleaved chains, depth 9 instead of 24) | 1482 μs | −9 μs (within run-to-run spread) |
+| deferred lookback + fix-up, no pre-poll sleeps | 1791 μs | +300 μs |
+| deferred lookback + fix-up, with pre-poll sleeps | 1584 μs | +93 μs |
+
+- **4-chain reduce:** publishing PARTIAL earlier did not reduce waiting —
+  INVALID first polls stayed ~30% and re-polls rose (1.61 → 1.80). Too small
+  to keep the extra code.
+- **Deferred lookback** (`p1_vec_defer`): each round a block first finished
+  its previous tile (lookback, INCLUSIVE, out = compose(P, local) from a
+  shared-memory pending buffer, store), then scanned the current tile
+  locally. The assumption was that the previous tile's predecessors would
+  have published a round earlier. That held locally (0.9% INVALID first
+  polls on the GTX 1660 Ti) but not on the A100: 28.9% INVALID — with 648
+  resident blocks, neighbouring blocks drift out of phase, so the owner of
+  tile p−1 is often still in its previous round. Without pre-poll sleeps the
+  walk re-polled 2.04× per tile; the fix-up also adds a compose lookup per
+  element and a barrier.
+
+A bug found while testing `p1_vec_defer` (not in any measured code): the
+loop condition treated `tile_idx - gridDim.x` as a pending tile even past
+`num_tiles`, walking out of bounds (illegal memory access). Fixed before
+measuring by also requiring the pending tile to be `< num_tiles`.
+
 ### BS=32 (warp-scan, no intra-block barriers)
 Eliminates `__syncthreads()` inside `BlockScan` by using a single warp per
 block. Result: 3.7× slower. Reason: killing occupancy (1 block/SM vs 5–6)
@@ -589,21 +616,11 @@ Levers exhausted:
 - Static shmem for tables and `__launch_bounds__(256,6)` gave earlier gains.
 - Static `blockIdx.x` assignment and tile-0 fast path have no measurable effect.
 
-Open directions — the remaining gap is the lookback (~244 μs). Being
-measured, both on top of `p1_vec_pipe`:
-
-1. **4-chain reduce** (`p1_vec_pipe<…, REDUCE_CHAINS = 4>`): the per-thread
-   aggregate comes from 4 interleaved compose chains (dependency depth 9
-   instead of 24), so a tile's block aggregate — and its PARTIAL — is ready
-   sooner and predecessors are more often published at the first poll.
-2. **Deferred lookback and fix-up** (`p1_vec_defer`): each round a block
-   first finishes its *previous* tile (lookback, publish INCLUSIVE,
-   out = compose(P, local) from shared memory, store), then scans the current
-   tile locally and keeps it pending. The previous tile's predecessors
-   published a round earlier, so the lookback rarely meets INVALID tiles
-   (local test: 0.9% INVALID first polls vs 16–22%, 0.11 re-polls per tile)
-   and can skip the pre-poll sleeps. Costs one extra compose lookup per
-   element for the fix-up.
+Open directions — the remaining gap is the lookback (~240 μs). A 4-chain
+reduce and a one-round deferred lookback on top of `p1_vec_pipe` did not help
+(see "What We Tried"). Being measured: a dedicated lookback warp
+(`p1_vec_lbwarp`) that runs each tile's lookback asynchronously while the
+block's 8 compute warps continue with the next tile.
 
 Two-kernel reduce-then-scan is no longer an option: its traffic floor
 (~1574 μs) is above the current best.
