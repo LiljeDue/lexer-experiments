@@ -631,6 +631,22 @@ Two differences explain the larger gap here:
 | `p1_vec_pipe`, compose (1057 GB/s) | 68% | 78% |
 | `p1_vec_pipe`, integer add (1164 GB/s) | 75% | 86% |
 
+### Larger tiles for V3: 512 threads per block
+
+Motivated by the tile-rate comparison with the paper: V1–V3 at 512 threads
+per block (12,288-item tiles, 3 blocks/SM = same 48 warps, half the tiles).
+
+| | V2 | V3 | lookback cost | windows | depth (tiles) | re-polls |
+|---|---|---|---|---|---|---|
+| 256 threads (6/SM) | 1246 μs | 1529 μs | 283 μs | 2.93 | 68 | 1.13 |
+| **512 threads (3/SM)** | 1242 μs | **1491 μs** | **249 μs** | **1.87** | **35** | 1.06 |
+
+The block scan stays free at 512 threads (V2 unchanged). The look-back lag in
+*time* stays about the same, so with twice the items per tile the depth in
+tiles halves and most look-backs walk 2 windows instead of 3. V3 at 512
+threads (1055 GB/s, 78% of memcpy, 91% of the integer-add ceiling) matches
+the persistent `cp.async` kernel at 256 threads by a different mechanism.
+
 ### Dedicated lookback warp (`p1_vec_lbwarp`)
 
 Persistent, `cp.async` prefetch, 288 threads = 8 compute warps + 1 lookback
@@ -764,9 +780,10 @@ a faster per-thread reduce (no effect), a one-round deferred lookback
 warp (later INCLUSIVE publication, lower occupancy); first-poll sleep
 tuning has no effect. An integer-add operator shows ~133 μs of the ~240 μs
 is the compose chain inside the lookback's window reductions; a pipelined
-two-window lookback made it worse (stale speculative loads). Being measured:
-the V ladder at 512 threads per block (half the tile rate; see "Comparison
-with the decoupled look-back paper"). `p1_vec_pipe` has also been ported into the
+two-window lookback made it worse (stale speculative loads). Larger tiles
+help: V3 at 512 threads per block reaches 1491 μs (see "Larger tiles for
+V3"). Being measured: the persistent `cp.async` kernel at 512 threads
+(buffers in dynamic shared memory) and V3 at 768 threads. `p1_vec_pipe` has also been ported into the
 single-pass lexer (`lexerVecPipe` in `cuda_lexer.cu`).
 
 Two-kernel reduce-then-scan is no longer an option: its traffic floor
