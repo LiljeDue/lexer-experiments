@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <algorithm>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include "common/sps.cu.h"
@@ -959,6 +960,224 @@ void lexerTranspose(
 }
 
 
+// ---------------------------------------------------------------------------
+// cp.async helpers (sm_80+): 16-byte global -> shared copies that bypass
+// registers and L1. Older architectures fall back to a synchronous copy.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
+#if __CUDA_ARCH__ >= 800
+    uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(s), "l"(gmem) : "memory");
+#else
+    *reinterpret_cast<uint4*>(smem) = *reinterpret_cast<const uint4*>(gmem);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#endif
+}
+
+// Waits until at most N of this thread's committed groups are still pending.
+template<int N>
+__device__ __forceinline__ void cp_async_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Single-pass lexer with the P1 optimisations from p1_bench.cu (p1_vec_pipe):
+//  - persistent grid (at most the co-resident blocks; the lookbacks spin on
+//    predecessor tiles), each block prefetching its next tile with cp.async
+//    into a second shmem buffer while it works on the current one;
+//  - warp-local vectorized load: each warp owns WARP * ITEMS_PER_THREAD
+//    consecutive bytes, lanes read their own ITEMS_PER_THREAD bytes back with
+//    LDS.64 (bank-conflict-free at ITEMS_PER_THREAD = 24);
+//  - relaxed tile-state publication (no __threadfence) for both lookbacks;
+//  - produce detection from registers: the next position's state is the
+//    thread's own next item, the next lane's first item (shuffle) or the next
+//    warp's first item (shmem), instead of a flat shmem copy of all states;
+//  - index scan over per-thread produce counts (one item per thread).
+// Output staging for coalesced index/token writes reuses the consumed input
+// buffer (tokens) plus a u16 buffer (positions within the tile).
+// ---------------------------------------------------------------------------
+// Compose functor over the block's shared-memory table (one pointer, instead of
+// the three-pointer LexerCtxShmem, to keep register pressure down).
+struct ShmemCompose {
+    const state_t* table;
+    __device__ __forceinline__ state_t operator()(const state_t& a, const state_t& b) const {
+        return table[get_index(b) * NUM_STATES + get_index(a)];
+    }
+};
+
+template<typename I, I BLOCK_SIZE, I ITEMS_PER_THREAD>
+__global__ LB_P1
+void lexerVecPipe(
+    LexerCtxShmem ctx,
+    const uint8_t* __restrict__ d_in,
+    uint32_t* d_index_out,
+    token_t* d_token_out,
+    ScanTileState<state_t> state_states,
+    ScanTileState<I> index_states,
+    I size,
+    I num_tiles,
+    volatile I* new_size,
+    volatile bool* is_valid)
+{
+    static_assert(ITEMS_PER_THREAD % 8 == 0, "ITEMS_PER_THREAD must be a multiple of 8");
+    static_assert(ITEMS_PER_THREAD <= 32, "produce flags are kept in a 32-bit mask");
+    constexpr I WARPS      = BLOCK_SIZE / WARP;
+    constexpr I VECS       = ITEMS_PER_THREAD / 8;
+    constexpr I WARP_ITEMS = WARP * ITEMS_PER_THREAD;
+    constexpr I TILE       = BLOCK_SIZE * ITEMS_PER_THREAD;
+    constexpr I CHUNKS     = WARP_ITEMS / 16;
+    static_assert(WARP_ITEMS % 16 == 0, "warp segment must be a multiple of 16 bytes");
+    static_assert(TILE <= 65536, "tile positions are staged as uint16_t");
+
+    using BlockScanState = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using BlockScanI     = cub::BlockScan<I, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOpState  = TilePrefixCallbackOp<state_t, ShmemCompose, true>;
+    using PrefixOpIdx    = TilePrefixCallbackOp<I, Add<I>, true>;
+
+    // Input bytes (double-buffered; warp w owns [w * WARP_ITEMS, ...)). After a
+    // tile's bytes are in registers its buffer stages that tile's tokens.
+    __shared__ __align__(16) uint8_t  inbuf[2][TILE];
+    __shared__ __align__(16) uint16_t lid_stage[TILE];
+    __shared__ typename BlockScanState::TempStorage state_scan;
+    __shared__ typename PrefixOpState::TempStorage  state_prefix;
+    __shared__ typename BlockScanI::TempStorage     idx_scan;
+    __shared__ typename PrefixOpIdx::TempStorage    idx_prefix;
+    __shared__ state_t warp_first[WARPS];
+    __shared__ state_t next_tile_first;
+    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    __shared__ __align__(8) state_t shmem_to_state[256];
+
+    for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES / 4; i += BLOCK_SIZE)
+        reinterpret_cast<volatile uint64_t*>(shmem_compose)[i] =
+            reinterpret_cast<uint64_t*>(ctx.d_compose_glb)[i];
+    for (uint32_t i = threadIdx.x; i < 256 / 4; i += BLOCK_SIZE)
+        reinterpret_cast<volatile uint64_t*>(shmem_to_state)[i] =
+            reinterpret_cast<uint64_t*>(ctx.d_to_state)[i];
+    const ShmemCompose compose{shmem_compose};
+    __syncthreads();
+
+    const I warp = threadIdx.x / WARP;
+    const I lane = threadIdx.x % WARP;
+
+    // Issues this warp's share of tile's input into inbuf[buf] (full tiles
+    // only; the partial last tile is read directly), then commits a group.
+    auto prefetch = [&](I tile, I buf) {
+        if (tile < num_tiles && tile * TILE + TILE <= size) {
+            const uint8_t* src = d_in + tile * TILE + warp * WARP_ITEMS;
+            uint8_t*       dst = inbuf[buf] + warp * WARP_ITEMS;
+            for (I c = lane; c < CHUNKS; c += WARP)
+                cp_async16(dst + 16 * c, src + 16 * c);
+        }
+        cp_async_commit();
+    };
+
+    I buf = 0;
+    prefetch(blockIdx.x, buf);
+    for (I tile = blockIdx.x; tile < num_tiles; tile += gridDim.x, buf ^= 1) {
+        prefetch(tile + gridDim.x, buf ^ 1);
+        cp_async_wait<1>();   // this tile's group has landed
+        __syncwarp();
+
+        const I glb_offs = tile * TILE;
+        const bool full  = glb_offs + TILE <= size;
+        if (threadIdx.x == 0) {
+            I boundary = glb_offs + TILE;
+            next_tile_first = boundary < size ? shmem_to_state[d_in[boundary]] : state_t(IDENTITY);
+        }
+
+        state_t st[ITEMS_PER_THREAD];
+        if (full) {
+            const uint2* in = reinterpret_cast<const uint2*>(inbuf[buf] + warp * WARP_ITEMS);
+            #pragma unroll
+            for (I k = 0; k < VECS; k++) {
+                uint2 w = in[lane * VECS + k];
+                #pragma unroll
+                for (I b = 0; b < 8; b++) {
+                    uint32_t word = b < 4 ? w.x : w.y;
+                    st[8 * k + b] = shmem_to_state[(word >> (8 * (b % 4))) & 0xffu];
+                }
+            }
+        } else {
+            #pragma unroll
+            for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+                I idx = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i;
+                st[i] = idx < size ? shmem_to_state[d_in[idx]] : state_t(IDENTITY);
+            }
+        }
+
+        // State scan (lookback 1).
+        PrefixOpState state_op(state_states, state_prefix, compose, (int)tile, state_t(IDENTITY));
+        BlockScanState(state_scan).InclusiveScan(st, st, compose, state_op);
+
+        // The state after each position: own next item, next lane's first
+        // item, next warp's first item, or (end of tile) the next tile's first
+        // byte composed onto this tile's last state.
+        if (lane == 0)
+            warp_first[warp] = st[0];
+        __syncthreads();   // warp_first / next_tile_first; this tile's input bytes consumed
+        state_t next = (state_t)__shfl_down_sync(0xffffffff, (uint32_t)st[0], 1);
+        if (lane == WARP - 1)
+            next = warp + 1 < WARPS ? warp_first[warp + 1] : compose(st[ITEMS_PER_THREAD - 1], next_tile_first);
+
+        // Produce flag and 4-bit token per position, in one pass so each
+        // state can die once used; only the flags, tokens and last state stay
+        // live through the index scan and its lookback.
+        const state_t last_state = st[ITEMS_PER_THREAD - 1];
+        // Valid items of this thread (the input ends inside the last one).
+        const I       tid_base   = glb_offs + threadIdx.x * ITEMS_PER_THREAD;
+        const I       valid      = tid_base < size ? size - tid_base : 0;
+        uint32_t prod_bits = 0;
+        uint32_t tok[VECS] = {};
+        #pragma unroll
+        for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+            state_t nxt = i + 1 < ITEMS_PER_THREAD ? st[i + 1] : next;
+            bool produce = i < valid && (i + 1 == valid || is_produce(nxt));
+            prod_bits |= uint32_t(produce) << i;
+            tok[i / 8] |= uint32_t(get_token(st[i])) << (4 * (i % 8));
+        }
+
+        // Index scan (lookback 2) over per-thread produce counts.
+        I thread_offs;
+        PrefixOpIdx idx_op(index_states, idx_prefix, Add<I>(), (int)tile, I(0));
+        BlockScanI(idx_scan).ExclusiveScan((I)__popc(prod_bits), thread_offs, Add<I>(), idx_op);
+        const I idx_pfx  = idx_op.GetExclusivePrefix();
+        const I prod_agg = idx_op.GetBlockAggregate();
+
+        // Stage (token, position) by output slot, then write coalesced.
+        uint8_t* tok_stage = inbuf[buf];
+        I slot = thread_offs - idx_pfx;
+        #pragma unroll
+        for (I i = 0; i < ITEMS_PER_THREAD; i++) {
+            if ((prod_bits >> i) & 1) {
+                tok_stage[slot] = (tok[i / 8] >> (4 * (i % 8))) & 0xfu;
+                lid_stage[slot] = (uint16_t)(threadIdx.x * ITEMS_PER_THREAD + i);
+                slot++;
+            }
+        }
+        __syncthreads();
+        for (I s = threadIdx.x; s < prod_agg; s += BLOCK_SIZE) {
+            d_index_out[idx_pfx + s] = glb_offs + lid_stage[s];
+            d_token_out[idx_pfx + s] = tok_stage[s];
+        }
+
+        if (tile == num_tiles - 1 && threadIdx.x == BLOCK_SIZE - 1) {
+            *new_size = idx_pfx + prod_agg;
+            *is_valid = is_accept(last_state);
+        }
+        // Staging buffers, scan / prefix temp storage and warp_first are
+        // reused next tile; inbuf[buf] is the target of the next prefetch.
+        __syncthreads();
+    }
+    cp_async_wait<0>();
+}
+
 template<typename T>
 __global__ void initScanTileStateKernel(ScanTileState<T> state, int num_tiles) {
     state.InitializeStatus(num_tiles);
@@ -1519,6 +1738,148 @@ void testLexerTranspose(uint8_t* input,
     ctx.Cleanup();
 }
 
+// Grid for the persistent lexerVecPipe: every block must be co-resident (its
+// lookbacks spin on predecessor tiles). Requests the maximum shared memory
+// carveout (~26 KB/block) and sizes the grid from the occupancy API.
+template<typename I, I BS, I IPT>
+static I lexerVecPipeGrid(I num_tiles, int* blocks_per_sm) {
+    auto kernel = lexerVecPipe<I, BS, IPT>;
+    gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                   (int)cudaSharedmemCarveoutMaxShared));
+    int bps = 0, sms = 0;
+    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, BS, 0));
+    gpuAssert(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    if (bps < 1) { fprintf(stderr, "lexerVecPipe does not fit on an SM\n"); exit(1); }
+    if (blocks_per_sm) *blocks_per_sm = bps;
+    return std::min(num_tiles, (I)(bps * sms));
+}
+
+template<uint32_t BS, uint32_t IPT>
+void testLexerVecPipe(uint8_t* input,
+                      size_t input_size,
+                      uint32_t* expected_indices,
+                      token_t* expected_tokens,
+                      size_t expected_size) {
+    using I = uint32_t;
+    const I size = input_size;
+    const I NLB  = (size + BS * IPT - 1) / (BS * IPT);
+    const size_t IN_ARRAY_BYTES  = (size_t)size * sizeof(uint8_t);
+    const size_t INDEX_OUT_BYTES = (size_t)size * sizeof(I);
+    const size_t TOKEN_OUT_BYTES = (size_t)size * sizeof(token_t);
+#ifdef PROFILE
+    const I WARMUP_RUNS = 1; const I RUNS = 1;
+#else
+    const I WARMUP_RUNS = 500; const I RUNS = 100;
+#endif
+    std::vector<token_t> h_token_out(size, 0);
+    std::vector<I>       h_index_out(size, 0);
+
+    I*       d_new_size;
+    bool*    d_is_valid;
+    uint8_t* d_in;
+    I*       d_index_out;
+    token_t* d_token_out;
+    ScanTileState<state_t> d_state_states;
+    ScanTileState<I>       d_index_states;
+
+    gpuAssert(cudaMalloc((void**)&d_new_size,  sizeof(I)));
+    gpuAssert(cudaMalloc((void**)&d_is_valid,  sizeof(bool)));
+    gpuAssert(cudaMalloc((void**)&d_state_states.d_tile_descriptors,
+        ScanTileState<state_t>::AllocationSize(NLB)));
+    gpuAssert(cudaMalloc((void**)&d_index_states.d_tile_descriptors,
+        ScanTileState<I>::AllocationSize(NLB)));
+    gpuAssert(cudaMalloc((void**)&d_in,        IN_ARRAY_BYTES));
+    gpuAssert(cudaMalloc((void**)&d_index_out, INDEX_OUT_BYTES));
+    gpuAssert(cudaMalloc((void**)&d_token_out, TOKEN_OUT_BYTES));
+    gpuAssert(cudaMemcpy(d_in, input, IN_ARRAY_BYTES, cudaMemcpyHostToDevice));
+
+    LexerCtxShmem ctx = LexerCtxShmem();
+    int bps = 0;
+    const I grid = lexerVecPipeGrid<I, BS, IPT>(NLB, &bps);
+    printf("[%d/SM] ", bps);
+    fflush(stdout);
+
+    auto reset = [&]() {
+        cudaMemset(d_is_valid, 0, sizeof(bool));
+        initScanTileState(d_state_states, (int)NLB);
+        initScanTileState(d_index_states, (int)NLB);
+    };
+    auto launch = [&]() {
+        lexerVecPipe<I, BS, IPT><<<grid, BS>>>(
+            ctx, d_in, d_index_out, d_token_out,
+            d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid);
+    };
+    reset();
+
+    float* temp_total = (float*) malloc(sizeof(float) * RUNS);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start); cudaEventCreate(&stop);
+
+    for (I i = 0; i < WARMUP_RUNS; ++i) {
+        launch();
+        cudaDeviceSynchronize(); reset();
+        gpuAssert(cudaPeekAtLastError());
+    }
+    for (I i = 0; i < RUNS; ++i) {
+        cudaEventRecord(start, 0);
+        launch();
+        gpuAssert(cudaDeviceSynchronize());
+        cudaEventRecord(stop, 0); cudaEventSynchronize(stop);
+        cudaEventElapsedTime(temp_total + i, start, stop);
+        reset(); gpuAssert(cudaPeekAtLastError());
+    }
+
+    // Correctness run.
+    reset();
+    launch();
+    cudaDeviceSynchronize(); gpuAssert(cudaPeekAtLastError());
+
+    I temp_size = 0;
+    bool is_valid = false;
+    gpuAssert(cudaMemcpy(h_index_out.data(), d_index_out, INDEX_OUT_BYTES, cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(h_token_out.data(), d_token_out, TOKEN_OUT_BYTES, cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
+    gpuAssert(cudaMemcpy(&is_valid,  d_is_valid, sizeof(bool), cudaMemcpyDeviceToHost));
+
+    bool test_passes = is_valid;
+    if (!test_passes)
+        std::cout << "Lexer Test Failed: The input given to the lexer does not result in an accepting state." << std::endl;
+    if (test_passes && temp_size != (I)expected_size) {
+        printf("Lexer Test Failed: Expected size=%zu but got size=%u\n", expected_size, temp_size);
+        test_passes = false;
+    }
+    if (test_passes) {
+        for (I i = 0; i < (I)expected_size; ++i) {
+            if (h_index_out[i] != expected_indices[i]) {
+                printf("Lexer Test Failed: index mismatch at i=%u: expected=%u got=%u\n",
+                       i, expected_indices[i], h_index_out[i]);
+                test_passes = false; break;
+            }
+            if (h_token_out[i] != expected_tokens[i]) {
+                printf("Lexer Test Failed: token mismatch at i=%u: expected=%u got=%u\n",
+                       i, (unsigned)expected_tokens[i], (unsigned)h_token_out[i]);
+                test_passes = false; break;
+            }
+        }
+    }
+
+    if (test_passes) {
+        const size_t TOTAL_BYTES = IN_ARRAY_BYTES
+            + (size_t)temp_size * (sizeof(I) + sizeof(token_t));
+        printf("\n");
+        printf("  %-36s ", "Total:");
+        compute_descriptors(temp_total, RUNS, TOTAL_BYTES);
+    }
+
+    free(temp_total);
+    gpuAssert(cudaFree(d_in)); gpuAssert(cudaFree(d_index_out));
+    gpuAssert(cudaFree(d_token_out));
+    gpuAssert(cudaFree(d_index_states.d_tile_descriptors));
+    gpuAssert(cudaFree(d_state_states.d_tile_descriptors));
+    gpuAssert(cudaFree(d_new_size)); gpuAssert(cudaFree(d_is_valid));
+    ctx.Cleanup();
+}
+
 
 #ifdef DEBUG
 #define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
@@ -1655,6 +2016,57 @@ bool runTest(LexerTest* test) {
 
     if (pass) printf("PASS [%s]\n", test->name);
 
+    // Same test for lexerVecPipe (single-pass, vectorized, persistent).
+    {
+        const I VP_IPT   = 24;
+        const I vp_tiles = (size + BLOCK_SIZE * VP_IPT - 1) / (BLOCK_SIZE * VP_IPT);
+        ScanTileState<state_t> vp_state_states;
+        ScanTileState<I>       vp_index_states;
+        gpuAssert(cudaMalloc((void**)&vp_state_states.d_tile_descriptors,
+            ScanTileState<state_t>::AllocationSize(vp_tiles)));
+        gpuAssert(cudaMalloc((void**)&vp_index_states.d_tile_descriptors,
+            ScanTileState<I>::AllocationSize(vp_tiles)));
+        initScanTileState(vp_state_states, (int)vp_tiles);
+        initScanTileState(vp_index_states, (int)vp_tiles);
+        gpuAssert(cudaMemset(d_is_valid, 0, sizeof(bool)));
+        gpuAssert(cudaMemset(d_new_size, 0xff, sizeof(I)));
+        gpuAssert(cudaMemset(d_index_out, 0xff, size * sizeof(I)));
+        gpuAssert(cudaMemset(d_token_out, 0xff, size * sizeof(token_t)));
+
+        LexerCtxShmem vp_ctx;
+        const I grid = lexerVecPipeGrid<I, BLOCK_SIZE, VP_IPT>(vp_tiles, nullptr);
+        lexerVecPipe<I, BLOCK_SIZE, VP_IPT><<<grid, BLOCK_SIZE>>>(
+            vp_ctx, d_in, d_index_out, d_token_out, vp_state_states, vp_index_states,
+            size, vp_tiles, d_new_size, d_is_valid);
+        gpuAssert(cudaDeviceSynchronize());
+        gpuAssert(cudaPeekAtLastError());
+
+        I    vp_size  = 0;
+        bool vp_valid = false;
+        gpuAssert(cudaMemcpy(&vp_size,  d_new_size, sizeof(I),    cudaMemcpyDeviceToHost));
+        gpuAssert(cudaMemcpy(&vp_valid, d_is_valid, sizeof(bool), cudaMemcpyDeviceToHost));
+        bool vp_pass = vp_valid && vp_size == (I) test->expected_size;
+        if (vp_pass) {
+            std::vector<I>       vp_indices(vp_size);
+            std::vector<token_t> vp_tokens(vp_size);
+            gpuAssert(cudaMemcpy(vp_indices.data(), d_index_out, vp_size * sizeof(I),       cudaMemcpyDeviceToHost));
+            gpuAssert(cudaMemcpy(vp_tokens.data(),  d_token_out, vp_size * sizeof(token_t), cudaMemcpyDeviceToHost));
+            for (I i = 0; i < vp_size && vp_pass; i++)
+                vp_pass = vp_indices[i] == test->expected_indices[i] &&
+                          vp_tokens[i]  == test->expected_tokens[i];
+        }
+        if (vp_pass)
+            printf("PASS [%s] (lexerVecPipe)\n", test->name);
+        else
+            fprintf(stderr, "FAIL [%s] (lexerVecPipe): valid=%d size=%u (expected %zu)\n",
+                    test->name, (int)vp_valid, vp_size, test->expected_size);
+        pass = pass && vp_pass;
+
+        vp_ctx.Cleanup();
+        gpuAssert(cudaFree(vp_state_states.d_tile_descriptors));
+        gpuAssert(cudaFree(vp_index_states.d_tile_descriptors));
+    }
+
     ctx.Cleanup();
     gpuAssert(cudaFree(d_in));
     gpuAssert(cudaFree(d_index_out));
@@ -1745,6 +2157,9 @@ int main(int32_t argc, char *argv[]) {
     testLexerAlpaccShmem<30>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "1Pass BS256/IPT20 (transpose):");
     testLexerTranspose<256, 20>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "1Pass vec + cp.async BS256/IPT24:");
+    fflush(stdout);
+    testLexerVecPipe<256, 24>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     free(input);
     free(expected_indices);
     free(expected_tokens);

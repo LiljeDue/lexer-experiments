@@ -72,6 +72,16 @@ __device__ __forceinline__ TxnWord load_relaxed(const TxnWord* ptr) {
     return *const_cast<const volatile TxnWord*>(ptr);
 }
 
+// Relaxed GPU-scope store without a fence. Status and value share one word,
+// so a reader needs no ordering beyond that word itself (measured +54 GB/s
+// over store_release for P1 in p1_bench.cu).
+__device__ __forceinline__ void store_relaxed_gpu(uint32_t* ptr, uint32_t val) {
+    asm volatile("st.relaxed.gpu.u32 [%0], %1;" :: "l"(ptr), "r"(val) : "memory");
+}
+__device__ __forceinline__ void store_relaxed_gpu(unsigned long long* ptr, unsigned long long val) {
+    asm volatile("st.relaxed.gpu.u64 [%0], %1;" :: "l"(ptr), "l"(val) : "memory");
+}
+
 // ---------------------------------------------------------------------------
 // ScanTileState<T>: per-tile state array with padding.
 // Allocated as (num_tiles + TILE_STATUS_PADDING) TxnWords.
@@ -113,6 +123,16 @@ struct ScanTileState {
                       TxnWordTraits<T>::pack(StatusWord(SCAN_TILE_INCLUSIVE), value));
     }
 
+    // Same, published with store_relaxed_gpu (no __threadfence).
+    __device__ __forceinline__ void SetPartialRelaxed(int tile_idx, T value) {
+        store_relaxed_gpu(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx,
+                          TxnWordTraits<T>::pack(StatusWord(SCAN_TILE_PARTIAL), value));
+    }
+    __device__ __forceinline__ void SetInclusiveRelaxed(int tile_idx, T value) {
+        store_relaxed_gpu(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx,
+                          TxnWordTraits<T>::pack(StatusWord(SCAN_TILE_INCLUSIVE), value));
+    }
+
     // Spin until tile is non-invalid, return status and value.
     // initial_delay_ns: sleep before first load (absorbs L2 write latency from predecessor).
     __device__ __forceinline__ void WaitForValid(int tile_idx, StatusWord& status, T& value,
@@ -142,8 +162,10 @@ struct ScanTileState {
 // accumulates these zero values until the while loop terminates when the warp
 // reaches no INCLUSIVE tiles at all (all OOB) — but the identity field is used
 // to seed an artificial INCLUSIVE at the OOB boundary instead.
+// RELAXED = true publishes PARTIAL/INCLUSIVE with store_relaxed_gpu instead of
+// store_release (default false keeps existing kernels unchanged).
 // ---------------------------------------------------------------------------
-template<typename T, typename ScanOpT>
+template<typename T, typename ScanOpT, bool RELAXED = false>
 struct TilePrefixCallbackOp {
     using StatusWord  = typename ScanTileState<T>::StatusWord;
     using WarpReduceT = cub::WarpReduce<T, WARP>;
@@ -209,7 +231,10 @@ struct TilePrefixCallbackOp {
     __device__ __forceinline__ T operator()(T block_aggregate) {
         if (threadIdx.x == 0) {
             temp_storage.block_aggregate = block_aggregate;
-            tile_state.SetPartial(tile_idx, block_aggregate);
+            if constexpr (RELAXED)
+                tile_state.SetPartialRelaxed(tile_idx, block_aggregate);
+            else
+                tile_state.SetPartial(tile_idx, block_aggregate);
         }
 
         int predecessor_idx = tile_idx - threadIdx.x - 1;
@@ -232,7 +257,10 @@ struct TilePrefixCallbackOp {
 
         if (threadIdx.x == 0) {
             inclusive_prefix = scan_op(ep, block_aggregate);
-            tile_state.SetInclusive(tile_idx, inclusive_prefix);
+            if constexpr (RELAXED)
+                tile_state.SetInclusiveRelaxed(tile_idx, inclusive_prefix);
+            else
+                tile_state.SetInclusive(tile_idx, inclusive_prefix);
             temp_storage.exclusive_prefix = ep;
             temp_storage.inclusive_prefix = inclusive_prefix;
         }
