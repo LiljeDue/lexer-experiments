@@ -851,8 +851,8 @@ __device__ __forceinline__ void cp_async_wait() {
 // compose table.
 // ---------------------------------------------------------------------------
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false,
-         bool ADD_OP = false, bool DYN_SMEM = false>
-__global__ LB_P1_BS(BLOCK_SIZE)
+         bool ADD_OP = false>
+__global__ LB_P1
 void p1_vec_pipe(
     state_t* __restrict__ d_compose_glb,
     state_t* __restrict__ d_to_state_glb,
@@ -875,21 +875,8 @@ void p1_vec_pipe(
     constexpr state_t ID = ADD_OP ? state_t(0) : IDENTITY;
 
     // Double-buffered per-warp input bytes, and a per-warp output buffer.
-    // With DYN_SMEM the buffers live in dynamic shared memory (4 * TILE bytes;
-    // they exceed the 48 KB static limit at BLOCK_SIZE = 512).
-    constexpr uint32_t WARPS     = BLOCK_SIZE / WARP;
-    constexpr uint32_t OUT_WORDS = WARP_ITEMS * sizeof(state_t) / 4;   // per warp
-    __shared__ __align__(16) uint8_t  inbuf_s[2][DYN_SMEM ? 1 : WARPS][DYN_SMEM ? 16 : WARP_ITEMS];
-    __shared__ __align__(16) uint32_t outbuf_s[DYN_SMEM ? 1 : WARPS][DYN_SMEM ? 4 : OUT_WORDS];
-    extern __shared__ __align__(16) uint8_t p1_dyn_smem[];
-    auto inbuf = [&](uint32_t b, uint32_t w) -> uint8_t* {
-        if constexpr (DYN_SMEM) return p1_dyn_smem + (b * WARPS + w) * WARP_ITEMS;
-        else                    return inbuf_s[b][w];
-    };
-    auto outbuf = [&](uint32_t w) -> uint32_t* {
-        if constexpr (DYN_SMEM) return reinterpret_cast<uint32_t*>(p1_dyn_smem + 2 * TILE) + w * OUT_WORDS;
-        else                    return outbuf_s[w];
-    };
+    __shared__ __align__(16) uint8_t  inbuf[2][BLOCK_SIZE / WARP][WARP_ITEMS];
+    __shared__ __align__(16) uint32_t outbuf[BLOCK_SIZE / WARP][WARP_ITEMS * sizeof(state_t) / 4];
     __shared__ typename BlockScanT::TempStorage scan_temp;
     __shared__ typename PrefixOp::TempStorage   prefix_temp;
     __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
@@ -907,7 +894,7 @@ void p1_vec_pipe(
     auto prefetch = [&](uint32_t tile, uint32_t buf) {
         if (tile < num_tiles && tile * TILE + TILE <= size) {
             const uint8_t* src = d_in + tile * TILE + warp * WARP_ITEMS;
-            uint8_t*       dst = inbuf(buf, warp);
+            uint8_t*       dst = inbuf[buf][warp];
             for (uint32_t c = lane; c < CHUNKS; c += WARP)
                 cp_async16(dst + 16 * c, src + 16 * c);
         }
@@ -926,7 +913,7 @@ void p1_vec_pipe(
 
         state_t st[ITEMS_PER_THREAD];
         if (full) {
-            const uint2* in = reinterpret_cast<const uint2*>(inbuf(buf, warp));
+            const uint2* in = reinterpret_cast<const uint2*>(inbuf[buf][warp]);
             #pragma unroll
             for (uint32_t k = 0; k < VECS; k++) {
                 uint2 w = in[lane * VECS + k];
@@ -958,7 +945,7 @@ void p1_vec_pipe(
         }
 
         if (full) {
-            uint4* ob = reinterpret_cast<uint4*>(outbuf(warp));
+            uint4* ob = reinterpret_cast<uint4*>(outbuf[warp]);
             #pragma unroll
             for (uint32_t k = 0; k < VECS; k++) {
                 const state_t* s = st + 8 * k;
@@ -1050,14 +1037,11 @@ static void reset(ScanTileState& ts, uint32_t nlb) {
 // ~14 KB exceeds the default 100 KB configuration) and returns the resulting
 // resident blocks per SM.
 template<typename KernelT>
-static int max_shared_blocks_per_sm(KernelT kernel, int threads = BLOCK_SIZE, size_t dyn_smem = 0) {
+static int max_shared_blocks_per_sm(KernelT kernel) {
     gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                    (int)cudaSharedmemCarveoutMaxShared));
-    if (dyn_smem > 0)   // opt in to more than 48 KB of dynamic shared memory
-        gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                       (int)dyn_smem));
     int blocks = 0;
-    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, threads, dyn_smem));
+    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, BLOCK_SIZE, 0));
     return blocks;
 }
 
@@ -1242,40 +1226,34 @@ int main(int argc, char** argv) {
     // Same ladder at 512 threads per block: 12,288-item tiles, half as many
     // tiles (and lookbacks) per second. The block scan is free in the V
     // kernels, so larger blocks no longer cost block-scan time.
-    constexpr uint32_t BS512 = 512, BS768 = 768;
-    auto tiles_bs = [&](uint32_t bs) { return (size + bs * VEC_IPT - 1) / (bs * VEC_IPT); };
-    const uint32_t vec512_tiles = tiles_bs(BS512);
-    const uint32_t vec768_tiles = tiles_bs(BS768);
-    auto run_vec_bs = [&](auto kernel, uint32_t bs, uint32_t step, const char* label) {
-        const uint32_t tiles = tiles_bs(bs);
+    constexpr uint32_t BS512 = 512;
+    const uint32_t vec512_tiles = (size + BS512 * VEC_IPT - 1) / (BS512 * VEC_IPT);
+    auto run_vec512 = [&](auto kernel, uint32_t step, const char* label) {
         int bps = 0;
-        gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, bs, 0));
+        gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, BS512, 0));
         char name[64];
         snprintf(name, sizeof(name), "%s [%d/SM]:", label, bps);
-        auto prep   = [&] { if (step == 3) reset(ts, tiles); };
+        auto prep   = [&] { if (step == 3) reset(ts, vec512_tiles); };
         auto launch = [&] {
-            kernel<<<tiles, bs>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
+            kernel<<<vec512_tiles, BS512>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
         };
         poison_out(); prep(); launch(); fetch_states();
         if (!check_states(input, size, h_states, step >= 2,
-                          step == 2 ? bs * VEC_IPT : 0, name)) exit(1);
+                          step == 2 ? BS512 * VEC_IPT : 0, name)) exit(1);
         bench(name, u16_bytes, prep, launch);
     };
-    run_vec_bs(p1_vec<BS512, VEC_IPT, 1>, BS512, 1, "V1 BS512");
-    run_vec_bs(p1_vec<BS512, VEC_IPT, 2>, BS512, 2, "V2 BS512");
-    run_vec_bs(p1_vec<BS512, VEC_IPT, 3>, BS512, 3, "V3 BS512");
-    run_vec_bs(p1_vec<BS768, VEC_IPT, 2>, BS768, 2, "V2 BS768");
-    run_vec_bs(p1_vec<BS768, VEC_IPT, 3>, BS768, 3, "V3 BS768");
+    run_vec512(p1_vec<BS512, VEC_IPT, 1>, 1, "V1 BS512");
+    run_vec512(p1_vec<BS512, VEC_IPT, 2>, 2, "V2 BS512");
+    run_vec512(p1_vec<BS512, VEC_IPT, 3>, 3, "V3 BS512");
 
     // Persistent grid: every block must be resident at once (the lookback
     // spins on predecessor tiles), so grid = resident blocks/SM x SMs.
     int num_sms = 0;
     gpuAssert(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0));
-    auto pipe_grid = [&](auto kernel, int& bps, int threads = BLOCK_SIZE, size_t dyn_smem = 0,
-                         uint32_t tiles = 0) {
-        bps = max_shared_blocks_per_sm(kernel, threads, dyn_smem);
+    auto pipe_grid = [&](auto kernel, int& bps) {
+        bps = max_shared_blocks_per_sm(kernel);   // ~25 KB shmem/block
         if (bps < 1) { fprintf(stderr, "p1_vec_pipe does not fit on an SM\n"); exit(1); }
-        return std::min(tiles ? tiles : vec_tiles, (uint32_t)(bps * num_sms));
+        return std::min(vec_tiles, (uint32_t)(bps * num_sms));
     };
     // p1_vec_pipe, and the same kernel with a 16-bit add operator instead of
     // compose (checked against a host running sum).
@@ -1296,23 +1274,6 @@ int main(int argc, char** argv) {
     };
     run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT>,                         "V3 persistent + cp.async", false);
     run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, true>,            "V3 pipe, integer add op", true);
-    {
-        // Persistent + cp.async at 512 threads per block: buffers in dynamic
-        // shared memory (4 * TILE bytes = 48 KB).
-        auto kernel = p1_vec_pipe<BS512, VEC_IPT, false, false, true>;
-        const size_t dyn = 4 * (size_t)BS512 * VEC_IPT;
-        int bps;
-        const uint32_t grid = pipe_grid(kernel, bps, BS512, dyn, vec512_tiles);
-        char name[64];
-        snprintf(name, sizeof(name), "V3 persistent + cp.async BS512 [%d/SM]:", bps);
-        auto prep   = [&] { reset(ts, vec512_tiles); };
-        auto launch = [&] {
-            kernel<<<grid, BS512, dyn>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, vec512_tiles);
-        };
-        poison_out(); prep(); launch(); fetch_states();
-        if (!check_states(input, size, h_states, true, 0, name)) exit(1);
-        bench(name, u16_bytes, prep, launch);
-    }
 
     // Lookback statistics from instrumented copies of L3 and the V3 kernels,
     // summed over STATS_LAUNCHES launches. Diagnostic only: the counter
@@ -1344,10 +1305,6 @@ int main(int argc, char** argv) {
         p1_vec<BS512, VEC_IPT, 3, true><<<vec512_tiles, BS512>>>(
             d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
     }, "V3 BS512");
-    run_stats(vec768_tiles, [&] {
-        p1_vec<BS768, VEC_IPT, 3, true><<<vec768_tiles, BS768>>>(
-            d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
-    }, "V3 BS768");
     auto run_pipe_stats = [&](auto kernel, const char* name, bool add) {
         int bps;
         const uint32_t grid = pipe_grid(kernel, bps);
@@ -1357,15 +1314,6 @@ int main(int argc, char** argv) {
     };
     run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true>,               "V3 persistent + cp.async", false);
     run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, true>,        "V3 pipe, integer add op", true);
-    {
-        auto kernel = p1_vec_pipe<BS512, VEC_IPT, true, false, true>;
-        const size_t dyn = 4 * (size_t)BS512 * VEC_IPT;
-        int bps;
-        const uint32_t grid = pipe_grid(kernel, bps, BS512, dyn, vec512_tiles);
-        run_stats(vec512_tiles, [&] {
-            kernel<<<grid, BS512, dyn>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, vec512_tiles);
-        }, "V3 persistent + cp.async BS512");
-    }
 
     free(h_states);
 
