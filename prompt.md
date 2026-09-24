@@ -553,6 +553,33 @@ hand. **Alternative:** dynamic tile tickets (`atomicAdd` for the next tile)
 would make the persistent kernels safe even if not all blocks are resident,
 at the cost of an atomic per tile and broadcasting the tile index.
 
+### Lookback cost with an integer-add operator; first-poll sleep sweep
+
+To separate the lookback *protocol* from the compose operator, `p1_vec_pipe`
+was also run with 16-bit integer addition (as in the decoupled look-back
+paper; output checked against a host running sum), and with the first-poll
+sleep base (200 ns + 50 × (tile % 8)) varied:
+
+| Variant | Time | lookback cost (vs V2 1247 μs) |
+|---|---|---|
+| `p1_vec_pipe`, compose, sleep 200+ | 1490 μs | 243 μs |
+| sleep 100+ / 400+ / 600+ / 900+ | 1491 / 1489 / 1490 / 1486 μs | no change |
+| **integer add** | **1357 μs (1159 GB/s)** | **110 μs** |
+
+- **Compose costs ~133 μs of the lookback.** Not in the block scan (V2 ≈ V1
+  showed that is free) but inside the lookback: each 32-tile window is
+  reduced with `TailSegmentedReduce` — 5 dependent shuffle + compose steps,
+  each compose a shared-memory table load — and tiles walk ~3 windows. The
+  add version re-polls *more* (1.83 vs 1.48 per tile) yet is faster, so the
+  cost is the dependent compose chain, not waiting.
+- **Sleep tuning is closed:** 100–900 ns bases make no difference. (The
+  100/400/600 variants even had near-identical lookback stats; `__nanosleep`
+  only guarantees a sleep in [0, 2t], so these settings may not really
+  differ.) Removing the sleep entirely did hurt earlier (+142 μs, L3).
+
+At 1159 GB/s (85% of memcpy) the add version is roughly what the decoupled
+look-back protocol achieves here; the gap to it is the compose chain.
+
 ### Dedicated lookback warp (`p1_vec_lbwarp`)
 
 Persistent, `cp.async` prefetch, 288 threads = 8 compute warps + 1 lookback
@@ -683,8 +710,14 @@ Status — the remaining gap is the lookback (~240 μs). Hiding it has failed
 in every form tried on top of `p1_vec_pipe`: more resident warps (spills),
 a faster per-thread reduce (no effect), a one-round deferred lookback
 (predecessors not published earlier on the A100) and a dedicated lookback
-warp (later INCLUSIVE publication, lower occupancy). `p1_vec_pipe` is
-treated as the final P1; next step is porting it into `cuda_lexer.cu`.
+warp (later INCLUSIVE publication, lower occupancy); first-poll sleep
+tuning has no effect. An integer-add operator shows ~133 μs of the ~240 μs
+is the compose chain inside the lookback's window reductions. Being
+measured: a pipelined lookback (`PIPELINED_LB`: two windows loaded per
+round trip, next pair prefetched while reducing, the two window reductions
+interleaved, and waiting only on INVALID lanes up to a window's first
+INCLUSIVE/OOB lane). `p1_vec_pipe` has also been ported into the
+single-pass lexer (`lexerVecPipe` in `cuda_lexer.cu`).
 
 Two-kernel reduce-then-scan is no longer an option: its traffic floor
 (~1574 μs) is above the current best.

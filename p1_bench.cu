@@ -148,6 +148,16 @@ struct ScanTileState {
                      : "memory");
     }
 
+    // One relaxed load of tile_idx's descriptor word (status | value << 16).
+    __device__ __forceinline__ uint32_t LoadDescriptor(int tile_idx) {
+        uint32_t w;
+        asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
+                     : "=r"(w)
+                     : "l"(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx)
+                     : "memory");
+        return w;
+    }
+
     // Sleeps initial_delay_ns, then polls until no lane in the warp sees
     // INVALID (350 ns between polls). first_status / retries report what the
     // first poll saw and how many times the warp re-polled (used only by
@@ -216,9 +226,14 @@ __device__ __forceinline__ void record_lookback_stats(
 }
 
 // Prefix callback used with CUB BlockScan (decoupled lookback).
-// DELAY_BASE: the first poll of a tile's lookback is preceded by a sleep of
-// DELAY_BASE + 50 * (tile % 8) ns.
-template<typename ScanOpT, bool STATS = false, uint32_t DELAY_BASE = 200>
+//
+// PIPELINED = false: one 32-tile window at a time (load, wait until no lane is
+// INVALID, TailSegmentedReduce, next window).
+// PIPELINED = true: two windows per step. Both windows' descriptors are loaded
+// together and the next pair is prefetched while the current pair is reduced;
+// the two window reductions run interleaved, so their compose chains overlap.
+// A window only waits for INVALID lanes up to its first INCLUSIVE/OOB lane.
+template<typename ScanOpT, bool STATS = false, bool PIPELINED = false>
 struct PrefixCallbackOp {
     using WarpReduceT = cub::WarpReduce<state_t, WARP>;
 
@@ -255,32 +270,122 @@ struct PrefixCallbackOp {
                    .TailSegmentedReduce(eff, tail_flag, flipped);
     }
 
+    // --- pipelined lookback helpers (warp 0: lane == threadIdx.x) ---------
+
+    // Descriptor word of tile idx; tiles before 0 read as OOB (word 0).
+    __device__ __forceinline__ uint32_t LoadWindowWord(int idx) {
+        return idx < 0 ? uint32_t(SCAN_TILE_OOB) : tile_state.LoadDescriptor(idx);
+    }
+
+    // Re-polls w (the descriptor of tile idx in each lane) until no lane up to
+    // and including the window's first INCLUSIVE/OOB lane is INVALID. Returns
+    // the ballot of INCLUSIVE/OOB lanes.
+    __device__ __forceinline__ uint32_t
+    MakeWindowValid(uint32_t& w, int idx, uint32_t& retries) {
+        while (true) {
+            const uint32_t st   = w & 0xffffu;
+            const uint32_t tail = __ballot_sync(0xffffffff, st == uint32_t(SCAN_TILE_INCLUSIVE) ||
+                                                            st == uint32_t(SCAN_TILE_OOB));
+            const uint32_t inv  = __ballot_sync(0xffffffff, st == uint32_t(SCAN_TILE_INVALID));
+            // lanes 0 .. first tail (all lanes if there is no tail)
+            const uint32_t upto = tail ? ((tail & (0u - tail)) << 1) - 1u : 0xffffffffu;
+            if ((inv & upto) == 0)
+                return tail;
+            retries++;
+            __nanosleep(350);
+            w = LoadWindowWord(idx);
+        }
+    }
+
+    // This lane's contribution: its value up to the first tail lane, identity
+    // after it and for OOB lanes.
+    __device__ __forceinline__ state_t WindowValue(uint32_t w, uint32_t tail) {
+        const uint32_t first = tail ? (uint32_t)__ffs(tail) - 1 : WARP;
+        const bool keep = threadIdx.x <= first && (w & 0xffffu) != uint32_t(SCAN_TILE_OOB);
+        return keep ? state_t(w >> 16) : identity;
+    }
+
+    // Lane 0 receives compose(v[31], ..., v[1], v[0]) of both windows (lane 0
+    // is the newest tile); the two reductions are interleaved.
+    __device__ __forceinline__ void ReduceTwoWindows(state_t& va, state_t& vb) {
+        #pragma unroll
+        for (uint32_t d = 1; d < WARP; d <<= 1) {
+            state_t oa = (state_t)__shfl_down_sync(0xffffffff, (uint32_t)va, d);
+            state_t ob = (state_t)__shfl_down_sync(0xffffffff, (uint32_t)vb, d);
+            if (threadIdx.x + d < WARP) {
+                va = scan_op(oa, va);
+                vb = scan_op(ob, vb);
+            }
+        }
+    }
+
     __device__ __forceinline__ state_t operator()(state_t block_aggregate) {
         if (threadIdx.x == 0) {
             temp_storage.block_aggregate = block_aggregate;
             tile_state.SetPartial(tile_idx, block_aggregate);
         }
         int      predecessor_idx = tile_idx - threadIdx.x - 1;
-        uint32_t predecessor_status;
         // Seed initial delay with tile_idx to spread out thundering-herd polling.
-        uint32_t initial_delay = DELAY_BASE + (uint32_t)(tile_idx % 8) * 50;
-        uint32_t first_status, later_status, retries = 0, windows = 1;
-        exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status, initial_delay,
-                                         first_status, retries);
-        while (__all_sync(0xffffffff,
-                          predecessor_status != uint32_t(SCAN_TILE_INCLUSIVE) &&
-                          predecessor_status != uint32_t(SCAN_TILE_OOB))) {
-            predecessor_idx -= WARP;
-            windows++;
-            state_t w = ProcessWindow(predecessor_idx, predecessor_status, 350,
-                                      later_status, retries);
-            exclusive_prefix = scan_op(w, exclusive_prefix);
+        uint32_t initial_delay = 200 + (uint32_t)(tile_idx % 8) * 50;
+        uint32_t first_status, retries = 0, windows = 1, depth = 0;
+        if constexpr (!PIPELINED) {
+            uint32_t predecessor_status, later_status;
+            exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status, initial_delay,
+                                             first_status, retries);
+            while (__all_sync(0xffffffff,
+                              predecessor_status != uint32_t(SCAN_TILE_INCLUSIVE) &&
+                              predecessor_status != uint32_t(SCAN_TILE_OOB))) {
+                predecessor_idx -= WARP;
+                windows++;
+                state_t w = ProcessWindow(predecessor_idx, predecessor_status, 350,
+                                          later_status, retries);
+                exclusive_prefix = scan_op(w, exclusive_prefix);
+            }
+            if constexpr (STATS) {
+                uint32_t done = __ballot_sync(0xffffffff,
+                                              predecessor_status == uint32_t(SCAN_TILE_INCLUSIVE) ||
+                                              predecessor_status == uint32_t(SCAN_TILE_OOB));
+                depth = (windows - 1) * WARP + (__ffs(done) - 1);
+            }
+        } else {
+            __nanosleep(initial_delay);
+            uint32_t wa = LoadWindowWord(predecessor_idx);
+            uint32_t wb = LoadWindowWord(predecessor_idx - WARP);
+            first_status = wa & 0xffffu;
+            windows = 0;
+            bool first = true;
+            while (true) {
+                const uint32_t ta = MakeWindowValid(wa, predecessor_idx, retries);
+                uint32_t tb = 0, na = 0, nb = 0;
+                if (ta == 0) {
+                    tb = MakeWindowValid(wb, predecessor_idx - WARP, retries);
+                    if (tb == 0) {   // prefetch the next pair while reducing this one
+                        na = LoadWindowWord(predecessor_idx - 2 * WARP);
+                        nb = LoadWindowWord(predecessor_idx - 3 * WARP);
+                    }
+                }
+                state_t va = WindowValue(wa, ta);
+                state_t vb = ta == 0 ? WindowValue(wb, tb) : identity;
+                ReduceTwoWindows(va, vb);
+                exclusive_prefix = first ? va : scan_op(va, exclusive_prefix);
+                first = false;
+                windows++;
+                if (ta != 0) {
+                    depth = (windows - 1) * WARP + (__ffs(ta) - 1);
+                    break;
+                }
+                exclusive_prefix = scan_op(vb, exclusive_prefix);
+                windows++;
+                if (tb != 0) {
+                    depth = (windows - 1) * WARP + (__ffs(tb) - 1);
+                    break;
+                }
+                predecessor_idx -= 2 * WARP;
+                wa = na;
+                wb = nb;
+            }
         }
         if constexpr (STATS) {
-            uint32_t done  = __ballot_sync(0xffffffff,
-                                           predecessor_status == uint32_t(SCAN_TILE_INCLUSIVE) ||
-                                           predecessor_status == uint32_t(SCAN_TILE_OOB));
-            uint32_t depth = (windows - 1) * WARP + (__ffs(done) - 1);
             if (threadIdx.x == 0)
                 record_lookback_stats(tile_idx, first_status, retries, windows, depth);
         }
@@ -847,10 +952,11 @@ __device__ __forceinline__ void cp_async_wait() {
 //
 // ADD_OP: scan with 16-bit addition instead of compose (identity 0; output is
 // the running sum of to_state values), to measure the lookback without the
-// compose table. DELAY_BASE: see PrefixCallbackOp.
+// compose table. PIPELINED_LB: pipelined two-window lookback (see
+// PrefixCallbackOp).
 // ---------------------------------------------------------------------------
 template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false,
-         bool ADD_OP = false, uint32_t DELAY_BASE = 200>
+         bool ADD_OP = false, bool PIPELINED_LB = false>
 __global__ LB_P1
 void p1_vec_pipe(
     state_t* __restrict__ d_compose_glb,
@@ -870,7 +976,7 @@ void p1_vec_pipe(
 
     using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
     using ScanOpT    = std::conditional_t<ADD_OP, AddOp, ComposeOp>;
-    using PrefixOp   = PrefixCallbackOp<ScanOpT, STATS, DELAY_BASE>;
+    using PrefixOp   = PrefixCallbackOp<ScanOpT, STATS, PIPELINED_LB>;
     constexpr state_t ID = ADD_OP ? state_t(0) : IDENTITY;
 
     // Double-buffered per-warp input bytes, and a per-warp output buffer.
@@ -1231,8 +1337,8 @@ int main(int argc, char** argv) {
         if (bps < 1) { fprintf(stderr, "p1_vec_pipe does not fit on an SM\n"); exit(1); }
         return std::min(vec_tiles, (uint32_t)(bps * num_sms));
     };
-    // p1_vec_pipe variants: first-poll sleep base (DELAY_BASE, default 200 ns)
-    // and a 16-bit add operator instead of compose (checked against a host sum).
+    // p1_vec_pipe variants: pipelined two-window lookback (PIPELINED_LB), and a
+    // 16-bit add operator instead of compose (checked against a host sum).
     auto run_pipe = [&](auto kernel, const char* label, bool add) {
         int bps;
         const uint32_t grid = pipe_grid(kernel, bps);
@@ -1249,11 +1355,9 @@ int main(int argc, char** argv) {
         bench(name, u16_bytes, prep, launch);
     };
     run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT>,                         "V3 persistent + cp.async", false);
-    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, false, 100>,      "V3 pipe, first sleep 100+", false);
-    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, false, 400>,      "V3 pipe, first sleep 400+", false);
-    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, false, 600>,      "V3 pipe, first sleep 600+", false);
-    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, false, 900>,      "V3 pipe, first sleep 900+", false);
     run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, true>,            "V3 pipe, integer add op", true);
+    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, false, true>,     "V3 pipe, pipelined lookback", false);
+    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, true, true>,      "V3 pipe, pipelined lb, add op", true);
 
     // Lookback statistics from instrumented copies of L3 and the V3 kernels,
     // summed over STATS_LAUNCHES launches. Diagnostic only: the counter
@@ -1289,11 +1393,9 @@ int main(int argc, char** argv) {
         }, name, add);
     };
     run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true>,               "V3 persistent + cp.async", false);
-    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, false, 100>, "V3 pipe, first sleep 100+", false);
-    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, false, 400>, "V3 pipe, first sleep 400+", false);
-    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, false, 600>, "V3 pipe, first sleep 600+", false);
-    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, false, 900>, "V3 pipe, first sleep 900+", false);
     run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, true>,        "V3 pipe, integer add op", true);
+    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, false, true>, "V3 pipe, pipelined lookback", false);
+    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, true, true>,  "V3 pipe, pipelined lb, add op", true);
 
     free(h_states);
 
