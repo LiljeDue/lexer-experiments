@@ -104,10 +104,7 @@ static state_t h_compose[NUM_STATES * NUM_STATES] = {
 
 const uint8_t  LG_WARP          = 5;
 const uint8_t  WARP             = 1 << LG_WARP;
-// A lookback window covers WARP * LANE_ITEMS predecessor tiles and can reach
-// back to tile index -(WARP * MAX_LANE_ITEMS); the padding holds OOB entries.
-const uint32_t MAX_LANE_ITEMS      = 2;
-const uint32_t TILE_STATUS_PADDING = WARP * MAX_LANE_ITEMS;
+const uint32_t TILE_STATUS_PADDING = WARP;
 
 enum ScanTileStatus : uint32_t {
     SCAN_TILE_OOB       = 0,
@@ -126,7 +123,6 @@ struct ScanTileState {
         return (num_tiles + TILE_STATUS_PADDING) * sizeof(uint32_t);
     }
 
-    // Requires blockDim.x >= TILE_STATUS_PADDING.
     __device__ void InitializeStatus(int num_tiles) {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx < num_tiles)
@@ -151,46 +147,33 @@ struct ScanTileState {
                      : "memory");
     }
 
-    __device__ __forceinline__ uint32_t LoadDescriptor(int tile_idx) {
+    // Sleeps initial_delay_ns, then polls until no lane in the warp sees
+    // INVALID (350 ns between polls). first_status / retries report what the
+    // first poll saw and how many times the warp re-polled (used only by
+    // instrumented variants).
+    __device__ __forceinline__ void WaitForValid(int tile_idx,
+                                                  uint32_t& status,
+                                                  state_t& value,
+                                                  uint32_t initial_delay_ns,
+                                                  uint32_t& first_status,
+                                                  uint32_t& retries) {
+        __nanosleep(initial_delay_ns);
         uint32_t w;
         asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
                      : "=r"(w)
                      : "l"(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx)
                      : "memory");
-        return w;
-    }
-
-    // Polls descriptors tile_idx, tile_idx-1, ..., tile_idx-(LANE_ITEMS-1)
-    // until no lane in the warp sees INVALID. Sleeps initial_delay_ns before
-    // the first poll if SLEEP_FIRST, and 350 ns between polls.
-    // first_status / retries report what the first poll of tile_idx saw and
-    // how many times the warp re-polled (used only by instrumented variants).
-    template<uint32_t LANE_ITEMS, bool SLEEP_FIRST>
-    __device__ __forceinline__ void WaitForValid(int tile_idx,
-                                                  uint32_t (&w)[LANE_ITEMS],
-                                                  uint32_t initial_delay_ns,
-                                                  uint32_t& first_status,
-                                                  uint32_t& retries) {
-        if (SLEEP_FIRST)
-            __nanosleep(initial_delay_ns);
-        auto any_invalid = [&] {
-            bool inv = false;
-            #pragma unroll
-            for (uint32_t k = 0; k < LANE_ITEMS; k++)
-                inv |= (w[k] & 0xffffu) == uint32_t(SCAN_TILE_INVALID);
-            return inv;
-        };
-        #pragma unroll
-        for (uint32_t k = 0; k < LANE_ITEMS; k++)
-            w[k] = LoadDescriptor(tile_idx - (int)k);
-        first_status = w[0] & 0xffffu;
-        while (__any_sync(0xffffffff, any_invalid())) {
+        first_status = w & 0xffffu;
+        while (__any_sync(0xffffffff, (w & 0xffffu) == uint32_t(SCAN_TILE_INVALID))) {
             retries++;
             __nanosleep(350);
-            #pragma unroll
-            for (uint32_t k = 0; k < LANE_ITEMS; k++)
-                w[k] = LoadDescriptor(tile_idx - (int)k);
+            asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
+                         : "=r"(w)
+                         : "l"(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx)
+                         : "memory");
         }
+        status = w & 0xffffu;
+        value  = state_t(w >> 16);
     }
 };
 
@@ -199,7 +182,7 @@ struct ScanTileState {
 // contention; the host sums the slots.
 //   FIRST_*:  status of tile-1 at the first poll (after the initial sleep)
 //   RETRY_*:  warp-level re-polls of a window with an INVALID entry, per tile
-//   WIN_*:    lookback windows walked per tile
+//   WIN_*:    32-tile lookback windows walked per tile
 //   DEPTH_*:  tiles walked back from tile-1 to the nearest INCLUSIVE (or OOB)
 //             tile; 0 = tile-1 was already INCLUSIVE
 enum LookbackStat : uint32_t {
@@ -232,15 +215,8 @@ __device__ __forceinline__ void record_lookback_stats(
 }
 
 // Prefix callback used with CUB BlockScan (decoupled lookback).
-//   LATER_WINDOW_SLEEP: sleep 350 ns before the first poll of every window
-//                       after the first (the first window always sleeps
-//                       200 + 50*(tile%8) ns).
-//   LANE_ITEMS:         predecessor tiles per lane; a window covers
-//                       WARP * LANE_ITEMS tiles.
-template<typename ScanOpT, bool LATER_WINDOW_SLEEP = true, uint32_t LANE_ITEMS = 1,
-         bool STATS = false>
+template<typename ScanOpT, bool STATS = false>
 struct PrefixCallbackOp {
-    static_assert(LANE_ITEMS >= 1 && LANE_ITEMS <= MAX_LANE_ITEMS, "LANE_ITEMS out of range");
     using WarpReduceT = cub::WarpReduce<state_t, WARP>;
 
     ScanTileState& tile_state;
@@ -262,38 +238,18 @@ struct PrefixCallbackOp {
         : tile_state(ts), scan_op(op), tile_idx(idx),
           identity(id), temp_storage(tmp) {}
 
-    // Lane covers tiles pred_idx (newest) down to pred_idx-(LANE_ITEMS-1).
-    // Returns the window's aggregate (valid in lane 0) up to and including
-    // the newest INCLUSIVE/OOB tile. tail: this lane holds such a tile;
-    // tail_k: its position within the lane.
-    template<bool SLEEP_FIRST>
     __device__ __forceinline__ state_t
-    ProcessWindow(int pred_idx, uint32_t delay_ns, int& tail, uint32_t& tail_k,
-                  uint32_t& first_status, uint32_t& retries) {
-        uint32_t w[LANE_ITEMS];
-        tile_state.WaitForValid<LANE_ITEMS, SLEEP_FIRST>(pred_idx, w, delay_ns, first_status, retries);
-
-        // Lane-local reduce, newest -> oldest, stopping at the first
-        // INCLUSIVE/OOB tile. Older tiles are applied before newer ones.
-        state_t lane_val = identity;
-        tail   = 0;
-        tail_k = LANE_ITEMS;
-        #pragma unroll
-        for (uint32_t k = 0; k < LANE_ITEMS; k++) {
-            uint32_t status = w[k] & 0xffffu;
-            int      is_oob = status == uint32_t(SCAN_TILE_OOB);
-            state_t  val    = is_oob ? identity : state_t(w[k] >> 16);
-            if (!tail) {
-                lane_val = (k == 0) ? val : scan_op(val, lane_val);
-                if (status == uint32_t(SCAN_TILE_INCLUSIVE) || is_oob) {
-                    tail   = 1;
-                    tail_k = k;
-                }
-            }
-        }
-        auto flipped = [&](state_t a, state_t b) { return scan_op(b, a); };
+    ProcessWindow(int predecessor_idx, uint32_t& predecessor_status,
+                  uint32_t delay_ns, uint32_t& first_status, uint32_t& retries) {
+        state_t value;
+        tile_state.WaitForValid(predecessor_idx, predecessor_status, value, delay_ns,
+                                first_status, retries);
+        int is_oob    = (predecessor_status == uint32_t(SCAN_TILE_OOB));
+        int tail_flag = (predecessor_status == uint32_t(SCAN_TILE_INCLUSIVE)) | is_oob;
+        state_t eff   = is_oob ? identity : value;
+        auto flipped  = [&](state_t a, state_t b) { return scan_op(b, a); };
         return WarpReduceT(temp_storage.warp_reduce)
-                   .TailSegmentedReduce(lane_val, tail, flipped);
+                   .TailSegmentedReduce(eff, tail_flag, flipped);
     }
 
     __device__ __forceinline__ state_t operator()(state_t block_aggregate) {
@@ -301,24 +257,27 @@ struct PrefixCallbackOp {
             temp_storage.block_aggregate = block_aggregate;
             tile_state.SetPartial(tile_idx, block_aggregate);
         }
-        int pred_idx = tile_idx - 1 - (int)(threadIdx.x * LANE_ITEMS);
+        int      predecessor_idx = tile_idx - threadIdx.x - 1;
+        uint32_t predecessor_status;
         // Seed initial delay with tile_idx to spread out thundering-herd polling.
         uint32_t initial_delay = 200 + (uint32_t)(tile_idx % 8) * 50;
-        uint32_t first_status, later_status, retries = 0, windows = 1, tail_k;
-        int      tail;
-        exclusive_prefix = ProcessWindow<true>(pred_idx, initial_delay, tail, tail_k,
-                                               first_status, retries);
-        while (__all_sync(0xffffffff, !tail)) {
-            pred_idx -= WARP * LANE_ITEMS;
+        uint32_t first_status, later_status, retries = 0, windows = 1;
+        exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status, initial_delay,
+                                         first_status, retries);
+        while (__all_sync(0xffffffff,
+                          predecessor_status != uint32_t(SCAN_TILE_INCLUSIVE) &&
+                          predecessor_status != uint32_t(SCAN_TILE_OOB))) {
+            predecessor_idx -= WARP;
             windows++;
-            state_t w = ProcessWindow<LATER_WINDOW_SLEEP>(pred_idx, 350, tail, tail_k,
-                                                          later_status, retries);
+            state_t w = ProcessWindow(predecessor_idx, predecessor_status, 350,
+                                      later_status, retries);
             exclusive_prefix = scan_op(w, exclusive_prefix);
         }
         if constexpr (STATS) {
-            uint32_t lane  = __ffs(__ballot_sync(0xffffffff, tail)) - 1;
-            uint32_t k     = __shfl_sync(0xffffffff, tail_k, lane);
-            uint32_t depth = (windows - 1) * WARP * LANE_ITEMS + lane * LANE_ITEMS + k;
+            uint32_t done  = __ballot_sync(0xffffffff,
+                                           predecessor_status == uint32_t(SCAN_TILE_INCLUSIVE) ||
+                                           predecessor_status == uint32_t(SCAN_TILE_OOB));
+            uint32_t depth = (windows - 1) * WARP + (__ffs(done) - 1);
             if (threadIdx.x == 0)
                 record_lookback_stats(tile_idx, first_status, retries, windows, depth);
         }
@@ -410,8 +369,7 @@ static void initScanTileState(ScanTileState& ts, int num_tiles) {
 #endif
 
 
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool LATER_WINDOW_SLEEP = true,
-         uint32_t LANE_ITEMS = 1, bool STATS = false>
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false>
 __global__ LB_P1
 void p1_transpose(
     state_t* __restrict__ d_compose_glb,
@@ -429,7 +387,7 @@ void p1_transpose(
                                         cub::BLOCK_STORE_WARP_TRANSPOSE>;
     using BlockScanT  = cub::BlockScan <state_t, BLOCK_SIZE,
                                         cub::BLOCK_SCAN_WARP_SCANS>;
-    using PrefixOp    = PrefixCallbackOp<ComposeOp, LATER_WINDOW_SLEEP, LANE_ITEMS, STATS>;
+    using PrefixOp    = PrefixCallbackOp<ComposeOp, STATS>;
 
     __shared__ union {
         typename BlockLoadT::TempStorage  load;
@@ -895,9 +853,7 @@ int main(int argc, char** argv) {
         bench("L2 + block scan (no lookback):", u16_bytes, no_prep, launch);
     }
 
-    // L3: + decoupled lookback = p1_transpose, plus lookback variants:
-    //   no later-window sleep: skip the 350 ns sleep before windows 2, 3, ...
-    //   64-tile window:        2 predecessor tiles per lane
+    // L3: + decoupled lookback = p1_transpose
     auto run_l3 = [&](auto kernel, const char* name) {
         auto prep   = [&] { reset(ts, nlb); };
         auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb); };
@@ -905,16 +861,13 @@ int main(int argc, char** argv) {
         if (!check_states(input, size, h_states, true, 0, name)) exit(1);
         bench(name, u16_bytes, prep, launch);
     };
-    run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true,  1>, "L3 + lookback (p1_transpose):");
-    run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, false, 1>, "L3 no later-window sleep:");
-    run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true,  2>, "L3 64-tile window:");
-    run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, false, 2>, "L3 64-tile window, no later sleep:");
+    run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD>, "L3 + lookback (p1_transpose):");
 
-    // Lookback statistics from instrumented copies of the L3 variants,
+    // Lookback statistics from an instrumented copy of L3,
     // summed over STATS_LAUNCHES launches. Diagnostic only: the counter
     // atomics perturb timing, so no times are reported.
     constexpr uint32_t STATS_LAUNCHES = 10;
-    printf("\nLookback stats (instrumented L3 variants, %u launches):\n", STATS_LAUNCHES);
+    printf("\nLookback stats (instrumented L3, %u launches):\n", STATS_LAUNCHES);
     auto run_stats = [&](auto kernel, const char* name) {
         auto launch = [&] {
             reset(ts, nlb);
@@ -929,10 +882,7 @@ int main(int argc, char** argv) {
         }
         print_lookback_stats(name);
     };
-    run_stats(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true,  1, true>, "L3");
-    run_stats(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, false, 1, true>, "L3 no later-window sleep");
-    run_stats(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true,  2, true>, "L3 64-tile window");
-    run_stats(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, false, 2, true>, "L3 64-tile window, no later sleep");
+    run_stats(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true>, "L3");
 
     free(h_states);
 

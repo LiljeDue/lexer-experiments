@@ -315,15 +315,26 @@ L1 is the practical u16 SoL (94% of the floor). The whole gap is the scan:
 
 ### Lookback statistics (instrumented `p1_transpose`, BS=256)
 
-- tile-1 at the first poll: INVALID 27.7%, PARTIAL 72.3%, INCLUSIVE 0.0%
-- re-polls per tile: 1.47
-- depth to the nearest INCLUSIVE tile: 63 tiles on average; 99.1% of tiles
-  walk back ≥ 32 tiles, i.e. need a second 32-tile window
+Two runs (the second with finer depth buckets and a window counter):
 
-Every tile walks two windows back-to-back (two dependent L2 round trips plus
-a 350 ns sleep before the second window). The band of tiles that are PARTIAL
-but not yet INCLUSIVE is ~63 tiles deep; a slower lookback makes the band
-deeper, which makes the next lookback slower.
+- tile-1 at the first poll: INVALID 25–28%, PARTIAL 72–75%, INCLUSIVE 0.0%
+- re-polls per tile: 1.30–1.47
+- depth to the nearest INCLUSIVE tile: 63–69 tiles on average; 89% of tiles
+  walk back ≥ 64 tiles
+- 32-tile windows walked per tile: 3.00 (89% walk 3 or more)
+
+The depth is a fixed **time lag**, not a fixed tile count. Dividing depth by
+the tile completion rate gives the time between a tile publishing PARTIAL and
+publishing INCLUSIVE — about the duration of one lookback:
+
+| Config | Tiles/μs | Depth | Lag |
+|---|---|---|---|
+| BS=256 | 49.6 | 69 | 1.40 μs |
+| BS=512 | 23.7 | 32 | 1.36 μs |
+| BS=256, 64-tile window | 39.4 | 68 | 1.73 μs |
+
+So changing how many tiles or windows the lookback walks does not shorten it.
+The cost is that 7 of 8 warps of every block sit idle for ~1.4 μs per tile.
 
 ## What We Tried and Why It Didn't Help
 
@@ -347,6 +358,20 @@ not latency. Column compose issues more shmem loads per element (2 × 8-byte
 column loads + an index→state load vs 2 compose loads), so it lost despite
 removing the dependent chain. (Only 5 distinct input columns exist for this
 DFA, so a register-resident variant is possible but DFA-specific.)
+
+### Skipping the sleep before later lookback windows
+Kept the tuned first-window sleep but dropped the 350 ns sleep before
+windows 2, 3, …. Result: 1878 μs vs 1877 μs — no effect. Why: that sleep
+overlaps time the warp would otherwise spend waiting for INVALID
+predecessors to publish.
+
+### 64-tile lookback window (2 predecessor tiles per lane)
+Each lane checked 2 tile descriptors so one window covers 64 tiles and the
+typical depth (~69) needs fewer round trips. Result: 2363 μs vs 1877 μs
+(+486 μs); 2426 μs combined with no later-window sleep. Windows per tile
+dropped from 3.00 to 1.83, but re-polls rose from 1.30 to 2.72. Why: the warp
+re-polls until *every* descriptor in its window is past INVALID; a window
+twice as wide more often contains a slow predecessor, so it waits longer.
 
 ### Larger blocks (BS=512 / BS=1024, IPT=22)
 Halves / quarters the number of tiles to cut the number of lookbacks.
@@ -419,8 +444,8 @@ Levers exhausted **within the current kernel design**:
 
 - IPT=22, BS=256 is the best tile configuration of those swept (IPT 16–32,
   BS 128/256/512/1024).
-- Removing lookback sleeps and column compose both made P1 slower (see
-  "What We Tried").
+- Lookback sleep changes, a 64-tile lookback window and column compose all
+  made P1 slower or had no effect (see "What We Tried").
 - `BLOCK_LOAD/STORE_WARP_TRANSPOSE` eliminates shmem store bank conflicts and
   reduces instruction count: +144 GB/s over the manual blocked layout.
 - `st.relaxed.gpu` tile state stores replace `__threadfence()`: +54 GB/s.
@@ -433,10 +458,9 @@ read-only ceiling). The dominant cost is ~47% of warp cycles stalled at CTA
 barriers, mostly waiting for the cross-tile lookback. This gap is **not shown
 to be irreducible**. Open directions:
 
-1. **Reduce exposed lookback latency** — the lookback stats show every tile
-   walking two 32-tile windows. Being measured: a 64-tile window (2
-   predecessor tiles per lane, one round trip) and skipping the sleep before
-   later windows. Beyond that: start the lookback earlier in the tile so it
-   overlaps the load and intra-block scan.
+1. **Hide the lookback instead of shortening it** — the lookback takes
+   ~1.4 μs per tile regardless of sleeps, window size or tile count (see
+   "Lookback statistics"); the cost is the block's other warps idling for
+   it. Shortening it (sleep changes, 64-tile window, larger blocks) failed.
 2. **Two-kernel reduce-then-scan** — traffic floor ~1574 μs, below the current
    1870 μs; not yet implemented or measured.
