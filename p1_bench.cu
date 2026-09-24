@@ -216,7 +216,9 @@ __device__ __forceinline__ void record_lookback_stats(
 }
 
 // Prefix callback used with CUB BlockScan (decoupled lookback).
-template<typename ScanOpT, bool STATS = false>
+// DELAY_BASE: the first poll of a tile's lookback is preceded by a sleep of
+// DELAY_BASE + 50 * (tile % 8) ns.
+template<typename ScanOpT, bool STATS = false, uint32_t DELAY_BASE = 200>
 struct PrefixCallbackOp {
     using WarpReduceT = cub::WarpReduce<state_t, WARP>;
 
@@ -261,7 +263,7 @@ struct PrefixCallbackOp {
         int      predecessor_idx = tile_idx - threadIdx.x - 1;
         uint32_t predecessor_status;
         // Seed initial delay with tile_idx to spread out thundering-herd polling.
-        uint32_t initial_delay = 200 + (uint32_t)(tile_idx % 8) * 50;
+        uint32_t initial_delay = DELAY_BASE + (uint32_t)(tile_idx % 8) * 50;
         uint32_t first_status, later_status, retries = 0, windows = 1;
         exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status, initial_delay,
                                          first_status, retries);
@@ -307,6 +309,15 @@ struct ComposeOp {
     __device__ __forceinline__ state_t
     operator()(state_t a, state_t b) const {
         return d_compose[(b & 15u) * NUM_STATES + (a & 15u)];
+    }
+};
+
+// 16-bit integer addition: a stand-in scan operator (as in the decoupled
+// lookback paper) to measure the lookback without the compose table lookups.
+struct AddOp {
+    __device__ __forceinline__ state_t
+    operator()(state_t a, state_t b) const {
+        return state_t(a + b);
     }
 };
 
@@ -833,8 +844,13 @@ __device__ __forceinline__ void cp_async_wait() {
 // The grid must not exceed the number of co-resident blocks: a tile's
 // lookback spins until its predecessors publish, which requires every block
 // that owns an earlier tile to be running.
+//
+// ADD_OP: scan with 16-bit addition instead of compose (identity 0; output is
+// the running sum of to_state values), to measure the lookback without the
+// compose table. DELAY_BASE: see PrefixCallbackOp.
 // ---------------------------------------------------------------------------
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false>
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false,
+         bool ADD_OP = false, uint32_t DELAY_BASE = 200>
 __global__ LB_P1
 void p1_vec_pipe(
     state_t* __restrict__ d_compose_glb,
@@ -853,7 +869,9 @@ void p1_vec_pipe(
     static_assert(WARP_ITEMS % 16 == 0, "warp segment must be a multiple of 16 bytes");
 
     using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
-    using PrefixOp   = PrefixCallbackOp<ComposeOp, STATS>;
+    using ScanOpT    = std::conditional_t<ADD_OP, AddOp, ComposeOp>;
+    using PrefixOp   = PrefixCallbackOp<ScanOpT, STATS, DELAY_BASE>;
+    constexpr state_t ID = ADD_OP ? state_t(0) : IDENTITY;
 
     // Double-buffered per-warp input bytes, and a per-warp output buffer.
     __shared__ __align__(16) uint8_t  inbuf[2][BLOCK_SIZE / WARP][WARP_ITEMS];
@@ -908,18 +926,20 @@ void p1_vec_pipe(
             #pragma unroll
             for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
                 uint32_t idx = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i;
-                st[i] = idx < size ? shmem_to_state[d_in[idx]] : IDENTITY;
+                st[i] = idx < size ? shmem_to_state[d_in[idx]] : ID;
             }
         }
 
-        ComposeOp compose_op{shmem_compose};
+        ScanOpT compose_op;
+        if constexpr (!ADD_OP)
+            compose_op = ComposeOp{shmem_compose};
         if (tile_idx == 0) {
             state_t block_aggregate;
             BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, block_aggregate);
             if (threadIdx.x == 0)
                 tile_state.SetInclusive(0, block_aggregate);
         } else {
-            PrefixOp prefix_op(tile_state, prefix_temp, compose_op, (int)tile_idx, IDENTITY);
+            PrefixOp prefix_op(tile_state, prefix_temp, compose_op, (int)tile_idx, ID);
             BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, prefix_op);
         }
 
@@ -950,6 +970,21 @@ void p1_vec_pipe(
         __syncthreads();
     }
     cp_async_wait<0>();
+}
+
+// Host reference for the ADD_OP variants: wrapping 16-bit inclusive sum of
+// to_state values.
+static bool check_add_scan(const uint8_t* input, uint32_t size, const state_t* out, const char* name) {
+    state_t acc = 0;
+    for (uint32_t i = 0; i < size; i++) {
+        acc = state_t(acc + h_to_state[input[i]]);
+        if (out[i] != acc) {
+            fprintf(stderr, "%s mismatch at %u: got %u, expected %u\n",
+                    name, i, (uint32_t)out[i], (uint32_t)acc);
+            return false;
+        }
+    }
+    return true;
 }
 
 // Host reference for ladder / P1 output. scan == false: plain byte->state map.
@@ -1196,30 +1231,41 @@ int main(int argc, char** argv) {
         if (bps < 1) { fprintf(stderr, "p1_vec_pipe does not fit on an SM\n"); exit(1); }
         return std::min(vec_tiles, (uint32_t)(bps * num_sms));
     };
-    {
-        auto kernel = p1_vec_pipe<BLOCK_SIZE, VEC_IPT>;
+    // p1_vec_pipe variants: first-poll sleep base (DELAY_BASE, default 200 ns)
+    // and a 16-bit add operator instead of compose (checked against a host sum).
+    auto run_pipe = [&](auto kernel, const char* label, bool add) {
         int bps;
         const uint32_t grid = pipe_grid(kernel, bps);
         char name[64];
-        snprintf(name, sizeof(name), "V3 persistent + cp.async [%d/SM]:", bps);
+        snprintf(name, sizeof(name), "%s [%d/SM]:", label, bps);
         auto prep   = [&] { reset(ts, vec_tiles); };
         auto launch = [&] {
             kernel<<<grid, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, vec_tiles);
         };
         poison_out(); prep(); launch(); fetch_states();
-        if (!check_states(input, size, h_states, true, 0, name)) exit(1);
+        bool ok = add ? check_add_scan(input, size, h_states, name)
+                      : check_states(input, size, h_states, true, 0, name);
+        if (!ok) exit(1);
         bench(name, u16_bytes, prep, launch);
-    }
+    };
+    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT>,                         "V3 persistent + cp.async", false);
+    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, false, 100>,      "V3 pipe, first sleep 100+", false);
+    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, false, 400>,      "V3 pipe, first sleep 400+", false);
+    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, false, 600>,      "V3 pipe, first sleep 600+", false);
+    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, false, 900>,      "V3 pipe, first sleep 900+", false);
+    run_pipe(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, true>,            "V3 pipe, integer add op", true);
 
     // Lookback statistics from instrumented copies of L3 and the V3 kernels,
     // summed over STATS_LAUNCHES launches. Diagnostic only: the counter
     // atomics perturb timing, so no times are reported.
     constexpr uint32_t STATS_LAUNCHES = 10;
     printf("\nLookback stats (instrumented, %u launches):\n", STATS_LAUNCHES);
-    auto run_stats = [&](uint32_t tiles, auto launch_kernel, const char* name) {
+    auto run_stats = [&](uint32_t tiles, auto launch_kernel, const char* name, bool add = false) {
         auto launch = [&] { reset(ts, tiles); launch_kernel(); };
         poison_out(); launch(); fetch_states();
-        if (!check_states(input, size, h_states, true, 0, name)) exit(1);
+        bool ok = add ? check_add_scan(input, size, h_states, name)
+                      : check_states(input, size, h_states, true, 0, name);
+        if (!ok) exit(1);
         reset_lookback_stats();
         for (uint32_t i = 0; i < STATS_LAUNCHES; i++) {
             launch();
@@ -1235,14 +1281,19 @@ int main(int argc, char** argv) {
         p1_vec<BLOCK_SIZE, VEC_IPT, 3, true><<<vec_tiles, BLOCK_SIZE>>>(
             d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
     }, "V3");
-    {
-        auto kernel = p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true>;
+    auto run_pipe_stats = [&](auto kernel, const char* name, bool add) {
         int bps;
         const uint32_t grid = pipe_grid(kernel, bps);
         run_stats(vec_tiles, [&] {
             kernel<<<grid, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, vec_tiles);
-        }, "V3 persistent + cp.async");
-    }
+        }, name, add);
+    };
+    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true>,               "V3 persistent + cp.async", false);
+    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, false, 100>, "V3 pipe, first sleep 100+", false);
+    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, false, 400>, "V3 pipe, first sleep 400+", false);
+    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, false, 600>, "V3 pipe, first sleep 600+", false);
+    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, false, 900>, "V3 pipe, first sleep 900+", false);
+    run_pipe_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, true>,        "V3 pipe, integer add op", true);
 
     free(h_states);
 
