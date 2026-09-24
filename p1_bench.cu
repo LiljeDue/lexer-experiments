@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cassert>
 #include <cmath>
+#include <type_traits>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <thrust/iterator/transform_iterator.h>
@@ -379,6 +380,118 @@ void p1_transpose(
 }
 
 // ---------------------------------------------------------------------------
+// Map-only baselines: speed of light for P1
+//
+// Byte → state lookup with no scan. Reads the same input as P1 and writes one
+// state per byte at OUT_BITS each: 16 = full state_t, 8 = state index as
+// uint8_t, 4 = two state indices packed per byte (element 2j in the low
+// nibble of byte j). The state index (bits 3:0) determines the full state_t,
+// so the 8- and 4-bit outputs lose no information.
+//
+// Each thread issues CHUNKS 16-byte loads (coalesced across the block) before
+// doing any work, to keep enough loads in flight.
+// ---------------------------------------------------------------------------
+
+__host__ __device__ __forceinline__ uint32_t map_out_bytes(uint32_t size, uint32_t out_bits) {
+    return (uint32_t)(((uint64_t)size * out_bits + 7) / 8);
+}
+
+template<uint32_t OUT_BITS, uint32_t BLOCK_SIZE, uint32_t CHUNKS>
+__global__ __launch_bounds__(BLOCK_SIZE)
+void map_only(
+    const state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    uint8_t* __restrict__ d_out,
+    uint32_t size)
+{
+    static_assert(OUT_BITS == 16 || OUT_BITS == 8 || OUT_BITS == 4, "OUT_BITS must be 16, 8 or 4");
+
+    __shared__ state_t shmem_to_state[256];
+    for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_SIZE)
+        shmem_to_state[i] = d_to_state_glb[i];
+    __syncthreads();
+
+    auto map = [&](uint32_t byte) -> uint32_t {
+        state_t s = shmem_to_state[byte];
+        return OUT_BITS == 16 ? s : (s & 15u);
+    };
+
+    const uint32_t nvec = size / 16;
+    const uint4* in_vec = reinterpret_cast<const uint4*>(d_in);
+    const uint32_t base = blockIdx.x * BLOCK_SIZE * CHUNKS + threadIdx.x;
+
+    uint4 v[CHUNKS];
+    #pragma unroll
+    for (uint32_t c = 0; c < CHUNKS; c++) {
+        uint32_t idx = base + c * BLOCK_SIZE;
+        if (idx < nvec) v[c] = in_vec[idx];
+    }
+
+    #pragma unroll
+    for (uint32_t c = 0; c < CHUNKS; c++) {
+        uint32_t idx = base + c * BLOCK_SIZE;
+        if (idx >= nvec) break;
+        const uint32_t w[4] = {v[c].x, v[c].y, v[c].z, v[c].w};
+        auto in_byte = [&](uint32_t k) { return (w[k / 4] >> (8 * (k % 4))) & 0xffu; };
+
+        if constexpr (OUT_BITS == 16) {
+            uint32_t o[8];
+            #pragma unroll
+            for (uint32_t j = 0; j < 8; j++)
+                o[j] = map(in_byte(2 * j)) | (map(in_byte(2 * j + 1)) << 16);
+            uint4* out_vec = reinterpret_cast<uint4*>(d_out);
+            out_vec[2 * idx]     = make_uint4(o[0], o[1], o[2], o[3]);
+            out_vec[2 * idx + 1] = make_uint4(o[4], o[5], o[6], o[7]);
+        } else if constexpr (OUT_BITS == 8) {
+            uint32_t o[4];
+            #pragma unroll
+            for (uint32_t j = 0; j < 4; j++)
+                o[j] = map(in_byte(4 * j))           | (map(in_byte(4 * j + 1)) << 8)
+                     | (map(in_byte(4 * j + 2)) << 16) | (map(in_byte(4 * j + 3)) << 24);
+            reinterpret_cast<uint4*>(d_out)[idx] = make_uint4(o[0], o[1], o[2], o[3]);
+        } else {
+            uint32_t o[2] = {0, 0};
+            #pragma unroll
+            for (uint32_t k = 0; k < 16; k++)
+                o[k / 8] |= map(in_byte(k)) << (4 * (k % 8));
+            reinterpret_cast<uint2*>(d_out)[idx] = make_uint2(o[0], o[1]);
+        }
+    }
+
+    // Tail (size % 16 bytes): one thread, scalar. Starts 16-aligned, so the
+    // nibble pairs never straddle the vector part.
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (uint32_t i = nvec * 16; i < size; i += (OUT_BITS == 4 ? 2 : 1)) {
+            if constexpr (OUT_BITS == 16)
+                reinterpret_cast<state_t*>(d_out)[i] = (state_t)map(d_in[i]);
+            else if constexpr (OUT_BITS == 8)
+                d_out[i] = (uint8_t)map(d_in[i]);
+            else
+                d_out[i / 2] = (uint8_t)(map(d_in[i]) | (i + 1 < size ? map(d_in[i + 1]) << 4 : 0));
+        }
+    }
+}
+
+// Host reference check for map_only output.
+static bool check_map_only(const uint8_t* input, uint32_t size,
+                           uint32_t out_bits, const uint8_t* out) {
+    for (uint32_t i = 0; i < size; i++) {
+        state_t s = h_to_state[input[i]];
+        uint32_t expect = out_bits == 16 ? s : (s & 15u);
+        uint32_t got;
+        if (out_bits == 16)     got = reinterpret_cast<const state_t*>(out)[i];
+        else if (out_bits == 8) got = out[i];
+        else                    got = (out[i / 2] >> (4 * (i % 2))) & 15u;
+        if (got != expect) {
+            fprintf(stderr, "map_only<%u> mismatch at %u: got %u, expected %u\n",
+                    out_bits, i, got, expect);
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Launch / bench helpers
 // ---------------------------------------------------------------------------
 
@@ -474,6 +587,56 @@ int main(int argc, char** argv) {
         }
         print_stats(ms, BENCH_RUNS, p1_bytes);
     }
+
+    // ------------------------------------------------------------------
+    // Speed-of-light references: map-only kernels and D2D memcpy.
+    // GB/s counts input bytes read + output bytes written.
+    // ------------------------------------------------------------------
+    auto bench_sol = [&](const char* name, size_t bytes, auto launch) {
+        printf("%-38s ", name);
+        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            launch();
+            gpuAssert(cudaDeviceSynchronize());
+        }
+        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            gpuAssert(cudaEventRecord(t0));
+            launch();
+            gpuAssert(cudaDeviceSynchronize());
+            gpuAssert(cudaEventRecord(t1));
+            gpuAssert(cudaEventSynchronize(t1));
+            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
+        }
+        print_stats(ms, BENCH_RUNS, bytes);
+    };
+
+    uint8_t* h_check = (uint8_t*)malloc((size_t)size * sizeof(state_t));
+    auto run_map = [&](auto out_bits_tag, const char* name) {
+        constexpr uint32_t OUT_BITS = decltype(out_bits_tag)::value;
+        constexpr uint32_t CHUNKS   = 4;
+        auto kernel      = map_only<OUT_BITS, BLOCK_SIZE, CHUNKS>;
+        uint32_t nvec    = size / 16;
+        uint32_t blocks  = max(1u, (nvec + BLOCK_SIZE * CHUNKS - 1) / (BLOCK_SIZE * CHUNKS));
+        uint32_t out_len = map_out_bytes(size, OUT_BITS);
+        uint8_t* d_out   = reinterpret_cast<uint8_t*>(d_states_out);
+
+        gpuAssert(cudaMemset(d_out, 0xff, out_len));
+        kernel<<<blocks, BLOCK_SIZE>>>(d_to_state_glb, d_in, d_out, size);
+        gpuAssert(cudaDeviceSynchronize());
+        gpuAssert(cudaMemcpy(h_check, d_out, out_len, cudaMemcpyDeviceToHost));
+        if (!check_map_only(input, size, OUT_BITS, h_check)) exit(1);
+
+        bench_sol(name, (size_t)size + out_len, [&] {
+            kernel<<<blocks, BLOCK_SIZE>>>(d_to_state_glb, d_in, d_out, size);
+        });
+    };
+    run_map(std::integral_constant<uint32_t, 16>{}, "SoL map-only (u16 out):");
+    run_map(std::integral_constant<uint32_t, 8>{},  "SoL map-only (u8 out):");
+    run_map(std::integral_constant<uint32_t, 4>{},  "SoL map-only (4-bit out):");
+    free(h_check);
+
+    bench_sol("SoL memcpy D2D (1 B in, 1 B out):", 2 * (size_t)size, [&] {
+        gpuAssert(cudaMemcpyAsync(d_states_out, d_in, size, cudaMemcpyDeviceToDevice));
+    });
 
     // Cleanup
     free(ms); free(input);
