@@ -662,6 +662,118 @@ void p1_ladder(
         BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
 }
 
+// ---------------------------------------------------------------------------
+// Register-packed P1: the in-thread scan loops hold two u16 states per
+// 32-bit register (pk[j] = st[2j] | st[2j+1] << 16), halving the registers
+// the states occupy during the scan so that 8 blocks/SM (<= 32 registers)
+// can fit without spilling. BlockScan scans only the per-thread aggregates
+// (one item per thread).
+//   LOOKBACK = false: every tile scans from IDENTITY (like p1_ladder STEP 2;
+//                     output is not valid P1).
+//   LOOKBACK = true:  full P1 with decoupled lookback.
+// ---------------------------------------------------------------------------
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool LOOKBACK, uint32_t MIN_BLOCKS = 6>
+__global__ LB_P1(MIN_BLOCKS)
+void p1_packed(
+    state_t* __restrict__ d_compose_glb,
+    state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_states_out,
+    ScanTileState tile_state,
+    uint32_t size)
+{
+    static_assert(ITEMS_PER_THREAD % 2 == 0, "ITEMS_PER_THREAD must be even");
+    constexpr uint32_t PAIRS = ITEMS_PER_THREAD / 2;
+
+    using TransformIter = thrust::transform_iterator<ByteToState, const uint8_t*>;
+    using BlockLoadT  = cub::BlockLoad <state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    using BlockStoreT = cub::BlockStore<state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_STORE_WARP_TRANSPOSE>;
+    using BlockScanT  = cub::BlockScan <state_t, BLOCK_SIZE,
+                                        cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp    = PrefixCallbackOp<ComposeOp>;
+
+    __shared__ union {
+        typename BlockLoadT::TempStorage  load;
+        typename BlockStoreT::TempStorage store;
+        struct {
+            typename PrefixOp::TempStorage  prefix;
+            typename BlockScanT::TempStorage scan;
+        } scan_storage;
+    } temp;
+
+    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    __shared__ __align__(8) state_t shmem_to_state[256];
+
+    loadTablesToShmem<BLOCK_SIZE>(
+        d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
+
+    uint32_t tile_idx = blockIdx.x;
+    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+    uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
+                                      (uint64_t)size - glb_offs);
+
+    ByteToState byte_to_state{shmem_to_state};
+    TransformIter d_in_states(d_in + glb_offs, byte_to_state);
+    uint32_t pk[PAIRS];
+    {
+        state_t st[ITEMS_PER_THREAD];
+        if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+            BlockLoadT(temp.load).Load(d_in_states, st);
+        else
+            BlockLoadT(temp.load).Load(d_in_states, st, valid, IDENTITY);
+        #pragma unroll
+        for (uint32_t j = 0; j < PAIRS; j++)
+            pk[j] = uint32_t(st[2 * j]) | (uint32_t(st[2 * j + 1]) << 16);
+    }
+    __syncthreads();
+
+    ComposeOp compose_op{shmem_compose};
+
+    // Thread reduce over the packed pairs. Out-of-range items are IDENTITY.
+    state_t agg = IDENTITY;
+    #pragma unroll
+    for (uint32_t j = 0; j < PAIRS; j++) {
+        agg = compose_op(agg, state_t(pk[j] & 0xffffu));
+        agg = compose_op(agg, state_t(pk[j] >> 16));
+    }
+
+    // Block-wide exclusive scan of the per-thread aggregates.
+    state_t prefix;
+    if (!LOOKBACK || tile_idx == 0) {
+        state_t block_aggregate;
+        BlockScanT(temp.scan_storage.scan).ExclusiveScan(
+            agg, prefix, IDENTITY, compose_op, block_aggregate);
+        if (LOOKBACK && threadIdx.x == 0)
+            tile_state.SetInclusive(0, block_aggregate);
+    } else {
+        PrefixOp prefix_op(tile_state, temp.scan_storage.prefix, compose_op, (int)tile_idx, IDENTITY);
+        BlockScanT(temp.scan_storage.scan).ExclusiveScan(agg, prefix, compose_op, prefix_op);
+    }
+
+    // Thread scan seeded with the exclusive prefix, results packed in place.
+    state_t acc = prefix;
+    #pragma unroll
+    for (uint32_t j = 0; j < PAIRS; j++) {
+        state_t lo = compose_op(acc, state_t(pk[j] & 0xffffu));
+        acc        = compose_op(lo,  state_t(pk[j] >> 16));
+        pk[j]      = uint32_t(lo) | (uint32_t(acc) << 16);
+    }
+    __syncthreads();
+
+    state_t st[ITEMS_PER_THREAD];
+    #pragma unroll
+    for (uint32_t j = 0; j < PAIRS; j++) {
+        st[2 * j]     = state_t(pk[j] & 0xffffu);
+        st[2 * j + 1] = state_t(pk[j] >> 16);
+    }
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st);
+    else
+        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
+}
+
 // Host reference for ladder / P1 output. scan == false: plain byte->state map.
 // scan == true: inclusive compose scan that restarts every tile_len elements
 // (tile_len == 0: one scan over the whole input, i.e. real P1 output).
@@ -707,13 +819,16 @@ static void reset(ScanTileState& ts, uint32_t nlb) {
     initScanTileState(ts, (int)nlb);
 }
 
-// Requests the maximum shared memory carveout for kernel (8 blocks/SM x
-// ~13 KB exceeds the default 100 KB configuration) and returns the resulting
-// resident blocks per SM.
+// Sets kernel's preferred shared memory carveout (percent of the maximum;
+// 8 blocks/SM x ~13 KB exceeds the default 100 KB configuration) and returns
+// the resulting resident blocks per SM. On A100, 100% = 164 KB shared
+// (~28 KB L1); CARVEOUT_132KB (81%) = 132 KB shared (~60 KB L1).
+constexpr int CARVEOUT_MAX   = (int)cudaSharedmemCarveoutMaxShared;
+constexpr int CARVEOUT_132KB = 81;
 template<typename KernelT>
-static int max_carveout_blocks_per_sm(KernelT kernel) {
+static int set_carveout_blocks_per_sm(KernelT kernel, int carveout_pct) {
     gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                   (int)cudaSharedmemCarveoutMaxShared));
+                                   carveout_pct));
     int blocks = 0;
     gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, BLOCK_SIZE, 0));
     return blocks;
@@ -869,7 +984,7 @@ int main(int argc, char** argv) {
     // L2 at <= 32 registers (__launch_bounds__(256, 8)): 8 blocks/SM
     {
         auto kernel = p1_ladder<BLOCK_SIZE, ITEMS_PER_THREAD, 2, 8>;
-        int  bps    = max_carveout_blocks_per_sm(kernel);
+        int  bps    = set_carveout_blocks_per_sm(kernel, CARVEOUT_MAX);
         auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, size); };
         char name[64];
         snprintf(name, sizeof(name), "L2 min 8 blocks/SM (got %d):", bps);
@@ -894,8 +1009,50 @@ int main(int argc, char** argv) {
     {
         auto kernel = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, false, 8>;
         snprintf(l3_8_name, sizeof(l3_8_name), "L3 min 8 blocks/SM (got %d):",
-                 max_carveout_blocks_per_sm(kernel));
+                 set_carveout_blocks_per_sm(kernel, CARVEOUT_MAX));
         run_l3(kernel, l3_8_name);
+    }
+
+    // 8 blocks/SM with a 132 KB carveout (more L1 for the spills), and the
+    // register-packed kernel (P2 = per-tile scan like L2, P3 = full P1).
+    printf("\n8 blocks/SM: carveout and register packing (u16 out):\n");
+    char name_buf[64];
+    auto with_bps = [&](const char* fmt, int bps) {
+        snprintf(name_buf, sizeof(name_buf), fmt, bps);
+        return (const char*)name_buf;
+    };
+    {
+        auto kernel = p1_ladder<BLOCK_SIZE, ITEMS_PER_THREAD, 2, 8>;
+        const char* name = with_bps("L2 8 blocks/SM, 132KB (got %d):",
+                                    set_carveout_blocks_per_sm(kernel, CARVEOUT_132KB));
+        auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, size); };
+        poison_out(); launch(); fetch_states();
+        if (!check_states(input, size, h_states, true, BLOCK_SIZE * ITEMS_PER_THREAD, name)) exit(1);
+        bench(name, u16_bytes, no_prep, launch);
+    }
+    {
+        auto kernel = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, false, 8>;
+        run_l3(kernel, with_bps("L3 8 blocks/SM, 132KB (got %d):",
+                                set_carveout_blocks_per_sm(kernel, CARVEOUT_132KB)));
+    }
+    auto run_packed = [&](auto kernel, bool lookback, const char* name) {
+        auto prep   = [&] { if (lookback) reset(ts, nlb); };
+        auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size); };
+        poison_out(); prep(); launch(); fetch_states();
+        if (!check_states(input, size, h_states, true, lookback ? 0 : BLOCK_SIZE * ITEMS_PER_THREAD, name)) exit(1);
+        bench(name, u16_bytes, prep, launch);
+    };
+    run_packed(p1_packed<BLOCK_SIZE, ITEMS_PER_THREAD, false, 6>, false, "P2 packed (6 blocks/SM):");
+    {
+        auto kernel = p1_packed<BLOCK_SIZE, ITEMS_PER_THREAD, false, 8>;
+        run_packed(kernel, false, with_bps("P2 packed, 8 blocks/SM, 132KB (got %d):",
+                                           set_carveout_blocks_per_sm(kernel, CARVEOUT_132KB)));
+    }
+    run_packed(p1_packed<BLOCK_SIZE, ITEMS_PER_THREAD, true, 6>, true, "P3 packed (6 blocks/SM):");
+    {
+        auto kernel = p1_packed<BLOCK_SIZE, ITEMS_PER_THREAD, true, 8>;
+        run_packed(kernel, true, with_bps("P3 packed, 8 blocks/SM, 132KB (got %d):",
+                                          set_carveout_blocks_per_sm(kernel, CARVEOUT_132KB)));
     }
 
     // Lookback statistics from an instrumented copy of L3,
@@ -920,7 +1077,7 @@ int main(int argc, char** argv) {
     run_stats(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true>, "L3");
     {
         auto kernel = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true, 8>;
-        max_carveout_blocks_per_sm(kernel);
+        set_carveout_blocks_per_sm(kernel, CARVEOUT_MAX);
         run_stats(kernel, "L3 min 8 blocks/SM");
     }
 
