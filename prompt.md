@@ -267,7 +267,100 @@ measured time, so it cannot be dismissed on bandwidth grounds. Whether it wins
 depends on how close each of its passes gets to the ceiling; it has not been
 implemented.
 
+## Speed-of-Light Investigation (A100)
+
+Goal: a P1 that runs at the speed of light (SoL) for its own traffic
+(1 B read + 2 B written per input byte). Timings are means over 100 runs; the
+95% CIs printed by `print_stats` are not valid (it uses sqrt(E[t²]) as the
+standard deviation), so run-to-run spread was judged from repeated runs
+(`p1_transpose`: 1852–1894 μs across five runs).
+
+### Speed-of-light references
+
+| Kernel | Traffic/byte | Time |
+|---|---|---|
+| memcpy D2D | 2 B | 773 μs (1356 GB/s) |
+| map-only, u8 out | 2 B | 779 μs |
+| map-only, 4-bit out | 1.5 B | 594 μs |
+| map-only, u16 out, coalesced (L0) | 3 B | 1257 μs |
+
+memcpy at 1356 GB/s is ~87% of a 40 GB A100's spec bandwidth. The u16 floor
+at that bandwidth is ~1159 μs. Smaller outputs only move the floor; they do
+not remove the scan overhead, so all work below stays at u16.
+
+### Cost ladder
+
+Each step adds one piece of `p1_transpose` (all u16 out, BS=256, IPT=22):
+
+| Step | Kernel | Time | Added |
+|---|---|---|---|
+| L0 | map-only, coalesced | 1257 μs | – |
+| L1 | + warp-transpose load/store | 1239 μs | 0 |
+| L2 | + block scan, no lookback | 1524 μs | +285 μs |
+| L3 | + decoupled lookback (`p1_transpose`) | 1877–1894 μs | +360 μs |
+
+L1 is the practical u16 SoL (94% of the floor). The whole gap is the scan:
+~45% block scan, ~55% lookback.
+
+### Profile of the ladder (ncu, SM clock locked at 765 MHz)
+
+- **Block scan (L1→L2):** +227M warp instructions (~14 thread instructions
+  and ~2.5 shmem loads per element), LSU 73% busy, L1/shmem pipe 84% — the
+  block scan is throughput-bound on shmem/LSU. The `compose` line shows
+  mostly short-scoreboard stalls, but removing that dependency (column
+  compose, below) made it slower.
+- **Lookback (L2→L3):** only +52M instructions but +564K cycles; 24.8% of all
+  stall samples sit on the barrier where 7 of 8 warps wait for warp 0's
+  lookback (`block_scan_warp_scans.cuh:429`).
+
+### Lookback statistics (instrumented `p1_transpose`, BS=256)
+
+- tile-1 at the first poll: INVALID 27.7%, PARTIAL 72.3%, INCLUSIVE 0.0%
+- re-polls per tile: 1.47
+- depth to the nearest INCLUSIVE tile: 63 tiles on average; 99.1% of tiles
+  walk back ≥ 32 tiles, i.e. need a second 32-tile window
+
+Every tile walks two windows back-to-back (two dependent L2 round trips plus
+a 350 ns sleep before the second window). The band of tiles that are PARTIAL
+but not yet INCLUSIVE is ~63 tiles deep; a slower lookback makes the band
+deeper, which makes the next lookback slower.
+
 ## What We Tried and Why It Didn't Help
+
+### Removing the lookback sleeps (sleep modes)
+Variants of `p1_transpose` that (1) skipped the initial
+200–550 ns sleep before the first poll, or (2) also shortened the between-poll
+sleep from 350 ns to 32 ns. Result: 2019–2025 μs for both vs 1877–1894 μs for
+the baseline in the same runs (+125–148 μs).
+Why: the initial sleep is a well-tuned wait, not overhead. Without it the
+first poll usually finds tile-1 not yet published and the retry lands later
+than the tuned delay would have. The poll interval made no difference. The
+sleep samples in the profile were time spent waiting for the predecessor.
+
+### Column compose (`p1_column`)
+Replaced the two in-thread compose chains with ALU-only lookups: for fixed
+x, compose(a, x) over the 12 states packs into a u64 "column", so
+acc = (col[x] >> 4*acc) & 15 and the shmem load address depends only on the
+input. Result: no-lookback 1760–1800 μs vs 1524 μs (+~270 μs); with lookback
+2052 μs vs 1877 μs. Why: the block scan is bound by shmem/LSU throughput,
+not latency. Column compose issues more shmem loads per element (2 × 8-byte
+column loads + an index→state load vs 2 compose loads), so it lost despite
+removing the dependent chain. (Only 5 distinct input columns exist for this
+DFA, so a register-resident variant is possible but DFA-specific.)
+
+### Larger blocks (BS=512 / BS=1024, IPT=22)
+Halves / quarters the number of tiles to cut the number of lookbacks.
+
+| BS | L3 | lookback (L3−L2) | block scan (L2−L1) |
+|---|---|---|---|
+| 256 | 1894 μs | 370 μs | 285 μs |
+| 512 | 1962 μs | 320 μs | 349 μs |
+| 1024 | 2827 μs | 308 μs | 794 μs |
+
+Why it failed: lookback cost barely depends on the tile count (halving the
+tiles cut it by 14%) — the cost is how long each lookback takes, not how many
+there are. Larger blocks make the block scan more expensive (more warps per
+barrier; BS=1024 also drops to 50% occupancy at 63 registers).
 
 ### BS=32 (warp-scan, no intra-block barriers)
 Eliminates `__syncthreads()` inside `BlockScan` by using a single warp per
@@ -324,7 +417,10 @@ removed from the code; their numbers are kept as a historical record.
 
 Levers exhausted **within the current kernel design**:
 
-- IPT=22, BS=256 is the best tile configuration of those swept (16–32).
+- IPT=22, BS=256 is the best tile configuration of those swept (IPT 16–32,
+  BS 128/256/512/1024).
+- Removing lookback sleeps and column compose both made P1 slower (see
+  "What We Tried").
 - `BLOCK_LOAD/STORE_WARP_TRANSPOSE` eliminates shmem store bank conflicts and
   reduces instruction count: +144 GB/s over the manual blocked layout.
 - `st.relaxed.gpu` tile state stores replace `__threadfence()`: +54 GB/s.
@@ -337,8 +433,10 @@ read-only ceiling). The dominant cost is ~47% of warp cycles stalled at CTA
 barriers, mostly waiting for the cross-tile lookback. This gap is **not shown
 to be irreducible**. Open directions:
 
-1. **Reduce exposed lookback latency** — e.g. start the lookback earlier in the
-   tile so it overlaps the load and intra-block scan, instead of waiting at a
-   barrier afterwards.
+1. **Reduce exposed lookback latency** — the lookback stats show every tile
+   walking two 32-tile windows. Being measured: a 64-tile window (2
+   predecessor tiles per lane, one round trip) and skipping the sleep before
+   later windows. Beyond that: start the lookback earlier in the tile so it
+   overlaps the load and intra-block scan.
 2. **Two-kernel reduce-then-scan** — traffic floor ~1574 μs, below the current
    1870 μs; not yet implemented or measured.
