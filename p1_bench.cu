@@ -363,13 +363,10 @@ static void initScanTileState(ScanTileState& ts, int num_tiles) {
 
 // minnctapersm=6 is valid only on sm_80+ (A100 has 65536 regs/SM;
 // 6*256*40 = 61440 <= 65536). sm_75 has only 32768 and would warn.
-// LB_P1_MIN(8) caps registers at 32 (8*256*32 = 65536) for 8 blocks/SM.
 #if __CUDA_ARCH__ >= 800
 #define LB_P1 __launch_bounds__(256, 6)
-#define LB_P1_MIN(MIN_BLOCKS) __launch_bounds__(256, MIN_BLOCKS)
 #else
 #define LB_P1 __launch_bounds__(256)
-#define LB_P1_MIN(MIN_BLOCKS) __launch_bounds__(256)
 #endif
 
 
@@ -686,15 +683,13 @@ void p1_ladder(
 //   STEP 1: load/store only (like p1_ladder STEP 1).
 //   STEP 2: + BlockScan, no lookback (like p1_ladder STEP 2).
 //   STEP 3: + decoupled lookback (like p1_transpose).
-// STATS: record lookback statistics (STEP 3). MIN_BLOCKS: launch-bounds
-// minimum blocks/SM (6 = <= 40 registers, 8 = <= 32 registers).
+// STATS: record lookback statistics (STEP 3).
 // Other ITEMS_PER_THREAD multiples of 8 work but, unlike 24, have 2-4 way
 // bank conflicts on the blocked shmem accesses (lane strides of 4/8 or
 // 8/16 words).
 // ---------------------------------------------------------------------------
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t STEP, bool STATS = false,
-         uint32_t MIN_BLOCKS = 6>
-__global__ LB_P1_MIN(MIN_BLOCKS)
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t STEP, bool STATS = false>
+__global__ LB_P1
 void p1_vec(
     state_t* __restrict__ d_compose_glb,
     state_t* __restrict__ d_to_state_glb,
@@ -795,6 +790,166 @@ void p1_vec(
                 d_states_out[idx] = st[i];
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// cp.async helpers (sm_80+): 16-byte global -> shared copies that bypass
+// registers and L1. On older architectures they fall back to a synchronous
+// copy so the kernel logic can still be tested there.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
+#if __CUDA_ARCH__ >= 800
+    uint32_t s = (uint32_t)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(s), "l"(gmem) : "memory");
+#else
+    *reinterpret_cast<uint4*>(smem) = *reinterpret_cast<const uint4*>(gmem);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#endif
+}
+
+// Waits until at most N of this thread's committed groups are still pending.
+template<int N>
+__device__ __forceinline__ void cp_async_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Persistent p1_vec (STEP 3) with cp.async prefetch of the next tile.
+//
+// Each block processes tiles blockIdx.x, blockIdx.x + gridDim.x, ... . Before
+// working on its current tile, it issues cp.async copies of its *next* tile's
+// input into a second shmem buffer, so those loads are in flight during the
+// current tile's scan, lookback and store (in p1_vec a block issues no loads
+// while it waits in the lookback). Load/store otherwise as p1_vec: per-warp
+// buffers, __syncwarp only, 16-byte output vectors.
+//
+// The grid must not exceed the number of co-resident blocks: a tile's
+// lookback spins until its predecessors publish, which requires every block
+// that owns an earlier tile to be running.
+// ---------------------------------------------------------------------------
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false>
+__global__ LB_P1
+void p1_vec_pipe(
+    state_t* __restrict__ d_compose_glb,
+    state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_states_out,
+    ScanTileState tile_state,
+    uint32_t size,
+    uint32_t num_tiles)
+{
+    static_assert(ITEMS_PER_THREAD % 8 == 0, "ITEMS_PER_THREAD must be a multiple of 8");
+    constexpr uint32_t VECS       = ITEMS_PER_THREAD / 8;   // 8-byte reads = 16-byte stores per lane
+    constexpr uint32_t WARP_ITEMS = WARP * ITEMS_PER_THREAD;
+    constexpr uint32_t TILE       = BLOCK_SIZE * ITEMS_PER_THREAD;
+    constexpr uint32_t CHUNKS     = WARP_ITEMS / 16;        // 16-byte cp.async chunks per warp
+    static_assert(WARP_ITEMS % 16 == 0, "warp segment must be a multiple of 16 bytes");
+
+    using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOp, STATS>;
+
+    // Double-buffered per-warp input bytes, and a per-warp output buffer.
+    __shared__ __align__(16) uint8_t  inbuf[2][BLOCK_SIZE / WARP][WARP_ITEMS];
+    __shared__ __align__(16) uint32_t outbuf[BLOCK_SIZE / WARP][WARP_ITEMS * sizeof(state_t) / 4];
+    __shared__ typename BlockScanT::TempStorage scan_temp;
+    __shared__ typename PrefixOp::TempStorage   prefix_temp;
+    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    __shared__ __align__(8) state_t shmem_to_state[256];
+
+    loadTablesToShmem<BLOCK_SIZE>(
+        d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
+
+    const uint32_t warp = threadIdx.x / WARP;
+    const uint32_t lane = threadIdx.x % WARP;
+
+    // Issues this warp's share of tile's input into inbuf[buf] (full tiles
+    // only; the partial last tile is read directly), then commits a group —
+    // always, so every lane has one group per call.
+    auto prefetch = [&](uint32_t tile, uint32_t buf) {
+        if (tile < num_tiles && tile * TILE + TILE <= size) {
+            const uint8_t* src = d_in + tile * TILE + warp * WARP_ITEMS;
+            uint8_t*       dst = inbuf[buf][warp];
+            for (uint32_t c = lane; c < CHUNKS; c += WARP)
+                cp_async16(dst + 16 * c, src + 16 * c);
+        }
+        cp_async_commit();
+    };
+
+    uint32_t buf = 0;
+    prefetch(blockIdx.x, buf);
+    for (uint32_t tile_idx = blockIdx.x; tile_idx < num_tiles; tile_idx += gridDim.x, buf ^= 1) {
+        prefetch(tile_idx + gridDim.x, buf ^ 1);
+        cp_async_wait<1>();   // this tile's group has landed (next tile's may be pending)
+        __syncwarp();         // ... for every lane of the warp
+
+        const uint32_t glb_offs = tile_idx * TILE;
+        const bool     full     = glb_offs + TILE <= size;
+
+        state_t st[ITEMS_PER_THREAD];
+        if (full) {
+            const uint2* in = reinterpret_cast<const uint2*>(inbuf[buf][warp]);
+            #pragma unroll
+            for (uint32_t k = 0; k < VECS; k++) {
+                uint2 w = in[lane * VECS + k];
+                #pragma unroll
+                for (uint32_t b = 0; b < 8; b++) {
+                    uint32_t word = b < 4 ? w.x : w.y;
+                    st[8 * k + b] = shmem_to_state[(word >> (8 * (b % 4))) & 0xffu];
+                }
+            }
+        } else {
+            #pragma unroll
+            for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+                uint32_t idx = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i;
+                st[i] = idx < size ? shmem_to_state[d_in[idx]] : IDENTITY;
+            }
+        }
+
+        ComposeOp compose_op{shmem_compose};
+        if (tile_idx == 0) {
+            state_t block_aggregate;
+            BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, block_aggregate);
+            if (threadIdx.x == 0)
+                tile_state.SetInclusive(0, block_aggregate);
+        } else {
+            PrefixOp prefix_op(tile_state, prefix_temp, compose_op, (int)tile_idx, IDENTITY);
+            BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, prefix_op);
+        }
+
+        if (full) {
+            uint4* ob = reinterpret_cast<uint4*>(outbuf[warp]);
+            #pragma unroll
+            for (uint32_t k = 0; k < VECS; k++) {
+                const state_t* s = st + 8 * k;
+                ob[lane * VECS + k] = make_uint4(uint32_t(s[0]) | (uint32_t(s[1]) << 16),
+                                                 uint32_t(s[2]) | (uint32_t(s[3]) << 16),
+                                                 uint32_t(s[4]) | (uint32_t(s[5]) << 16),
+                                                 uint32_t(s[6]) | (uint32_t(s[7]) << 16));
+            }
+            __syncwarp();
+            uint4* dst = reinterpret_cast<uint4*>(d_states_out + glb_offs + warp * WARP_ITEMS);
+            #pragma unroll
+            for (uint32_t k = 0; k < VECS; k++)
+                dst[lane + k * WARP] = ob[lane + k * WARP];
+        } else {
+            #pragma unroll
+            for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+                uint32_t idx = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i;
+                if (idx < size)
+                    d_states_out[idx] = st[i];
+            }
+        }
+        // BlockScan / PrefixOp temp storage and outbuf are reused next tile.
+        __syncthreads();
+    }
+    cp_async_wait<0>();
 }
 
 // Host reference for ladder / P1 output. scan == false: plain byte->state map.
@@ -905,9 +1060,6 @@ int main(int argc, char** argv) {
     assert(input_size <= UINT32_MAX && "input exceeds uint32_t range");
     uint32_t size = (uint32_t)input_size;
     uint32_t nlb  = num_tiles(size);
-    // Tile state array: sized for the most tiles any variant uses (p1_vec at
-    // IPT=16).
-    const uint32_t max_tiles = std::max(nlb, (size + BLOCK_SIZE * 16 - 1) / (BLOCK_SIZE * 16));
 
     printf("%s  (%zu bytes, %u tiles)\n\n", argv[1], input_size, nlb);
 
@@ -922,7 +1074,7 @@ int main(int argc, char** argv) {
     gpuAssert(cudaMalloc(&d_states_out,   (size_t)size * sizeof(state_t)));
     gpuAssert(cudaMalloc(&d_compose_glb,  sizeof(h_compose)));
     gpuAssert(cudaMalloc(&d_to_state_glb, sizeof(h_to_state)));
-    gpuAssert(cudaMalloc(&ts.d_tile_descriptors, ScanTileState::AllocationSize(max_tiles)));
+    gpuAssert(cudaMalloc(&ts.d_tile_descriptors, ScanTileState::AllocationSize(nlb)));
 
     gpuAssert(cudaMemcpy(d_in,           input,     (size_t)size * sizeof(uint8_t), cudaMemcpyHostToDevice));
     gpuAssert(cudaMemcpy(d_compose_glb,  h_compose, sizeof(h_compose),              cudaMemcpyHostToDevice));
@@ -1014,44 +1166,53 @@ int main(int argc, char** argv) {
     };
     run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD>, "L3 + lookback (p1_transpose):");
 
-    // Vectorized load/store ladder: V1 ~ L1, V2 ~ L2, V3 ~ L3 at IPT=24, then
-    // V3 at 8 blocks/SM and V2/V3 at IPT=16 and IPT=32.
-    printf("\nVectorized load/store (u16 out):\n");
-    auto run_vec = [&](auto kernel, uint32_t ipt, uint32_t step, const char* name) {
-        int bps = 0;
-        gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, BLOCK_SIZE, 0));
-        char full_name[80];
-        snprintf(full_name, sizeof(full_name), "%s [%d/SM]", name, bps);
-        const uint32_t tiles = (size + BLOCK_SIZE * ipt - 1) / (BLOCK_SIZE * ipt);
-        assert(tiles <= max_tiles && "tile state array too small");
-        auto prep   = [&] { if (step == 3) reset(ts, tiles); };
+    // Vectorized load/store ladder at IPT=24: V1 ~ L1, V2 ~ L2, V3 ~ L3, then
+    // V3 as a persistent kernel that prefetches its next tile with cp.async.
+    printf("\nVectorized load/store (IPT=24, u16 out):\n");
+    constexpr uint32_t VEC_IPT = 24;
+    const uint32_t vec_tiles = (size + BLOCK_SIZE * VEC_IPT - 1) / (BLOCK_SIZE * VEC_IPT);
+    assert(vec_tiles <= nlb && "tile state array is sized for nlb tiles");
+    auto run_vec = [&](auto kernel, uint32_t step, const char* name) {
+        auto prep   = [&] { if (step == 3) reset(ts, vec_tiles); };
         auto launch = [&] {
-            kernel<<<tiles, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
+            kernel<<<vec_tiles, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
         };
         poison_out(); prep(); launch(); fetch_states();
         if (!check_states(input, size, h_states, step >= 2,
-                          step == 2 ? BLOCK_SIZE * ipt : 0, full_name)) exit(1);
-        bench(full_name, u16_bytes, prep, launch);
+                          step == 2 ? BLOCK_SIZE * VEC_IPT : 0, name)) exit(1);
+        bench(name, u16_bytes, prep, launch);
     };
-    run_vec(p1_vec<BLOCK_SIZE, 24, 1>, 24, 1, "V1 vec load/store (IPT=24):");
-    run_vec(p1_vec<BLOCK_SIZE, 24, 2>, 24, 2, "V2 + block scan (no lookback):");
-    run_vec(p1_vec<BLOCK_SIZE, 24, 3>, 24, 3, "V3 + lookback:");
-    {
-        auto kernel = p1_vec<BLOCK_SIZE, 24, 3, false, 8>;
-        max_shared_blocks_per_sm(kernel);   // carveout so 8 x ~14 KB fits
-        run_vec(kernel, 24, 3, "V3 min 8 blocks/SM:");
-    }
-    run_vec(p1_vec<BLOCK_SIZE, 16, 2>, 16, 2, "V2 IPT=16:");
-    run_vec(p1_vec<BLOCK_SIZE, 16, 3>, 16, 3, "V3 IPT=16:");
-    // IPT=32 uses ~17 KB shmem/block: 6 blocks exceed the default 100 KB carveout.
-    max_shared_blocks_per_sm(p1_vec<BLOCK_SIZE, 32, 2>);
-    max_shared_blocks_per_sm(p1_vec<BLOCK_SIZE, 32, 3>);
-    run_vec(p1_vec<BLOCK_SIZE, 32, 2>, 32, 2, "V2 IPT=32:");
-    run_vec(p1_vec<BLOCK_SIZE, 32, 3>, 32, 3, "V3 IPT=32:");
+    run_vec(p1_vec<BLOCK_SIZE, VEC_IPT, 1>, 1, "V1 vec load/store:");
+    run_vec(p1_vec<BLOCK_SIZE, VEC_IPT, 2>, 2, "V2 + block scan (no lookback):");
+    run_vec(p1_vec<BLOCK_SIZE, VEC_IPT, 3>, 3, "V3 + lookback:");
 
-    // Lookback statistics from instrumented copies of L3 and V3, summed over
-    // STATS_LAUNCHES launches. Diagnostic only: the counter atomics perturb
-    // timing, so no times are reported.
+    // Persistent grid: every block must be resident at once (the lookback
+    // spins on predecessor tiles), so grid = resident blocks/SM x SMs.
+    int num_sms = 0;
+    gpuAssert(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0));
+    auto pipe_grid = [&](auto kernel, int& bps) {
+        bps = max_shared_blocks_per_sm(kernel);   // ~25 KB shmem/block
+        if (bps < 1) { fprintf(stderr, "p1_vec_pipe does not fit on an SM\n"); exit(1); }
+        return std::min(vec_tiles, (uint32_t)(bps * num_sms));
+    };
+    {
+        auto kernel = p1_vec_pipe<BLOCK_SIZE, VEC_IPT>;
+        int bps;
+        const uint32_t grid = pipe_grid(kernel, bps);
+        char name[64];
+        snprintf(name, sizeof(name), "V3 persistent + cp.async [%d/SM]:", bps);
+        auto prep   = [&] { reset(ts, vec_tiles); };
+        auto launch = [&] {
+            kernel<<<grid, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, vec_tiles);
+        };
+        poison_out(); prep(); launch(); fetch_states();
+        if (!check_states(input, size, h_states, true, 0, name)) exit(1);
+        bench(name, u16_bytes, prep, launch);
+    }
+
+    // Lookback statistics from instrumented copies of L3 and the V3 kernels,
+    // summed over STATS_LAUNCHES launches. Diagnostic only: the counter
+    // atomics perturb timing, so no times are reported.
     constexpr uint32_t STATS_LAUNCHES = 10;
     printf("\nLookback stats (instrumented, %u launches):\n", STATS_LAUNCHES);
     auto run_stats = [&](uint32_t tiles, auto launch_kernel, const char* name) {
@@ -1069,16 +1230,18 @@ int main(int argc, char** argv) {
         p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true><<<nlb, BLOCK_SIZE>>>(
             d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
     }, "L3");
-    const uint32_t tiles24 = (size + BLOCK_SIZE * 24 - 1) / (BLOCK_SIZE * 24);
-    run_stats(tiles24, [&] {
-        p1_vec<BLOCK_SIZE, 24, 3, true><<<tiles24, BLOCK_SIZE>>>(
+    run_stats(vec_tiles, [&] {
+        p1_vec<BLOCK_SIZE, VEC_IPT, 3, true><<<vec_tiles, BLOCK_SIZE>>>(
             d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
     }, "V3");
-    max_shared_blocks_per_sm(p1_vec<BLOCK_SIZE, 24, 3, true, 8>);
-    run_stats(tiles24, [&] {
-        p1_vec<BLOCK_SIZE, 24, 3, true, 8><<<tiles24, BLOCK_SIZE>>>(
-            d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
-    }, "V3 min 8 blocks/SM");
+    {
+        auto kernel = p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true>;
+        int bps;
+        const uint32_t grid = pipe_grid(kernel, bps);
+        run_stats(vec_tiles, [&] {
+            kernel<<<grid, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, vec_tiles);
+        }, "V3 persistent + cp.async");
+    }
 
     free(h_states);
 

@@ -464,6 +464,31 @@ Counted from the full-tile SASS path of L2 (BS=256, IPT=22):
 tips the MIO queue into throttling. Every change that added LSU work
 (column compose, spills at 8 blocks/SM) made P1 slower.
 
+### `p1_vec` at 8 blocks/SM and at IPT=16 / IPT=32
+
+With the load/store unit no longer saturated, more occupancy and other tile
+sizes were retried on V3:
+
+| Variant | V2 (block scan) | V3 | lookback (V3−V2) |
+|---|---|---|---|
+| IPT=24, 6 blocks/SM (best) | 1245 μs | 1527–1530 μs | ~282 μs |
+| IPT=24, 8 blocks/SM (32 regs, spills) | – | 1698 μs | – |
+| IPT=16 (128K tiles, 36 regs) | 1229 μs | 1935 μs | 706 μs |
+| IPT=32 (64K tiles, spills, 2–4-way conflicts) | 1392 μs | 1676 μs | 284 μs |
+
+Why they failed:
+- 8 blocks/SM: spills (40 B stores / 68 B loads) and more resident blocks
+  slowed each tile's publication — re-polls per tile rose from 1.13 to 2.34
+  and INVALID first polls from 23% to 37%.
+- IPT=16: 1.5× the tiles but 2.5× the lookback cost. Once a tile's work is
+  short relative to a ~1.4 μs lookback, the idle time dominates.
+- IPT=32: the lookback costs the same as at IPT=24, while spills and bank
+  conflicts bring the block-scan cost back (+136 μs over V1). Even with those
+  fixed it would land at about the IPT=24 time.
+
+IPT=24 at 6 blocks/SM is the sweet spot. V3's lookback behaves like L3's
+(~3 windows per tile, depth ~68, re-polls 1.13).
+
 ### BS=32 (warp-scan, no intra-block barriers)
 Eliminates `__syncthreads()` inside `BlockScan` by using a single warp per
 block. Result: 3.7× slower. Reason: killing occupancy (1 block/SM vs 5–6)
@@ -541,8 +566,10 @@ Open directions — the remaining gap is the lookback (~285 μs):
 1. **Hide the lookback instead of shortening it** — the lookback takes
    ~1.4 μs per tile regardless of sleeps, window size or tile count (see
    "Lookback statistics"); the cost is the block's other warps idling for
-   it. More resident warps hide it; for `p1_transpose` that cost registers
-   and spills on a saturated LSU (see "More resident blocks"). Being
-   measured for V3, whose LSU now has headroom: 8 blocks/SM, and IPT=16/32.
+   it. More resident warps or other tile sizes did not help (see "More
+   resident blocks" and "`p1_vec` at 8 blocks/SM and at IPT=16 / IPT=32").
+   Being measured: `p1_vec_pipe`, a persistent V3 that prefetches its next
+   tile with `cp.async` so the block keeps loads in flight during the
+   lookback.
 2. **Two-kernel reduce-then-scan** — traffic floor ~1574 μs, now *above*
    V3's 1530 μs, so it can no longer win on traffic.
