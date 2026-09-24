@@ -148,17 +148,19 @@ struct ScanTileState {
                      : "memory");
     }
 
-    // Sleeps initial_delay_ns, then polls until no lane in the warp sees
-    // INVALID (350 ns between polls). first_status / retries report what the
+    // Sleeps initial_delay_ns (if PRE_SLEEP), then polls until no lane in the
+    // warp sees INVALID (350 ns between polls). first_status / retries report what the
     // first poll saw and how many times the warp re-polled (used only by
     // instrumented variants).
+    template<bool PRE_SLEEP = true>
     __device__ __forceinline__ void WaitForValid(int tile_idx,
                                                   uint32_t& status,
                                                   state_t& value,
                                                   uint32_t initial_delay_ns,
                                                   uint32_t& first_status,
                                                   uint32_t& retries) {
-        __nanosleep(initial_delay_ns);
+        if (PRE_SLEEP)
+            __nanosleep(initial_delay_ns);
         uint32_t w;
         asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
                      : "=r"(w)
@@ -216,7 +218,8 @@ __device__ __forceinline__ void record_lookback_stats(
 }
 
 // Prefix callback used with CUB BlockScan (decoupled lookback).
-template<typename ScanOpT, bool STATS = false>
+// PRE_SLEEP: sleep before the first poll of each window (see WaitForValid).
+template<typename ScanOpT, bool STATS = false, bool PRE_SLEEP = true>
 struct PrefixCallbackOp {
     using WarpReduceT = cub::WarpReduce<state_t, WARP>;
 
@@ -243,8 +246,8 @@ struct PrefixCallbackOp {
     ProcessWindow(int predecessor_idx, uint32_t& predecessor_status,
                   uint32_t delay_ns, uint32_t& first_status, uint32_t& retries) {
         state_t value;
-        tile_state.WaitForValid(predecessor_idx, predecessor_status, value, delay_ns,
-                                first_status, retries);
+        tile_state.template WaitForValid<PRE_SLEEP>(predecessor_idx, predecessor_status, value,
+                                                    delay_ns, first_status, retries);
         int is_oob    = (predecessor_status == uint32_t(SCAN_TILE_OOB));
         int tail_flag = (predecessor_status == uint32_t(SCAN_TILE_INCLUSIVE)) | is_oob;
         state_t eff   = is_oob ? identity : value;
@@ -833,8 +836,17 @@ __device__ __forceinline__ void cp_async_wait() {
 // The grid must not exceed the number of co-resident blocks: a tile's
 // lookback spins until its predecessors publish, which requires every block
 // that owns an earlier tile to be running.
+//
+// REDUCE_CHAINS = 0: CUB BlockScan::InclusiveScan on the blocked array (a
+// single dependent chain of ITEMS_PER_THREAD composes for the per-thread
+// aggregate). REDUCE_CHAINS = C > 0: the per-thread aggregate is built from
+// C interleaved chains (dependency depth ITEMS_PER_THREAD/C + C - 1 instead of
+// ITEMS_PER_THREAD), so the block aggregate - and the tile's PARTIAL - is
+// ready sooner; BlockScan then scans the per-thread aggregates and each
+// thread runs its downsweep chain from its exclusive prefix.
 // ---------------------------------------------------------------------------
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false>
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false,
+         uint32_t REDUCE_CHAINS = 0>
 __global__ LB_P1
 void p1_vec_pipe(
     state_t* __restrict__ d_compose_glb,
@@ -913,14 +925,51 @@ void p1_vec_pipe(
         }
 
         ComposeOp compose_op{shmem_compose};
-        if (tile_idx == 0) {
-            state_t block_aggregate;
-            BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, block_aggregate);
-            if (threadIdx.x == 0)
-                tile_state.SetInclusive(0, block_aggregate);
+        if constexpr (REDUCE_CHAINS == 0) {
+            if (tile_idx == 0) {
+                state_t block_aggregate;
+                BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, block_aggregate);
+                if (threadIdx.x == 0)
+                    tile_state.SetInclusive(0, block_aggregate);
+            } else {
+                PrefixOp prefix_op(tile_state, prefix_temp, compose_op, (int)tile_idx, IDENTITY);
+                BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, prefix_op);
+            }
         } else {
-            PrefixOp prefix_op(tile_state, prefix_temp, compose_op, (int)tile_idx, IDENTITY);
-            BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, prefix_op);
+            static_assert(ITEMS_PER_THREAD % REDUCE_CHAINS == 0,
+                          "ITEMS_PER_THREAD must be a multiple of REDUCE_CHAINS");
+            constexpr uint32_t CHAIN = ITEMS_PER_THREAD / REDUCE_CHAINS;
+            state_t part[REDUCE_CHAINS];
+            #pragma unroll
+            for (uint32_t c = 0; c < REDUCE_CHAINS; c++)
+                part[c] = st[c * CHAIN];
+            #pragma unroll
+            for (uint32_t i = 1; i < CHAIN; i++) {
+                #pragma unroll
+                for (uint32_t c = 0; c < REDUCE_CHAINS; c++)
+                    part[c] = compose_op(part[c], st[c * CHAIN + i]);
+            }
+            state_t agg = part[0];
+            #pragma unroll
+            for (uint32_t c = 1; c < REDUCE_CHAINS; c++)
+                agg = compose_op(agg, part[c]);
+
+            state_t prefix;
+            if (tile_idx == 0) {
+                state_t block_aggregate;
+                BlockScanT(scan_temp).ExclusiveScan(agg, prefix, IDENTITY, compose_op, block_aggregate);
+                if (threadIdx.x == 0)
+                    tile_state.SetInclusive(0, block_aggregate);
+            } else {
+                PrefixOp prefix_op(tile_state, prefix_temp, compose_op, (int)tile_idx, IDENTITY);
+                BlockScanT(scan_temp).ExclusiveScan(agg, prefix, compose_op, prefix_op);
+            }
+            state_t acc = prefix;
+            #pragma unroll
+            for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+                acc   = compose_op(acc, st[i]);
+                st[i] = acc;
+            }
         }
 
         if (full) {
@@ -947,6 +996,181 @@ void p1_vec_pipe(
             }
         }
         // BlockScan / PrefixOp temp storage and outbuf are reused next tile.
+        __syncthreads();
+    }
+    cp_async_wait<0>();
+}
+
+// ---------------------------------------------------------------------------
+// Persistent P1 with the lookback and fix-up deferred by one round.
+//
+// Like p1_vec_pipe (persistent, cp.async prefetch of the next tile), but a
+// tile's lookback is not done while its own local scan waits. Each round a
+// block:
+//   1. looks back for its *pending* tile (the one it scanned last round) and
+//      publishes that tile's INCLUSIVE value. The pending tile's predecessors
+//      published their aggregates a round earlier, so the walk should rarely
+//      meet INVALID tiles (PRE_SLEEP = false also skips the pre-poll sleeps);
+//   2. fixes up the pending tile, out_i = compose(P, local_i), from the
+//      shared-memory pending buffer and stores it (16-byte stores; the fix-up
+//      is elementwise, so the buffer is read striped without a transpose);
+//   3. loads the current tile, runs a tile-local inclusive scan (no
+//      lookback), publishes PARTIAL (tile 0: INCLUSIVE) and writes the local
+//      results into the pending buffer.
+// A final round finishes the last pending tile. Same shmem as p1_vec_pipe:
+// the pending buffer is the output buffer.
+//
+// Grid: at most the number of co-resident blocks (see p1_vec_pipe). A
+// lookback only waits for earlier tiles' step 3, so there is no cycle.
+// ---------------------------------------------------------------------------
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool PRE_SLEEP = false, bool STATS = false>
+__global__ LB_P1
+void p1_vec_defer(
+    state_t* __restrict__ d_compose_glb,
+    state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_states_out,
+    ScanTileState tile_state,
+    uint32_t size,
+    uint32_t num_tiles)
+{
+    static_assert(ITEMS_PER_THREAD % 8 == 0, "ITEMS_PER_THREAD must be a multiple of 8");
+    constexpr uint32_t VECS       = ITEMS_PER_THREAD / 8;
+    constexpr uint32_t WARP_ITEMS = WARP * ITEMS_PER_THREAD;
+    constexpr uint32_t TILE       = BLOCK_SIZE * ITEMS_PER_THREAD;
+    constexpr uint32_t CHUNKS     = WARP_ITEMS / 16;
+    static_assert(WARP_ITEMS % 16 == 0, "warp segment must be a multiple of 16 bytes");
+
+    using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOp, STATS, PRE_SLEEP>;
+
+    __shared__ __align__(16) uint8_t  inbuf[2][BLOCK_SIZE / WARP][WARP_ITEMS];
+    // Per-warp pending buffer: the pending tile's local results, blocked.
+    __shared__ __align__(16) uint32_t pendbuf[BLOCK_SIZE / WARP][WARP_ITEMS * sizeof(state_t) / 4];
+    __shared__ typename BlockScanT::TempStorage scan_temp;
+    __shared__ typename PrefixOp::TempStorage   prefix_temp;
+    __shared__ state_t pending_prefix;
+    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    __shared__ __align__(8) state_t shmem_to_state[256];
+
+    loadTablesToShmem<BLOCK_SIZE>(
+        d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
+
+    const uint32_t warp = threadIdx.x / WARP;
+    const uint32_t lane = threadIdx.x % WARP;
+    ComposeOp compose_op{shmem_compose};
+
+    auto prefetch = [&](uint32_t tile, uint32_t buf) {
+        if (tile < num_tiles && tile * TILE + TILE <= size) {
+            const uint8_t* src = d_in + tile * TILE + warp * WARP_ITEMS;
+            uint8_t*       dst = inbuf[buf][warp];
+            for (uint32_t c = lane; c < CHUNKS; c += WARP)
+                cp_async16(dst + 16 * c, src + 16 * c);
+        }
+        cp_async_commit();
+    };
+
+    state_t  pending_agg = IDENTITY;   // block aggregate of the pending tile
+    uint32_t buf         = 0;
+    prefetch(blockIdx.x, buf);
+    for (uint32_t tile_idx = blockIdx.x; ; tile_idx += gridDim.x, buf ^= 1) {
+        const bool have_cur  = tile_idx < num_tiles;
+        // pending = tile_idx - gridDim.x, the tile this block scanned last round
+        const bool have_pend = tile_idx >= gridDim.x && tile_idx - gridDim.x < num_tiles;
+        if (!have_cur && !have_pend)
+            break;
+        if (have_cur)
+            prefetch(tile_idx + gridDim.x, buf ^ 1);
+
+        // Steps 1 + 2: lookback and fix-up of the pending tile.
+        if (have_pend) {
+            const uint32_t pend = tile_idx - gridDim.x;
+            if (warp == 0) {
+                state_t p = IDENTITY;   // tile 0 published INCLUSIVE directly
+                if (pend != 0) {
+                    PrefixOp prefix_op(tile_state, prefix_temp, compose_op, (int)pend, IDENTITY);
+                    p = prefix_op(pending_agg);
+                }
+                if (lane == 0)
+                    pending_prefix = p;
+            }
+            __syncthreads();
+            const state_t  P       = pending_prefix;
+            const uint32_t p_offs  = pend * TILE + warp * WARP_ITEMS;
+            const bool     p_full  = pend * TILE + TILE <= size;
+            const uint4*   pb      = reinterpret_cast<const uint4*>(pendbuf[warp]);
+            auto fix = [&](uint32_t v) { return uint32_t(compose_op(P, state_t(v))); };
+            #pragma unroll
+            for (uint32_t k = 0; k < VECS; k++) {
+                const uint32_t w = lane + k * WARP;   // striped: 8 consecutive states
+                uint4 v = pb[w];
+                uint32_t o[4] = {v.x, v.y, v.z, v.w};
+                #pragma unroll
+                for (uint32_t j = 0; j < 4; j++)
+                    o[j] = fix(o[j] & 0xffffu) | (fix(o[j] >> 16) << 16);
+                if (p_full) {
+                    reinterpret_cast<uint4*>(d_states_out + p_offs)[w] = make_uint4(o[0], o[1], o[2], o[3]);
+                } else {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 8; j++) {
+                        uint32_t idx = p_offs + 8 * w + j;
+                        if (idx < size)
+                            d_states_out[idx] = state_t(j % 2 ? o[j / 2] >> 16 : o[j / 2] & 0xffffu);
+                    }
+                }
+            }
+            __syncwarp();   // the pending buffer is rewritten below
+        }
+
+        // Step 3: local scan of the current tile into the pending buffer.
+        if (have_cur) {
+            cp_async_wait<1>();
+            __syncwarp();
+            const uint32_t glb_offs = tile_idx * TILE;
+            const bool     full     = glb_offs + TILE <= size;
+
+            state_t st[ITEMS_PER_THREAD];
+            if (full) {
+                const uint2* in = reinterpret_cast<const uint2*>(inbuf[buf][warp]);
+                #pragma unroll
+                for (uint32_t k = 0; k < VECS; k++) {
+                    uint2 w = in[lane * VECS + k];
+                    #pragma unroll
+                    for (uint32_t b = 0; b < 8; b++) {
+                        uint32_t word = b < 4 ? w.x : w.y;
+                        st[8 * k + b] = shmem_to_state[(word >> (8 * (b % 4))) & 0xffu];
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+                    uint32_t idx = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i;
+                    st[i] = idx < size ? shmem_to_state[d_in[idx]] : IDENTITY;
+                }
+            }
+
+            state_t block_aggregate;
+            BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, block_aggregate);
+            if (threadIdx.x == 0) {
+                if (tile_idx == 0)
+                    tile_state.SetInclusive(0, block_aggregate);
+                else
+                    tile_state.SetPartial(tile_idx, block_aggregate);
+            }
+            pending_agg = block_aggregate;
+
+            uint4* pb = reinterpret_cast<uint4*>(pendbuf[warp]);
+            #pragma unroll
+            for (uint32_t k = 0; k < VECS; k++) {
+                const state_t* s = st + 8 * k;
+                pb[lane * VECS + k] = make_uint4(uint32_t(s[0]) | (uint32_t(s[1]) << 16),
+                                                 uint32_t(s[2]) | (uint32_t(s[3]) << 16),
+                                                 uint32_t(s[4]) | (uint32_t(s[5]) << 16),
+                                                 uint32_t(s[6]) | (uint32_t(s[7]) << 16));
+            }
+        }
+        // Scan / prefix temp storage, pending_prefix and the pending buffer
+        // are reused next round.
         __syncthreads();
     }
     cp_async_wait<0>();
@@ -1195,12 +1419,11 @@ int main(int argc, char** argv) {
         if (bps < 1) { fprintf(stderr, "p1_vec_pipe does not fit on an SM\n"); exit(1); }
         return std::min(vec_tiles, (uint32_t)(bps * num_sms));
     };
-    {
-        auto kernel = p1_vec_pipe<BLOCK_SIZE, VEC_IPT>;
+    auto run_persistent = [&](auto kernel, const char* label) {
         int bps;
         const uint32_t grid = pipe_grid(kernel, bps);
         char name[64];
-        snprintf(name, sizeof(name), "V3 persistent + cp.async [%d/SM]:", bps);
+        snprintf(name, sizeof(name), "%s [%d/SM]:", label, bps);
         auto prep   = [&] { reset(ts, vec_tiles); };
         auto launch = [&] {
             kernel<<<grid, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, vec_tiles);
@@ -1208,7 +1431,11 @@ int main(int argc, char** argv) {
         poison_out(); prep(); launch(); fetch_states();
         if (!check_states(input, size, h_states, true, 0, name)) exit(1);
         bench(name, u16_bytes, prep, launch);
-    }
+    };
+    run_persistent(p1_vec_pipe<BLOCK_SIZE, VEC_IPT>, "V3 persistent + cp.async");
+    run_persistent(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, false, 4>, "V3 pipe, 4-chain reduce");
+    run_persistent(p1_vec_defer<BLOCK_SIZE, VEC_IPT, false>, "V3 deferred fix-up");
+    run_persistent(p1_vec_defer<BLOCK_SIZE, VEC_IPT, true>, "V3 deferred, pre-sleep");
 
     // Lookback statistics from instrumented copies of L3 and the V3 kernels,
     // summed over STATS_LAUNCHES launches. Diagnostic only: the counter
@@ -1234,14 +1461,16 @@ int main(int argc, char** argv) {
         p1_vec<BLOCK_SIZE, VEC_IPT, 3, true><<<vec_tiles, BLOCK_SIZE>>>(
             d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
     }, "V3");
-    {
-        auto kernel = p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true>;
+    auto run_persistent_stats = [&](auto kernel, const char* name) {
         int bps;
         const uint32_t grid = pipe_grid(kernel, bps);
         run_stats(vec_tiles, [&] {
             kernel<<<grid, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, vec_tiles);
-        }, "V3 persistent + cp.async");
-    }
+        }, name);
+    };
+    run_persistent_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true>, "V3 persistent + cp.async");
+    run_persistent_stats(p1_vec_pipe<BLOCK_SIZE, VEC_IPT, true, 4>, "V3 pipe, 4-chain reduce");
+    run_persistent_stats(p1_vec_defer<BLOCK_SIZE, VEC_IPT, false, true>, "V3 deferred fix-up");
 
     free(h_states);
 

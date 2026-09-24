@@ -368,6 +368,32 @@ the only remaining cost. (V uses IPT=24 vs L's 22; the earlier IPT sweep had
 24 slightly *worse* than 22 on the old path, so the gain is the
 vectorization.)
 
+### Persistent kernel with `cp.async` prefetch (`p1_vec_pipe`)
+
+In `p1_vec` a block issues no memory requests while it waits in the
+lookback. `p1_vec_pipe` makes V3 persistent — grid = resident blocks/SM ×
+SMs (6 × 108 = 648), block `b` processes tiles `b, b+648, …` — and before
+working on a tile, each warp issues `cp.async` 16-byte copies
+(`LDGSTS.E.BYPASS.128`: global → shared, no registers, no L1) of its share
+of the block's *next* tile into a second input buffer. Those loads are in
+flight during the current tile's scan, lookback and store.
+
+- 25.4 KB shmem/block (2 input buffers + output buffer), so 6 blocks/SM need
+  the maximum shared-memory carveout; 40 registers, no spills.
+- All blocks must be co-resident: a tile's lookback spins on its
+  predecessors, so every block owning an earlier tile has to be running.
+  The grid is sized from the occupancy API to guarantee this.
+- One extra `__syncthreads()` per tile (BlockScan temp storage is reused).
+
+| | V2 | V3 | V3 persistent + cp.async |
+|---|---|---|---|
+| time | 1244 μs | 1530 μs | **1488 μs** |
+| lookback cost (vs V2) | – | 286 μs | 244 μs |
+| windows / re-polls / depth | – | 2.92 / 1.13 / 68 | 3.49 / 1.55 / 85 |
+
+Each lookback got *longer* (tiles finish faster, so more are in flight during
+the ~1.4 μs lag), but it costs less because memory stays busy meanwhile.
+
 ## What We Tried and Why It Didn't Help
 
 ### Removing the lookback sleeps (sleep modes)
@@ -532,44 +558,52 @@ atomic counter was not the bottleneck.
 | `st.relaxed.gpu` tile state stores | 642 GB/s | 697 GB/s | +54 GB/s |
 | `BLOCK_LOAD/STORE_WARP_TRANSPOSE` | 697 GB/s | 841 GB/s | +144 GB/s |
 | Vectorized load/store (`p1_vec`, IPT=24) | 838 GB/s (1876 μs) | 1028 GB/s (1530 μs) | +190 GB/s |
+| Persistent + `cp.async` prefetch (`p1_vec_pipe`) | 1028 GB/s (1530 μs) | 1057 GB/s (1488 μs) | +29 GB/s |
 
 The warp-transpose gain came from eliminating shmem store bank conflicts and
 reducing instruction count. The vectorized load/store gain came from cutting
 memory-pipe instructions per element from ~9 to ~3.75, which makes the block
-scan free (see "Vectorized load/store").
+scan free (see "Vectorized load/store"). The persistent/prefetch gain keeps
+loads in flight while a block waits in its lookback (see "Persistent kernel
+with cp.async prefetch").
 
 ## Conclusion — Current State of P1
 
-`p1_vec<256, 24, 3>` (V3) at **1530 μs / 1028 GB/s** is the best P1 kernel.
-`p1_transpose` (1876 μs) stays in `p1_bench.cu` as the L3 reference; the other
-variants listed above were removed from the code and their numbers are kept
-as a historical record.
+`p1_vec_pipe<256, 24>` at **1488 μs / 1057 GB/s** is the best P1 kernel.
+`p1_transpose` (1876 μs, L3) and `p1_vec` (V3, 1530 μs) stay in
+`p1_bench.cu` as references; the other variants listed above were removed
+from the code and their numbers are kept as a historical record.
 
-Where the time goes (V ladder): load/store at the practical speed of light
-(V1 1256 μs vs 1159 μs u16 floor), block scan free (V2 1245 μs), lookback
-+285 μs. V3 is at 82% of V1 and 76% of the u16 floor.
+Where the time goes: load/store at the practical speed of light (V1 1255 μs
+vs 1159 μs u16 floor), block scan free (V2 1244 μs), lookback +244 μs.
+`p1_vec_pipe` is at 84% of V1 and 78% of the u16 floor.
 
 Levers exhausted:
 
 - Lookback sleep changes, a 64-tile lookback window, larger blocks, column
-  compose and 8 blocks/SM for the IPT=22 kernel (with or without register
-  packing / carveout changes) all made P1 slower or had no effect (see
-  "What We Tried").
+  compose, 8 blocks/SM (for both the IPT=22 kernel and V3) and IPT=16/32
+  for V3 all made P1 slower or had no effect (see "What We Tried").
 - `BLOCK_LOAD/STORE_WARP_TRANSPOSE` (+144 GB/s) and then vectorized
   warp-local exchanges (+190 GB/s) removed the load/store path's cost.
 - `st.relaxed.gpu` tile state stores replace `__threadfence()`: +54 GB/s.
 - Static shmem for tables and `__launch_bounds__(256,6)` gave earlier gains.
 - Static `blockIdx.x` assignment and tile-0 fast path have no measurable effect.
 
-Open directions — the remaining gap is the lookback (~285 μs):
+Open directions — the remaining gap is the lookback (~244 μs). Being
+measured, both on top of `p1_vec_pipe`:
 
-1. **Hide the lookback instead of shortening it** — the lookback takes
-   ~1.4 μs per tile regardless of sleeps, window size or tile count (see
-   "Lookback statistics"); the cost is the block's other warps idling for
-   it. More resident warps or other tile sizes did not help (see "More
-   resident blocks" and "`p1_vec` at 8 blocks/SM and at IPT=16 / IPT=32").
-   Being measured: `p1_vec_pipe`, a persistent V3 that prefetches its next
-   tile with `cp.async` so the block keeps loads in flight during the
-   lookback.
-2. **Two-kernel reduce-then-scan** — traffic floor ~1574 μs, now *above*
-   V3's 1530 μs, so it can no longer win on traffic.
+1. **4-chain reduce** (`p1_vec_pipe<…, REDUCE_CHAINS = 4>`): the per-thread
+   aggregate comes from 4 interleaved compose chains (dependency depth 9
+   instead of 24), so a tile's block aggregate — and its PARTIAL — is ready
+   sooner and predecessors are more often published at the first poll.
+2. **Deferred lookback and fix-up** (`p1_vec_defer`): each round a block
+   first finishes its *previous* tile (lookback, publish INCLUSIVE,
+   out = compose(P, local) from shared memory, store), then scans the current
+   tile locally and keeps it pending. The previous tile's predecessors
+   published a round earlier, so the lookback rarely meets INVALID tiles
+   (local test: 0.9% INVALID first polls vs 16–22%, 0.11 re-polls per tile)
+   and can skip the pre-poll sleeps. Costs one extra compose lookup per
+   element for the fix-up.
+
+Two-kernel reduce-then-scan is no longer an option: its traffic floor
+(~1574 μs) is above the current best.
