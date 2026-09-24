@@ -491,6 +491,141 @@ static bool check_map_only(const uint8_t* input, uint32_t size,
     return true;
 }
 
+// Map-only u16 with fully coalesced stores: each thread maps 8 input bytes
+// (one 8-byte load) to 8 states (one 16-byte store), so consecutive threads
+// write consecutive 16-byte segments. map_only<16> instead issues two 16-byte
+// stores 32 bytes apart per thread.
+template<uint32_t BLOCK_SIZE, uint32_t CHUNKS>
+__global__ __launch_bounds__(BLOCK_SIZE)
+void map_only_u16_coalesced(
+    const state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_out,
+    uint32_t size)
+{
+    __shared__ state_t shmem_to_state[256];
+    for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_SIZE)
+        shmem_to_state[i] = d_to_state_glb[i];
+    __syncthreads();
+
+    const uint32_t nvec = size / 8;
+    const uint2* in_vec = reinterpret_cast<const uint2*>(d_in);
+    uint4* out_vec      = reinterpret_cast<uint4*>(d_out);
+    const uint32_t base = blockIdx.x * BLOCK_SIZE * CHUNKS + threadIdx.x;
+
+    uint2 v[CHUNKS];
+    #pragma unroll
+    for (uint32_t c = 0; c < CHUNKS; c++) {
+        uint32_t idx = base + c * BLOCK_SIZE;
+        if (idx < nvec) v[c] = in_vec[idx];
+    }
+
+    #pragma unroll
+    for (uint32_t c = 0; c < CHUNKS; c++) {
+        uint32_t idx = base + c * BLOCK_SIZE;
+        if (idx >= nvec) break;
+        const uint32_t w[2] = {v[c].x, v[c].y};
+        auto s = [&](uint32_t k) -> uint32_t {
+            return shmem_to_state[(w[k / 4] >> (8 * (k % 4))) & 0xffu];
+        };
+        out_vec[idx] = make_uint4(s(0) | (s(1) << 16), s(2) | (s(3) << 16),
+                                  s(4) | (s(5) << 16), s(6) | (s(7) << 16));
+    }
+
+    // Tail (size % 8 bytes): one thread, scalar.
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        for (uint32_t i = nvec * 8; i < size; i++)
+            d_out[i] = shmem_to_state[d_in[i]];
+}
+
+// ---------------------------------------------------------------------------
+// P1 cost ladder: p1_transpose with pieces removed, to attribute its time.
+//   STEP 1: warp-transpose load -> store, no scan. Output = byte->state map.
+//   STEP 2: + BlockScan with compose, no lookback: every tile scans from
+//           IDENTITY independently. Output is a per-tile scan (not valid P1).
+// STEP 3 is p1_transpose itself (+ decoupled lookback).
+// ---------------------------------------------------------------------------
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t STEP>
+__global__ LB_P1
+void p1_ladder(
+    state_t* __restrict__ d_compose_glb,
+    state_t* __restrict__ d_to_state_glb,
+    const uint8_t* __restrict__ d_in,
+    state_t* __restrict__ d_states_out,
+    uint32_t size)
+{
+    static_assert(STEP == 1 || STEP == 2, "STEP must be 1 or 2");
+
+    using TransformIter = thrust::transform_iterator<ByteToState, const uint8_t*>;
+    using BlockLoadT  = cub::BlockLoad <state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    using BlockStoreT = cub::BlockStore<state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
+                                        cub::BLOCK_STORE_WARP_TRANSPOSE>;
+    using BlockScanT  = cub::BlockScan <state_t, BLOCK_SIZE,
+                                        cub::BLOCK_SCAN_WARP_SCANS>;
+
+    __shared__ union {
+        typename BlockLoadT::TempStorage  load;
+        typename BlockStoreT::TempStorage store;
+        typename BlockScanT::TempStorage  scan;
+    } temp;
+
+    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    __shared__ __align__(8) state_t shmem_to_state[256];
+
+    loadTablesToShmem<BLOCK_SIZE>(
+        d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
+
+    uint32_t tile_idx = blockIdx.x;
+    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
+    uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
+                                      (uint64_t)size - glb_offs);
+
+    ByteToState byte_to_state{shmem_to_state};
+    TransformIter d_in_states(d_in + glb_offs, byte_to_state);
+    state_t st[ITEMS_PER_THREAD];
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockLoadT(temp.load).Load(d_in_states, st);
+    else
+        BlockLoadT(temp.load).Load(d_in_states, st, valid, IDENTITY);
+    __syncthreads();
+
+    if constexpr (STEP == 2) {
+        ComposeOp compose_op{shmem_compose};
+        state_t block_aggregate;
+        BlockScanT(temp.scan).InclusiveScan(st, st, compose_op, block_aggregate);
+        __syncthreads();
+    }
+
+    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
+        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st);
+    else
+        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
+}
+
+// Host reference for ladder / P1 output. scan == false: plain byte->state map.
+// scan == true: inclusive compose scan that restarts every tile_len elements
+// (tile_len == 0: one scan over the whole input, i.e. real P1 output).
+static bool check_states(const uint8_t* input, uint32_t size, const state_t* out,
+                         bool scan, uint32_t tile_len, const char* name) {
+    state_t acc = IDENTITY;
+    for (uint32_t i = 0; i < size; i++) {
+        state_t x = h_to_state[input[i]];
+        if (!scan)
+            acc = x;
+        else if (tile_len != 0 && i % tile_len == 0)
+            acc = x;
+        else
+            acc = i == 0 ? x : h_compose[(x & 15u) * NUM_STATES + (acc & 15u)];
+        if (out[i] != acc) {
+            fprintf(stderr, "%s mismatch at %u: got %u, expected %u\n",
+                    name, i, (uint32_t)out[i], (uint32_t)acc);
+            return false;
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Launch / bench helpers
 // ---------------------------------------------------------------------------
@@ -562,43 +697,18 @@ int main(int argc, char** argv) {
     gpuAssert(cudaEventCreate(&t1));
 
     // ------------------------------------------------------------------
-    // P1 transpose
-    // ------------------------------------------------------------------
-    {
-        auto kernel    = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD>;
-        size_t p1_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
-
-        printf("%-38s \n  %-36s ", "2Pass P1 BS256/IPT22 (transpose):", "P1:");
-        for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
-            reset(ts, nlb);
-            kernel<<<nlb, BLOCK_SIZE>>>(
-                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
-            gpuAssert(cudaDeviceSynchronize());
-        }
-        for (uint32_t i = 0; i < BENCH_RUNS; i++) {
-            reset(ts, nlb);
-            gpuAssert(cudaEventRecord(t0));
-            kernel<<<nlb, BLOCK_SIZE>>>(
-                d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
-            gpuAssert(cudaDeviceSynchronize());
-            gpuAssert(cudaEventRecord(t1));
-            gpuAssert(cudaEventSynchronize(t1));
-            gpuAssert(cudaEventElapsedTime(ms + i, t0, t1));
-        }
-        print_stats(ms, BENCH_RUNS, p1_bytes);
-    }
-
-    // ------------------------------------------------------------------
-    // Speed-of-light references: map-only kernels and D2D memcpy.
+    // Bench helper. prep() runs untimed before every launch.
     // GB/s counts input bytes read + output bytes written.
     // ------------------------------------------------------------------
-    auto bench_sol = [&](const char* name, size_t bytes, auto launch) {
-        printf("%-38s ", name);
+    auto bench = [&](const char* name, size_t bytes, auto prep, auto launch) {
+        printf("%-40s ", name);
         for (uint32_t i = 0; i < WARMUP_RUNS; i++) {
+            prep();
             launch();
             gpuAssert(cudaDeviceSynchronize());
         }
         for (uint32_t i = 0; i < BENCH_RUNS; i++) {
+            prep();
             gpuAssert(cudaEventRecord(t0));
             launch();
             gpuAssert(cudaDeviceSynchronize());
@@ -608,7 +718,69 @@ int main(int argc, char** argv) {
         }
         print_stats(ms, BENCH_RUNS, bytes);
     };
+    auto no_prep = [] {};
 
+    const size_t u16_bytes = (size_t)size * sizeof(uint8_t) + (size_t)size * sizeof(state_t);
+    state_t* h_states = (state_t*)malloc((size_t)size * sizeof(state_t));
+    auto fetch_states = [&] {
+        gpuAssert(cudaDeviceSynchronize());
+        gpuAssert(cudaMemcpy(h_states, d_states_out, (size_t)size * sizeof(state_t),
+                             cudaMemcpyDeviceToHost));
+    };
+    auto poison_out = [&] {
+        gpuAssert(cudaMemset(d_states_out, 0xff, (size_t)size * sizeof(state_t)));
+    };
+
+    // ------------------------------------------------------------------
+    // P1 cost ladder (all u16 output, same traffic as P1)
+    // ------------------------------------------------------------------
+    printf("P1 cost ladder (u16 out):\n");
+
+    // L0: map-only, coalesced stores
+    {
+        constexpr uint32_t CHUNKS = 8;
+        auto kernel     = map_only_u16_coalesced<BLOCK_SIZE, CHUNKS>;
+        uint32_t nvec   = size / 8;
+        uint32_t blocks = max(1u, (nvec + BLOCK_SIZE * CHUNKS - 1) / (BLOCK_SIZE * CHUNKS));
+        auto launch = [&] { kernel<<<blocks, BLOCK_SIZE>>>(d_to_state_glb, d_in, d_states_out, size); };
+        poison_out(); launch(); fetch_states();
+        if (!check_states(input, size, h_states, false, 0, "L0")) exit(1);
+        bench("L0 map-only (coalesced):", u16_bytes, no_prep, launch);
+    }
+
+    // L1: + warp-transpose load/store
+    {
+        auto kernel = p1_ladder<BLOCK_SIZE, ITEMS_PER_THREAD, 1>;
+        auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, size); };
+        poison_out(); launch(); fetch_states();
+        if (!check_states(input, size, h_states, false, 0, "L1")) exit(1);
+        bench("L1 + warp-transpose load/store:", u16_bytes, no_prep, launch);
+    }
+
+    // L2: + block scan, no lookback
+    {
+        auto kernel = p1_ladder<BLOCK_SIZE, ITEMS_PER_THREAD, 2>;
+        auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, size); };
+        poison_out(); launch(); fetch_states();
+        if (!check_states(input, size, h_states, true, BLOCK_SIZE * ITEMS_PER_THREAD, "L2")) exit(1);
+        bench("L2 + block scan (no lookback):", u16_bytes, no_prep, launch);
+    }
+
+    // L3: + decoupled lookback = p1_transpose
+    {
+        auto kernel = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD>;
+        auto prep   = [&] { reset(ts, nlb); };
+        auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb); };
+        poison_out(); prep(); launch(); fetch_states();
+        if (!check_states(input, size, h_states, true, 0, "L3")) exit(1);
+        bench("L3 + lookback (p1_transpose):", u16_bytes, prep, launch);
+    }
+    free(h_states);
+
+    // ------------------------------------------------------------------
+    // Speed-of-light references: map-only kernels and D2D memcpy.
+    // ------------------------------------------------------------------
+    printf("\nSpeed-of-light references:\n");
     uint8_t* h_check = (uint8_t*)malloc((size_t)size * sizeof(state_t));
     auto run_map = [&](auto out_bits_tag, const char* name) {
         constexpr uint32_t OUT_BITS = decltype(out_bits_tag)::value;
@@ -618,23 +790,22 @@ int main(int argc, char** argv) {
         uint32_t blocks  = max(1u, (nvec + BLOCK_SIZE * CHUNKS - 1) / (BLOCK_SIZE * CHUNKS));
         uint32_t out_len = map_out_bytes(size, OUT_BITS);
         uint8_t* d_out   = reinterpret_cast<uint8_t*>(d_states_out);
+        auto launch = [&] { kernel<<<blocks, BLOCK_SIZE>>>(d_to_state_glb, d_in, d_out, size); };
 
         gpuAssert(cudaMemset(d_out, 0xff, out_len));
-        kernel<<<blocks, BLOCK_SIZE>>>(d_to_state_glb, d_in, d_out, size);
+        launch();
         gpuAssert(cudaDeviceSynchronize());
         gpuAssert(cudaMemcpy(h_check, d_out, out_len, cudaMemcpyDeviceToHost));
         if (!check_map_only(input, size, OUT_BITS, h_check)) exit(1);
 
-        bench_sol(name, (size_t)size + out_len, [&] {
-            kernel<<<blocks, BLOCK_SIZE>>>(d_to_state_glb, d_in, d_out, size);
-        });
+        bench(name, (size_t)size + out_len, no_prep, launch);
     };
-    run_map(std::integral_constant<uint32_t, 16>{}, "SoL map-only (u16 out):");
+    run_map(std::integral_constant<uint32_t, 16>{}, "SoL map-only (u16 out, strided store):");
     run_map(std::integral_constant<uint32_t, 8>{},  "SoL map-only (u8 out):");
     run_map(std::integral_constant<uint32_t, 4>{},  "SoL map-only (4-bit out):");
     free(h_check);
 
-    bench_sol("SoL memcpy D2D (1 B in, 1 B out):", 2 * (size_t)size, [&] {
+    bench("SoL memcpy D2D (1 B in, 1 B out):", 2 * (size_t)size, no_prep, [&] {
         gpuAssert(cudaMemcpyAsync(d_states_out, d_in, size, cudaMemcpyDeviceToDevice));
     });
 
