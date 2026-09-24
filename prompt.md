@@ -538,7 +538,8 @@ was not printed because stdout was not flushed before running it).
    spun forever. Locally (sm_75: 32 barriers/SM, 2 blocks of 16) every block
    was resident, so it passed.
 
-**How it was solved:** barrier ids are compile-time immediates
+**How it was solved:** (the kernel was later removed — see "Dedicated lookback
+warp") barrier ids are compile-time immediates
 (`named_bar_sync<ID, THREADS>()`, parity selected with a branch), so ptxas
 reserves only ids 0–5 (`used 6 barriers`; 64 / 6 = 10 blocks/SM, no limit
 at 5). `bench` now flushes stdout before each kernel so a hang is
@@ -551,6 +552,31 @@ that uses more named barriers must be checked against 64 / barriers-used by
 hand. **Alternative:** dynamic tile tickets (`atomicAdd` for the next tile)
 would make the persistent kernels safe even if not all blocks are resident,
 at the cost of an atomic per tile and broadcasting the tile index.
+
+### Dedicated lookback warp (`p1_vec_lbwarp`)
+
+Persistent, `cp.async` prefetch, 288 threads = 8 compute warps + 1 lookback
+warp. The compute warps ran a tile-local scan (custom block scan on a
+compute-only named barrier), published PARTIAL and handed the aggregate to
+the lookback warp (`bar.arrive`), then fixed up and stored the *previous*
+tile once its prefix arrived (`bar.sync`, out = compose(P, local) from a
+shared-memory pending buffer). The lookback warp ran each tile's lookback
+while the compute warps worked on the next tile.
+
+| | `p1_vec_pipe` (6 blocks/SM) | `p1_vec_lbwarp` (5 blocks/SM) |
+|---|---|---|
+| time | 1492 μs | 1837 μs (+345) |
+| INVALID first polls | 31% | 9% |
+| re-polls / windows / depth | 1.82 / 3.47 / 85 | 2.23 / 4.07 / 105 |
+
+Why it failed: PARTIAL is published before the lookback starts, so fewer
+first polls meet INVALID — but every tile's INCLUSIVE is published later
+(when the lookback warp gets to it), so the band of PARTIAL-only tiles grew
+(depth 105, >4 windows) and each lookback got longer. On the cost side:
+one block fewer per SM (40 compute warps instead of 48; 288 threads × 40
+registers), 56 B of spills (the current tile's 24 states stay live during the
+previous tile's fix-up), and one extra compose lookup plus a pending-buffer
+round trip per element. Which of these dominates was not profiled.
 
 ### 4-chain reduce and deferred lookback (on top of `p1_vec_pipe`)
 
@@ -653,11 +679,12 @@ Levers exhausted:
 - Static shmem for tables and `__launch_bounds__(256,6)` gave earlier gains.
 - Static `blockIdx.x` assignment and tile-0 fast path have no measurable effect.
 
-Open directions — the remaining gap is the lookback (~240 μs). A 4-chain
-reduce and a one-round deferred lookback on top of `p1_vec_pipe` did not help
-(see "What We Tried"). Being measured: a dedicated lookback warp
-(`p1_vec_lbwarp`) that runs each tile's lookback asynchronously while the
-block's 8 compute warps continue with the next tile.
+Status — the remaining gap is the lookback (~240 μs). Hiding it has failed
+in every form tried on top of `p1_vec_pipe`: more resident warps (spills),
+a faster per-thread reduce (no effect), a one-round deferred lookback
+(predecessors not published earlier on the A100) and a dedicated lookback
+warp (later INCLUSIVE publication, lower occupancy). `p1_vec_pipe` is
+treated as the final P1; next step is porting it into `cuda_lexer.cu`.
 
 Two-kernel reduce-then-scan is no longer an option: its traffic floor
 (~1574 μs) is above the current best.
