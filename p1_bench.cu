@@ -360,17 +360,18 @@ static void initScanTileState(ScanTileState& ts, int num_tiles) {
 // P1 kernels
 // ---------------------------------------------------------------------------
 
-// minnctapersm=6 is valid only on sm_80+ (A100 has 65536 regs/SM;
-// 6*256*40 = 61440 <= 65536). sm_75 has only 32768 and would warn.
+// minnctapersm (MIN_BLOCKS) is valid only on sm_80+ (A100 has 65536
+// regs/SM): 6 blocks -> <= 40 regs (6*256*40 = 61440), 8 blocks -> <= 32
+// regs (8*256*32 = 65536). sm_75 has only 32768 and would warn.
 #if __CUDA_ARCH__ >= 800
-#define LB_P1 __launch_bounds__(256, 6)
+#define LB_P1(MIN_BLOCKS) __launch_bounds__(256, MIN_BLOCKS)
 #else
-#define LB_P1 __launch_bounds__(256)
+#define LB_P1(MIN_BLOCKS) __launch_bounds__(256)
 #endif
 
 
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false>
-__global__ LB_P1
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false, uint32_t MIN_BLOCKS = 6>
+__global__ LB_P1(MIN_BLOCKS)
 void p1_transpose(
     state_t* __restrict__ d_compose_glb,
     state_t* __restrict__ d_to_state_glb,
@@ -603,8 +604,8 @@ void map_only_u16_coalesced(
 //           IDENTITY independently. Output is a per-tile scan (not valid P1).
 // STEP 3 is p1_transpose itself (+ decoupled lookback).
 // ---------------------------------------------------------------------------
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t STEP>
-__global__ LB_P1
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t STEP, uint32_t MIN_BLOCKS = 6>
+__global__ LB_P1(MIN_BLOCKS)
 void p1_ladder(
     state_t* __restrict__ d_compose_glb,
     state_t* __restrict__ d_to_state_glb,
@@ -704,6 +705,18 @@ static uint32_t num_tiles(uint32_t size) {
 
 static void reset(ScanTileState& ts, uint32_t nlb) {
     initScanTileState(ts, (int)nlb);
+}
+
+// Requests the maximum shared memory carveout for kernel (8 blocks/SM x
+// ~13 KB exceeds the default 100 KB configuration) and returns the resulting
+// resident blocks per SM.
+template<typename KernelT>
+static int max_carveout_blocks_per_sm(KernelT kernel) {
+    gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                   (int)cudaSharedmemCarveoutMaxShared));
+    int blocks = 0;
+    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, BLOCK_SIZE, 0));
+    return blocks;
 }
 
 static void reset_lookback_stats() {
@@ -853,6 +866,18 @@ int main(int argc, char** argv) {
         bench("L2 + block scan (no lookback):", u16_bytes, no_prep, launch);
     }
 
+    // L2 at <= 32 registers (__launch_bounds__(256, 8)): 8 blocks/SM
+    {
+        auto kernel = p1_ladder<BLOCK_SIZE, ITEMS_PER_THREAD, 2, 8>;
+        int  bps    = max_carveout_blocks_per_sm(kernel);
+        auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, size); };
+        char name[64];
+        snprintf(name, sizeof(name), "L2 min 8 blocks/SM (got %d):", bps);
+        poison_out(); launch(); fetch_states();
+        if (!check_states(input, size, h_states, true, BLOCK_SIZE * ITEMS_PER_THREAD, name)) exit(1);
+        bench(name, u16_bytes, no_prep, launch);
+    }
+
     // L3: + decoupled lookback = p1_transpose
     auto run_l3 = [&](auto kernel, const char* name) {
         auto prep   = [&] { reset(ts, nlb); };
@@ -862,6 +887,16 @@ int main(int argc, char** argv) {
         bench(name, u16_bytes, prep, launch);
     };
     run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD>, "L3 + lookback (p1_transpose):");
+
+    // L3 at <= 32 registers: more resident blocks to cover the warps that
+    // idle during each block's lookback.
+    char l3_8_name[64];
+    {
+        auto kernel = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, false, 8>;
+        snprintf(l3_8_name, sizeof(l3_8_name), "L3 min 8 blocks/SM (got %d):",
+                 max_carveout_blocks_per_sm(kernel));
+        run_l3(kernel, l3_8_name);
+    }
 
     // Lookback statistics from an instrumented copy of L3,
     // summed over STATS_LAUNCHES launches. Diagnostic only: the counter
@@ -883,6 +918,11 @@ int main(int argc, char** argv) {
         print_lookback_stats(name);
     };
     run_stats(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true>, "L3");
+    {
+        auto kernel = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true, 8>;
+        max_carveout_blocks_per_sm(kernel);
+        run_stats(kernel, "L3 min 8 blocks/SM");
+    }
 
     free(h_states);
 
