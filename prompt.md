@@ -580,6 +580,57 @@ sleep base (200 ns + 50 × (tile % 8)) varied:
 At 1159 GB/s (85% of memcpy) the add version is roughly what the decoupled
 look-back protocol achieves here; the gap to it is the compose chain.
 
+### Pipelined two-window lookback
+
+To shorten the compose chain inside the lookback, a pipelined variant loaded
+two 32-tile windows per round trip, prefetched the next pair while reducing,
+reduced both windows in one interleaved shuffle/compose loop, and waited only
+on INVALID lanes up to a window's first INCLUSIVE/OOB lane.
+
+| | `p1_vec_pipe` | pipelined | `p1_vec_pipe`, add | pipelined, add |
+|---|---|---|---|---|
+| time | 1490 μs | 1616 μs | 1351 μs | 1578 μs |
+| re-polls per tile | 1.47 | 2.65 | 1.83 | 2.93 |
+| windows / depth | 3.25 / 78 | 4.02 / 106 | 3.06 / 72 | 3.86 / 101 |
+
+Why it failed: the speculatively loaded windows are **stale**. Window B (and
+the next pair) is loaded together with window A; by the time A turns out to
+have no INCLUSIVE tile, B's data is older than a fresh load after the usual
+350 ns wait would be, so it more often still shows INVALID lanes, each costing
+a re-poll (350 ns sleep + round trip). The longer lookback deepened the band
+(depth 106), adding windows. It lost with the add operator too, so the
+protocol, not compose, was the problem. (A synthetic unit test of the
+lookback — 216 cases, mutation-checked — passed; the variant was correct.)
+
+### Comparison with the decoupled look-back paper
+
+Merrill & Garland, *Single-pass Parallel Prefix Scan with Decoupled
+Look-back* (NVIDIA NVR-2016-002; copy in `.claude-artifacts/`). Their ceiling
+is memcpy ("an ideal performance ceiling for prefix scan because it shares
+the same minimum I/O workload"); for 32-bit integer prefix sum CUB matches it
+on K40/M40 (26.7 vs 26.8 and 30.8 vs 31.0 G items/s) and reaches ~91% on the
+C2050 — 80% of that card's stated 144 GB/s theoretical bandwidth.
+
+We already use the paper's key techniques (parallel warp-wide look-back
+window, fence-free combined status/value word, aggregate/prefix protocol).
+Two differences explain the larger gap here:
+
+1. **Operator.** Addition needs no memory access; compose is a shared-memory
+   table lookup on the look-back's dependent reduction chain. Same kernel:
+   add 1351 μs (86% of memcpy) vs compose 1490 μs (78%). The add variant is
+   the realistic upper bound for this design, not memcpy parity.
+2. **Tile rate.** Each look-back costs a roughly fixed latency, so the number
+   of tiles per second matters. The paper's setting (M40, 8 B per 32-bit item,
+   2048-item tiles in their example) is ~15M tiles/s; P1 on the A100 (3 B per
+   item, 6144-item tiles, at memcpy speed) would be ~74M tiles/s — ~5× less
+   time per tile to hide the same latency. The paper notes that when
+   signalling latency limits throughput, larger partitions are the remedy.
+
+| | % of theoretical (1555 GB/s) | % of memcpy (1356 GB/s) |
+|---|---|---|
+| `p1_vec_pipe`, compose (1057 GB/s) | 68% | 78% |
+| `p1_vec_pipe`, integer add (1164 GB/s) | 75% | 86% |
+
 ### Dedicated lookback warp (`p1_vec_lbwarp`)
 
 Persistent, `cp.async` prefetch, 288 threads = 8 compute warps + 1 lookback
@@ -712,11 +763,10 @@ a faster per-thread reduce (no effect), a one-round deferred lookback
 (predecessors not published earlier on the A100) and a dedicated lookback
 warp (later INCLUSIVE publication, lower occupancy); first-poll sleep
 tuning has no effect. An integer-add operator shows ~133 μs of the ~240 μs
-is the compose chain inside the lookback's window reductions. Being
-measured: a pipelined lookback (`PIPELINED_LB`: two windows loaded per
-round trip, next pair prefetched while reducing, the two window reductions
-interleaved, and waiting only on INVALID lanes up to a window's first
-INCLUSIVE/OOB lane). `p1_vec_pipe` has also been ported into the
+is the compose chain inside the lookback's window reductions; a pipelined
+two-window lookback made it worse (stale speculative loads). Being measured:
+the V ladder at 512 threads per block (half the tile rate; see "Comparison
+with the decoupled look-back paper"). `p1_vec_pipe` has also been ported into the
 single-pass lexer (`lexerVecPipe` in `cuda_lexer.cu`).
 
 Two-kernel reduce-then-scan is no longer an option: its traffic floor
