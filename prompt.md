@@ -66,7 +66,9 @@ target 6 blocks/SM, reducing register count from 47 to 40.
 
 Input: `data/tokens_dense_500MiB.in` — 500 MiB of dense token data.
 
-Hardware: **NVIDIA A100 (sm_80)**, 108 SMs, 2 TB/s HBM2e bandwidth.
+Hardware: **NVIDIA A100 (sm_80)**, 108 SMs. Spec DRAM bandwidth depends on the
+model (40 GB HBM2: ~1.55 TB/s; 80 GB HBM2e: ~2 TB/s); which model the cluster
+node has is not recorded here.
 
 All timings are mean over 100 runs with 500 warmup iterations, reported as
 `μs` with 95% CI and effective GB/s (input bytes read + output bytes written).
@@ -88,9 +90,10 @@ BW ceiling BS256/IPT22 (read only):    537μs   1332 GB/s
 2Pass P1 BS128/IPT15 (cub-style):     2794μs    563 GB/s
 ```
 
-The BW ceiling (read-only, no scan) achieves 1332 GB/s — essentially saturating
-HBM2e. `p1_transpose` achieves 841 GB/s, roughly **63% of the memory bandwidth
-ceiling**. IPT=22 was confirmed optimal by a sweep over IPT=16/20/24/28/32.
+The BW ceiling (read-only, no scan) achieves 1332 GB/s — ~66% of spec on an
+80 GB A100, ~85% on a 40 GB A100. It is the best this load pattern achieved,
+not a proven DRAM limit. `p1_transpose` achieves 841 GB/s, roughly **63% of
+that measured ceiling**. IPT=22 was confirmed optimal by a sweep over IPT=16/20/24/28/32.
 
 Notably, `p1_transpose` at 841 GB/s exceeds the `add_scan` baseline at 771 GB/s,
 meaning DFA composition + transpose outperforms plain integer addition with the
@@ -164,10 +167,14 @@ lower per-tile throughput than 256T/22IPT.
    more instruction-efficient than the manual blocked layout + u64 store loop.
 3. **Higher occupancy** — 73.6% vs 67.6%, closer to the 75% theoretical ceiling.
 
-**The occupancy improvement** is because `p1_transpose` uses only static shmem
-(12.08 KiB/block) vs NregNone's static + dynamic (1.41 + 11.26 = 12.67 KiB).
-The smaller total footprint allows the 7th block/SM to fit, raising achieved
-occupancy.
+**The occupancy improvement is not explained by shmem.** Theoretical occupancy
+is capped at 6 blocks/SM (75%) by registers: 40 regs × 256 threads = 10,240
+regs/block, and 65,536 / 10,240 = 6. A 7th block cannot fit regardless of
+shmem, and 6 blocks × 12.67 KiB ≈ 76 KiB is well under the SM's shmem
+capacity, so shmem does not limit either kernel. Both kernels share the same
+75% ceiling; the gain from 67.6% to 73.6% *achieved* occupancy comes from
+something else (e.g. less time with blocks stalled or idle at barriers, or a
+smaller tail effect). The cause has not been determined.
 
 **Why `p1_transpose` has more barrier stall (47% vs 36%):**
 The warp-transpose requires an additional `__syncthreads()` between the load
@@ -194,10 +201,11 @@ available to hide the lookback latency, and it ends up slower overall.
 dominant bottleneck is the CTA barrier stall from the decoupled lookback
 algorithm: ~47% of warp cycles stalled at barriers.
 
-## Why 841 GB/s Is the Practical Ceiling
+## Remaining Headroom
 
-Two optimisations were investigated after `p1_transpose` was established as the
-best variant:
+Two barrier-reduction ideas were investigated after `p1_transpose` was
+established as the best variant. Both were ruled out, but neither result bounds
+P1 throughput — see "What these results do not show" below.
 
 ### 1. Removing the post-load `__syncthreads()`
 
@@ -213,26 +221,51 @@ source confirmed this sync is **load-bearing and cannot be removed**:
 
 ### 2. Switching to `BLOCK_SCAN_RAKING_MEMOIZE`
 
-Counted `__syncthreads()` calls in the two `BlockScan` specialisations:
+Counted `__syncthreads()` occurrences in the CUB source of the two `BlockScan`
+specialisations:
 
-| Algorithm | Internal `__syncthreads()` calls |
+| Algorithm | `__syncthreads()` in source |
 |---|---|
 | `BLOCK_SCAN_WARP_SCANS` | 3 |
 | `BLOCK_SCAN_RAKING` / `RAKING_MEMOIZE` | 16 |
 
-`BLOCK_SCAN_WARP_SCANS` is already the minimum-barrier option. Switching to
-raking would add 13 more barriers per tile and make performance worse.
+These are source occurrences, not barriers executed per tile (some sit in
+alternative code paths). Raking was not benchmarked; `WARP_SCANS` is kept
+because it is very likely the lower-barrier option.
 
-### Conclusion
+### What these results do not show
 
-All `__syncthreads()` calls in `p1_transpose` are load-bearing. The 47% CTA
-barrier stall is the minimum achievable for decoupled lookback at 256T/22IPT.
-**841 GB/s is the practical ceiling for this algorithm on A100.**
+The investigations above show that **no barrier in `p1_transpose` can be
+deleted**. They do not show that the barrier *stall* is minimal, or that
+841 GB/s is a ceiling:
 
-The only path to further improvement is a fundamentally different scan
-algorithm — e.g. a two-kernel reduce-then-scan — but that adds a second
-kernel launch and a full extra pass over the input, which is unlikely to
-improve end-to-end throughput.
+- **Barrier stall measures waiting, not barrier count.** In decoupled lookback,
+  one warp performs the lookback while the other warps of the block wait at the
+  next `__syncthreads()`. The 47% CTA-barrier stall therefore largely reflects
+  **lookback latency** exposed through a barrier. Reducing that latency, or
+  overlapping it with useful work, would reduce the stall without removing any
+  barrier.
+- **Decoupled lookback is not inherently this far from bandwidth.** CUB's
+  `DeviceScan` gets close to memcpy throughput for primitive operators. The gap
+  here is specific to this kernel/operator, not a property of single-pass scans.
+
+### Traffic floor
+
+P1 moves 3 bytes per input byte (1 byte read, 2-byte `state_t` written).
+For the 500 MiB input:
+
+| | Bytes moved | Time at 1332 GB/s |
+|---|---|---|
+| P1 (single pass) | 1573 MB | ~1180 μs |
+| Reduce-then-scan (input read twice) | 2097 MB | ~1574 μs |
+| `p1_transpose` measured | 1573 MB | **1870 μs** |
+
+(1332 GB/s is the measured read-only ceiling, not the A100's spec bandwidth.)
+
+A two-kernel reduce-then-scan has a traffic floor **below** the current
+measured time, so it cannot be dismissed on bandwidth grounds. Whether it wins
+depends on how close each of its passes gets to the ceiling; it has not been
+implemented.
 
 ## What We Tried and Why It Didn't Help
 
@@ -283,21 +316,29 @@ The final gain (warp-transpose) works by eliminating shmem store bank conflicts
 and reducing total instruction count, at the cost of more barrier stall per
 instruction. The net effect is strongly positive.
 
-## Conclusion — P1 is Done
+## Conclusion — Current State of P1
 
-`p1_transpose` at **841 GB/s** is the final optimised P1 kernel. All known
-optimisation levers have been exhausted:
+`p1_transpose` at **841 GB/s** (1870 μs) is the best P1 kernel so far and the
+only variant still in `p1_bench.cu`. The other variants listed above were
+removed from the code; their numbers are kept as a historical record.
 
-- IPT=22, BS=256 is the optimal tile configuration (sweep confirmed).
-- `BLOCK_LOAD/STORE_WARP_TRANSPOSE` eliminates shmem bank conflicts and
-  reduces instruction count, giving +144 GB/s over the manual blocked layout.
-- `st.relaxed.gpu` tile state stores replace `__threadfence()`, giving +54 GB/s.
+Levers exhausted **within the current kernel design**:
+
+- IPT=22, BS=256 is the best tile configuration of those swept (16–32).
+- `BLOCK_LOAD/STORE_WARP_TRANSPOSE` eliminates shmem store bank conflicts and
+  reduces instruction count: +144 GB/s over the manual blocked layout.
+- `st.relaxed.gpu` tile state stores replace `__threadfence()`: +54 GB/s.
 - Static shmem for tables and `__launch_bounds__(256,6)` gave earlier gains.
-- All `__syncthreads()` calls are load-bearing — none can be removed.
-- `BLOCK_SCAN_WARP_SCANS` is already the minimum-barrier BlockScan algorithm.
+- No `__syncthreads()` can be deleted.
 - Static `blockIdx.x` assignment and tile-0 fast path have no measurable effect.
 
-The remaining 37% gap to the BW ceiling (841 vs 1332 GB/s) is the irreducible
-cost of the decoupled lookback algorithm: ~47% of warp cycles stall at CTA
-barriers from the intra-block scan and cross-tile lookback. This is
-fundamental to any single-pass prefix scan with a data-dependent operator.
+The remaining gap is 1870 μs measured vs a ~1180 μs traffic floor (63% of the
+read-only ceiling). The dominant cost is ~47% of warp cycles stalled at CTA
+barriers, mostly waiting for the cross-tile lookback. This gap is **not shown
+to be irreducible**. Open directions:
+
+1. **Reduce exposed lookback latency** — e.g. start the lookback earlier in the
+   tile so it overlaps the load and intra-block scan, instead of waiting at a
+   barrier afterwards.
+2. **Two-kernel reduce-then-scan** — traffic floor ~1574 μs, below the current
+   1870 μs; not yet implemented or measured.
