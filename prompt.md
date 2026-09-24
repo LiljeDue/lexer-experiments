@@ -336,6 +336,38 @@ publishing INCLUSIVE — about the duration of one lookback:
 So changing how many tiles or windows the lookback walks does not shorten it.
 The cost is that 7 of 8 warps of every block sit idle for ~1.4 μs per tile.
 
+### Vectorized load/store (`p1_vec`)
+
+The block scan was bound by load/store-unit (MIO) throughput, and ~7 of ~9
+memory-pipe instructions per element came from the byte-granular load/store
+path (see "Memory-pipe instructions per element"). `p1_vec` keeps the same
+blocked-register scan (CUB `BlockScan`, same lookback) but moves 8-byte input
+vectors and 16-byte output vectors:
+
+- load: 3 × `LDG.64` per lane (256 contiguous bytes per warp instruction) →
+  `STS.64` into a per-warp buffer → `LDS.64` of the lane's own 24 bytes →
+  `to_state[]`
+- store: states packed 8 per 16 bytes → `STS.128` (blocked) → `LDS.128`
+  (striped) → `STG.128` (512 contiguous bytes per warp instruction)
+- the exchanges are warp-local (`__syncwarp` only), removing
+  `p1_transpose`'s two block barriers around load and store; at IPT=24 all
+  four shmem patterns are bank-conflict-free (lane strides of 6 / 12 words)
+
+~3.75 memory-pipe instructions per element instead of ~9.
+
+| Step | L (IPT=22) | V (IPT=24) |
+|---|---|---|
+| 1: load/store | 1237 μs | 1256 μs |
+| 2: + block scan | 1523 μs (+286) | 1245 μs (−11) |
+| 3: + lookback | 1876 μs (+353) | **1530 μs** (+285) |
+
+The block scan is now completely hidden behind memory time (V2 ≈ V1): with
+the load/store path no longer saturating the MIO queue, the scan's two
+compose lookups per element fit in the shadow of the loads. The lookback is
+the only remaining cost. (V uses IPT=24 vs L's 22; the earlier IPT sweep had
+24 slightly *worse* than 22 on the old path, so the gain is the
+vectorization.)
+
 ## What We Tried and Why It Didn't Help
 
 ### Removing the lookback sleeps (sleep modes)
@@ -474,46 +506,43 @@ atomic counter was not the bottleneck.
 | `__launch_bounds__(256,6)` on sm_80 | ~560 GB/s | 642 GB/s | ~80 GB/s |
 | `st.relaxed.gpu` tile state stores | 642 GB/s | 697 GB/s | +54 GB/s |
 | `BLOCK_LOAD/STORE_WARP_TRANSPOSE` | 697 GB/s | 841 GB/s | +144 GB/s |
+| Vectorized load/store (`p1_vec`, IPT=24) | 838 GB/s (1876 μs) | 1028 GB/s (1530 μs) | +190 GB/s |
 
-The final gain (warp-transpose) works by eliminating shmem store bank conflicts
-and reducing total instruction count, at the cost of more barrier stall per
-instruction. The net effect is strongly positive.
+The warp-transpose gain came from eliminating shmem store bank conflicts and
+reducing instruction count. The vectorized load/store gain came from cutting
+memory-pipe instructions per element from ~9 to ~3.75, which makes the block
+scan free (see "Vectorized load/store").
 
 ## Conclusion — Current State of P1
 
-`p1_transpose` at **841 GB/s** (1870 μs) is the best P1 kernel so far and the
-only variant still in `p1_bench.cu`. The other variants listed above were
-removed from the code; their numbers are kept as a historical record.
+`p1_vec<256, 24, 3>` (V3) at **1530 μs / 1028 GB/s** is the best P1 kernel.
+`p1_transpose` (1876 μs) stays in `p1_bench.cu` as the L3 reference; the other
+variants listed above were removed from the code and their numbers are kept
+as a historical record.
 
-Levers exhausted **within the current kernel design**:
+Where the time goes (V ladder): load/store at the practical speed of light
+(V1 1256 μs vs 1159 μs u16 floor), block scan free (V2 1245 μs), lookback
++285 μs. V3 is at 82% of V1 and 76% of the u16 floor.
 
-- IPT=22, BS=256 is the best tile configuration of those swept (IPT 16–32,
-  BS 128/256/512/1024).
-- Lookback sleep changes, a 64-tile lookback window, column compose and
-  8 blocks/SM (with or without register packing / carveout changes) all
-  made P1 slower or had no effect (see "What We Tried").
-- `BLOCK_LOAD/STORE_WARP_TRANSPOSE` eliminates shmem store bank conflicts and
-  reduces instruction count: +144 GB/s over the manual blocked layout.
+Levers exhausted:
+
+- Lookback sleep changes, a 64-tile lookback window, larger blocks, column
+  compose and 8 blocks/SM for the IPT=22 kernel (with or without register
+  packing / carveout changes) all made P1 slower or had no effect (see
+  "What We Tried").
+- `BLOCK_LOAD/STORE_WARP_TRANSPOSE` (+144 GB/s) and then vectorized
+  warp-local exchanges (+190 GB/s) removed the load/store path's cost.
 - `st.relaxed.gpu` tile state stores replace `__threadfence()`: +54 GB/s.
 - Static shmem for tables and `__launch_bounds__(256,6)` gave earlier gains.
-- No `__syncthreads()` can be deleted.
 - Static `blockIdx.x` assignment and tile-0 fast path have no measurable effect.
 
-The remaining gap is 1870 μs measured vs a ~1180 μs traffic floor (63% of the
-read-only ceiling). The dominant cost is ~47% of warp cycles stalled at CTA
-barriers, mostly waiting for the cross-tile lookback. This gap is **not shown
-to be irreducible**. Open directions:
+Open directions — the remaining gap is the lookback (~285 μs):
 
 1. **Hide the lookback instead of shortening it** — the lookback takes
    ~1.4 μs per tile regardless of sleeps, window size or tile count (see
    "Lookback statistics"); the cost is the block's other warps idling for
-   it. Shortening it (sleep changes, 64-tile window, larger blocks) failed.
-   More resident warps hide it but cost registers (see "More resident
-   blocks").
-2. **Cut load/store-unit work in the load/store path** — ~7 of ~9
-   memory-pipe instructions per element are the byte-granular load/store
-   path. Being measured: `p1_vec` (V1/V2/V3, IPT=24) with 8-byte loads,
-   16-byte stores and warp-local, bank-conflict-free exchanges (~3.75
-   instructions per element).
-3. **Two-kernel reduce-then-scan** — traffic floor ~1574 μs, below the current
-   1870 μs; not yet implemented or measured.
+   it. More resident warps hide it; for `p1_transpose` that cost registers
+   and spills on a saturated LSU (see "More resident blocks"). Being
+   measured for V3, whose LSU now has headroom: 8 blocks/SM, and IPT=16/32.
+2. **Two-kernel reduce-then-scan** — traffic floor ~1574 μs, now *above*
+   V3's 1530 μs, so it can no longer win on traffic.

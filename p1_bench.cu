@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cassert>
 #include <cmath>
+#include <algorithm>
 #include <type_traits>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
@@ -362,10 +363,13 @@ static void initScanTileState(ScanTileState& ts, int num_tiles) {
 
 // minnctapersm=6 is valid only on sm_80+ (A100 has 65536 regs/SM;
 // 6*256*40 = 61440 <= 65536). sm_75 has only 32768 and would warn.
+// LB_P1_MIN(8) caps registers at 32 (8*256*32 = 65536) for 8 blocks/SM.
 #if __CUDA_ARCH__ >= 800
 #define LB_P1 __launch_bounds__(256, 6)
+#define LB_P1_MIN(MIN_BLOCKS) __launch_bounds__(256, MIN_BLOCKS)
 #else
 #define LB_P1 __launch_bounds__(256)
+#define LB_P1_MIN(MIN_BLOCKS) __launch_bounds__(256)
 #endif
 
 
@@ -682,9 +686,15 @@ void p1_ladder(
 //   STEP 1: load/store only (like p1_ladder STEP 1).
 //   STEP 2: + BlockScan, no lookback (like p1_ladder STEP 2).
 //   STEP 3: + decoupled lookback (like p1_transpose).
+// STATS: record lookback statistics (STEP 3). MIN_BLOCKS: launch-bounds
+// minimum blocks/SM (6 = <= 40 registers, 8 = <= 32 registers).
+// Other ITEMS_PER_THREAD multiples of 8 work but, unlike 24, have 2-4 way
+// bank conflicts on the blocked shmem accesses (lane strides of 4/8 or
+// 8/16 words).
 // ---------------------------------------------------------------------------
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t STEP>
-__global__ LB_P1
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t STEP, bool STATS = false,
+         uint32_t MIN_BLOCKS = 6>
+__global__ LB_P1_MIN(MIN_BLOCKS)
 void p1_vec(
     state_t* __restrict__ d_compose_glb,
     state_t* __restrict__ d_to_state_glb,
@@ -700,7 +710,7 @@ void p1_vec(
     constexpr uint32_t TILE       = BLOCK_SIZE * ITEMS_PER_THREAD;
 
     using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
-    using PrefixOp   = PrefixCallbackOp<ComposeOp>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOp, STATS>;
 
     // Per-warp exchange buffer: input bytes on load, output states on store.
     __shared__ __align__(16) uint32_t xbuf[BLOCK_SIZE / WARP][WARP_ITEMS * sizeof(state_t) / 4];
@@ -832,6 +842,18 @@ static void reset(ScanTileState& ts, uint32_t nlb) {
     initScanTileState(ts, (int)nlb);
 }
 
+// Requests the maximum shared memory carveout for kernel (8 blocks/SM x
+// ~14 KB exceeds the default 100 KB configuration) and returns the resulting
+// resident blocks per SM.
+template<typename KernelT>
+static int max_shared_blocks_per_sm(KernelT kernel) {
+    gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                   (int)cudaSharedmemCarveoutMaxShared));
+    int blocks = 0;
+    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, BLOCK_SIZE, 0));
+    return blocks;
+}
+
 static void reset_lookback_stats() {
     void* p;
     gpuAssert(cudaGetSymbolAddress(&p, g_lookback_stats));
@@ -883,6 +905,9 @@ int main(int argc, char** argv) {
     assert(input_size <= UINT32_MAX && "input exceeds uint32_t range");
     uint32_t size = (uint32_t)input_size;
     uint32_t nlb  = num_tiles(size);
+    // Tile state array: sized for the most tiles any variant uses (p1_vec at
+    // IPT=16).
+    const uint32_t max_tiles = std::max(nlb, (size + BLOCK_SIZE * 16 - 1) / (BLOCK_SIZE * 16));
 
     printf("%s  (%zu bytes, %u tiles)\n\n", argv[1], input_size, nlb);
 
@@ -897,7 +922,7 @@ int main(int argc, char** argv) {
     gpuAssert(cudaMalloc(&d_states_out,   (size_t)size * sizeof(state_t)));
     gpuAssert(cudaMalloc(&d_compose_glb,  sizeof(h_compose)));
     gpuAssert(cudaMalloc(&d_to_state_glb, sizeof(h_to_state)));
-    gpuAssert(cudaMalloc(&ts.d_tile_descriptors, ScanTileState::AllocationSize(nlb)));
+    gpuAssert(cudaMalloc(&ts.d_tile_descriptors, ScanTileState::AllocationSize(max_tiles)));
 
     gpuAssert(cudaMemcpy(d_in,           input,     (size_t)size * sizeof(uint8_t), cudaMemcpyHostToDevice));
     gpuAssert(cudaMemcpy(d_compose_glb,  h_compose, sizeof(h_compose),              cudaMemcpyHostToDevice));
@@ -989,37 +1014,48 @@ int main(int argc, char** argv) {
     };
     run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD>, "L3 + lookback (p1_transpose):");
 
-    // Vectorized load/store ladder at IPT=24: V1 ~ L1, V2 ~ L2, V3 ~ L3.
-    printf("\nVectorized load/store (IPT=24, u16 out):\n");
-    {
-        constexpr uint32_t VEC_IPT = 24;
-        const uint32_t vec_tiles = (size + BLOCK_SIZE * VEC_IPT - 1) / (BLOCK_SIZE * VEC_IPT);
-        assert(vec_tiles <= nlb && "tile state array is sized for nlb tiles");
-        auto run_vec = [&](auto kernel, uint32_t step, const char* name) {
-            auto prep   = [&] { if (step == 3) reset(ts, vec_tiles); };
-            auto launch = [&] {
-                kernel<<<vec_tiles, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
-            };
-            poison_out(); prep(); launch(); fetch_states();
-            if (!check_states(input, size, h_states, step >= 2,
-                              step == 2 ? BLOCK_SIZE * VEC_IPT : 0, name)) exit(1);
-            bench(name, u16_bytes, prep, launch);
-        };
-        run_vec(p1_vec<BLOCK_SIZE, VEC_IPT, 1>, 1, "V1 vec load/store:");
-        run_vec(p1_vec<BLOCK_SIZE, VEC_IPT, 2>, 2, "V2 + block scan (no lookback):");
-        run_vec(p1_vec<BLOCK_SIZE, VEC_IPT, 3>, 3, "V3 + lookback:");
-    }
-
-    // Lookback statistics from an instrumented copy of L3,
-    // summed over STATS_LAUNCHES launches. Diagnostic only: the counter
-    // atomics perturb timing, so no times are reported.
-    constexpr uint32_t STATS_LAUNCHES = 10;
-    printf("\nLookback stats (instrumented L3, %u launches):\n", STATS_LAUNCHES);
-    auto run_stats = [&](auto kernel, const char* name) {
+    // Vectorized load/store ladder: V1 ~ L1, V2 ~ L2, V3 ~ L3 at IPT=24, then
+    // V3 at 8 blocks/SM and V2/V3 at IPT=16 and IPT=32.
+    printf("\nVectorized load/store (u16 out):\n");
+    auto run_vec = [&](auto kernel, uint32_t ipt, uint32_t step, const char* name) {
+        int bps = 0;
+        gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, BLOCK_SIZE, 0));
+        char full_name[80];
+        snprintf(full_name, sizeof(full_name), "%s [%d/SM]", name, bps);
+        const uint32_t tiles = (size + BLOCK_SIZE * ipt - 1) / (BLOCK_SIZE * ipt);
+        assert(tiles <= max_tiles && "tile state array too small");
+        auto prep   = [&] { if (step == 3) reset(ts, tiles); };
         auto launch = [&] {
-            reset(ts, nlb);
-            kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
+            kernel<<<tiles, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
         };
+        poison_out(); prep(); launch(); fetch_states();
+        if (!check_states(input, size, h_states, step >= 2,
+                          step == 2 ? BLOCK_SIZE * ipt : 0, full_name)) exit(1);
+        bench(full_name, u16_bytes, prep, launch);
+    };
+    run_vec(p1_vec<BLOCK_SIZE, 24, 1>, 24, 1, "V1 vec load/store (IPT=24):");
+    run_vec(p1_vec<BLOCK_SIZE, 24, 2>, 24, 2, "V2 + block scan (no lookback):");
+    run_vec(p1_vec<BLOCK_SIZE, 24, 3>, 24, 3, "V3 + lookback:");
+    {
+        auto kernel = p1_vec<BLOCK_SIZE, 24, 3, false, 8>;
+        max_shared_blocks_per_sm(kernel);   // carveout so 8 x ~14 KB fits
+        run_vec(kernel, 24, 3, "V3 min 8 blocks/SM:");
+    }
+    run_vec(p1_vec<BLOCK_SIZE, 16, 2>, 16, 2, "V2 IPT=16:");
+    run_vec(p1_vec<BLOCK_SIZE, 16, 3>, 16, 3, "V3 IPT=16:");
+    // IPT=32 uses ~17 KB shmem/block: 6 blocks exceed the default 100 KB carveout.
+    max_shared_blocks_per_sm(p1_vec<BLOCK_SIZE, 32, 2>);
+    max_shared_blocks_per_sm(p1_vec<BLOCK_SIZE, 32, 3>);
+    run_vec(p1_vec<BLOCK_SIZE, 32, 2>, 32, 2, "V2 IPT=32:");
+    run_vec(p1_vec<BLOCK_SIZE, 32, 3>, 32, 3, "V3 IPT=32:");
+
+    // Lookback statistics from instrumented copies of L3 and V3, summed over
+    // STATS_LAUNCHES launches. Diagnostic only: the counter atomics perturb
+    // timing, so no times are reported.
+    constexpr uint32_t STATS_LAUNCHES = 10;
+    printf("\nLookback stats (instrumented, %u launches):\n", STATS_LAUNCHES);
+    auto run_stats = [&](uint32_t tiles, auto launch_kernel, const char* name) {
+        auto launch = [&] { reset(ts, tiles); launch_kernel(); };
         poison_out(); launch(); fetch_states();
         if (!check_states(input, size, h_states, true, 0, name)) exit(1);
         reset_lookback_stats();
@@ -1029,7 +1065,20 @@ int main(int argc, char** argv) {
         }
         print_lookback_stats(name);
     };
-    run_stats(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true>, "L3");
+    run_stats(nlb, [&] {
+        p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true><<<nlb, BLOCK_SIZE>>>(
+            d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size, nlb);
+    }, "L3");
+    const uint32_t tiles24 = (size + BLOCK_SIZE * 24 - 1) / (BLOCK_SIZE * 24);
+    run_stats(tiles24, [&] {
+        p1_vec<BLOCK_SIZE, 24, 3, true><<<tiles24, BLOCK_SIZE>>>(
+            d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
+    }, "V3");
+    max_shared_blocks_per_sm(p1_vec<BLOCK_SIZE, 24, 3, true, 8>);
+    run_stats(tiles24, [&] {
+        p1_vec<BLOCK_SIZE, 24, 3, true, 8><<<tiles24, BLOCK_SIZE>>>(
+            d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
+    }, "V3 min 8 blocks/SM");
 
     free(h_states);
 
