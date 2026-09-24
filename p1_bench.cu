@@ -360,18 +360,17 @@ static void initScanTileState(ScanTileState& ts, int num_tiles) {
 // P1 kernels
 // ---------------------------------------------------------------------------
 
-// minnctapersm (MIN_BLOCKS) is valid only on sm_80+ (A100 has 65536
-// regs/SM): 6 blocks -> <= 40 regs (6*256*40 = 61440), 8 blocks -> <= 32
-// regs (8*256*32 = 65536). sm_75 has only 32768 and would warn.
+// minnctapersm=6 is valid only on sm_80+ (A100 has 65536 regs/SM;
+// 6*256*40 = 61440 <= 65536). sm_75 has only 32768 and would warn.
 #if __CUDA_ARCH__ >= 800
-#define LB_P1(MIN_BLOCKS) __launch_bounds__(256, MIN_BLOCKS)
+#define LB_P1 __launch_bounds__(256, 6)
 #else
-#define LB_P1(MIN_BLOCKS) __launch_bounds__(256)
+#define LB_P1 __launch_bounds__(256)
 #endif
 
 
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false, uint32_t MIN_BLOCKS = 6>
-__global__ LB_P1(MIN_BLOCKS)
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool STATS = false>
+__global__ LB_P1
 void p1_transpose(
     state_t* __restrict__ d_compose_glb,
     state_t* __restrict__ d_to_state_glb,
@@ -604,8 +603,8 @@ void map_only_u16_coalesced(
 //           IDENTITY independently. Output is a per-tile scan (not valid P1).
 // STEP 3 is p1_transpose itself (+ decoupled lookback).
 // ---------------------------------------------------------------------------
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t STEP, uint32_t MIN_BLOCKS = 6>
-__global__ LB_P1(MIN_BLOCKS)
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t STEP>
+__global__ LB_P1
 void p1_ladder(
     state_t* __restrict__ d_compose_glb,
     state_t* __restrict__ d_to_state_glb,
@@ -663,18 +662,30 @@ void p1_ladder(
 }
 
 // ---------------------------------------------------------------------------
-// Register-packed P1: the in-thread scan loops hold two u16 states per
-// 32-bit register (pk[j] = st[2j] | st[2j+1] << 16), halving the registers
-// the states occupy during the scan so that 8 blocks/SM (<= 32 registers)
-// can fit without spilling. BlockScan scans only the per-thread aggregates
-// (one item per thread).
-//   LOOKBACK = false: every tile scans from IDENTITY (like p1_ladder STEP 2;
-//                     output is not valid P1).
-//   LOOKBACK = true:  full P1 with decoupled lookback.
+// Vectorized P1 ladder: same blocked-register scan as p1_transpose, but the
+// load/store path moves 8-byte input vectors and 16-byte output vectors
+// instead of one byte / one state per instruction.
+//
+// Exchanges are warp-local (each warp owns WARP * ITEMS_PER_THREAD
+// consecutive elements), so they need only __syncwarp, no block barrier:
+//   load:  lane loads 8-byte vectors striped over its warp's segment
+//          (LDG.64, 256 contiguous bytes per warp instruction), writes them
+//          to the warp's shmem buffer (STS.64) and reads back its own
+//          ITEMS_PER_THREAD contiguous bytes (LDS.64); then byte -> state via
+//          to_state[].
+//   store: lane packs its states 8 per 16-byte vector, writes them blocked
+//          (STS.128), reads back striped (LDS.128) and stores (STG.128, 512
+//          contiguous bytes per warp instruction).
+// With ITEMS_PER_THREAD = 24 all four shmem access patterns are free of bank
+// conflicts (lane strides of 6 and 12 words). The last, partial tile uses a
+// scalar path.
+//   STEP 1: load/store only (like p1_ladder STEP 1).
+//   STEP 2: + BlockScan, no lookback (like p1_ladder STEP 2).
+//   STEP 3: + decoupled lookback (like p1_transpose).
 // ---------------------------------------------------------------------------
-template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, bool LOOKBACK, uint32_t MIN_BLOCKS = 6>
-__global__ LB_P1(MIN_BLOCKS)
-void p1_packed(
+template<uint32_t BLOCK_SIZE, uint32_t ITEMS_PER_THREAD, uint32_t STEP>
+__global__ LB_P1
+void p1_vec(
     state_t* __restrict__ d_compose_glb,
     state_t* __restrict__ d_to_state_glb,
     const uint8_t* __restrict__ d_in,
@@ -682,96 +693,98 @@ void p1_packed(
     ScanTileState tile_state,
     uint32_t size)
 {
-    static_assert(ITEMS_PER_THREAD % 2 == 0, "ITEMS_PER_THREAD must be even");
-    constexpr uint32_t PAIRS = ITEMS_PER_THREAD / 2;
+    static_assert(STEP >= 1 && STEP <= 3, "STEP must be 1, 2 or 3");
+    static_assert(ITEMS_PER_THREAD % 8 == 0, "ITEMS_PER_THREAD must be a multiple of 8");
+    constexpr uint32_t VECS       = ITEMS_PER_THREAD / 8;   // 8-byte loads = 16-byte stores per lane
+    constexpr uint32_t WARP_ITEMS = WARP * ITEMS_PER_THREAD;
+    constexpr uint32_t TILE       = BLOCK_SIZE * ITEMS_PER_THREAD;
 
-    using TransformIter = thrust::transform_iterator<ByteToState, const uint8_t*>;
-    using BlockLoadT  = cub::BlockLoad <state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
-                                        cub::BLOCK_LOAD_WARP_TRANSPOSE>;
-    using BlockStoreT = cub::BlockStore<state_t, BLOCK_SIZE, ITEMS_PER_THREAD,
-                                        cub::BLOCK_STORE_WARP_TRANSPOSE>;
-    using BlockScanT  = cub::BlockScan <state_t, BLOCK_SIZE,
-                                        cub::BLOCK_SCAN_WARP_SCANS>;
-    using PrefixOp    = PrefixCallbackOp<ComposeOp>;
+    using BlockScanT = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
+    using PrefixOp   = PrefixCallbackOp<ComposeOp>;
 
-    __shared__ union {
-        typename BlockLoadT::TempStorage  load;
-        typename BlockStoreT::TempStorage store;
-        struct {
-            typename PrefixOp::TempStorage  prefix;
-            typename BlockScanT::TempStorage scan;
-        } scan_storage;
-    } temp;
-
+    // Per-warp exchange buffer: input bytes on load, output states on store.
+    __shared__ __align__(16) uint32_t xbuf[BLOCK_SIZE / WARP][WARP_ITEMS * sizeof(state_t) / 4];
+    __shared__ typename BlockScanT::TempStorage scan_temp;
+    __shared__ typename PrefixOp::TempStorage   prefix_temp;
     __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
     __shared__ __align__(8) state_t shmem_to_state[256];
 
     loadTablesToShmem<BLOCK_SIZE>(
         d_compose_glb, d_to_state_glb, shmem_compose, shmem_to_state);
 
-    uint32_t tile_idx = blockIdx.x;
-    uint32_t glb_offs = tile_idx * BLOCK_SIZE * ITEMS_PER_THREAD;
-    uint32_t valid    = (uint32_t)min((uint64_t)BLOCK_SIZE * ITEMS_PER_THREAD,
-                                      (uint64_t)size - glb_offs);
-
-    ByteToState byte_to_state{shmem_to_state};
-    TransformIter d_in_states(d_in + glb_offs, byte_to_state);
-    uint32_t pk[PAIRS];
-    {
-        state_t st[ITEMS_PER_THREAD];
-        if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
-            BlockLoadT(temp.load).Load(d_in_states, st);
-        else
-            BlockLoadT(temp.load).Load(d_in_states, st, valid, IDENTITY);
-        #pragma unroll
-        for (uint32_t j = 0; j < PAIRS; j++)
-            pk[j] = uint32_t(st[2 * j]) | (uint32_t(st[2 * j + 1]) << 16);
-    }
-    __syncthreads();
-
-    ComposeOp compose_op{shmem_compose};
-
-    // Thread reduce over the packed pairs. Out-of-range items are IDENTITY.
-    state_t agg = IDENTITY;
-    #pragma unroll
-    for (uint32_t j = 0; j < PAIRS; j++) {
-        agg = compose_op(agg, state_t(pk[j] & 0xffffu));
-        agg = compose_op(agg, state_t(pk[j] >> 16));
-    }
-
-    // Block-wide exclusive scan of the per-thread aggregates.
-    state_t prefix;
-    if (!LOOKBACK || tile_idx == 0) {
-        state_t block_aggregate;
-        BlockScanT(temp.scan_storage.scan).ExclusiveScan(
-            agg, prefix, IDENTITY, compose_op, block_aggregate);
-        if (LOOKBACK && threadIdx.x == 0)
-            tile_state.SetInclusive(0, block_aggregate);
-    } else {
-        PrefixOp prefix_op(tile_state, temp.scan_storage.prefix, compose_op, (int)tile_idx, IDENTITY);
-        BlockScanT(temp.scan_storage.scan).ExclusiveScan(agg, prefix, compose_op, prefix_op);
-    }
-
-    // Thread scan seeded with the exclusive prefix, results packed in place.
-    state_t acc = prefix;
-    #pragma unroll
-    for (uint32_t j = 0; j < PAIRS; j++) {
-        state_t lo = compose_op(acc, state_t(pk[j] & 0xffffu));
-        acc        = compose_op(lo,  state_t(pk[j] >> 16));
-        pk[j]      = uint32_t(lo) | (uint32_t(acc) << 16);
-    }
-    __syncthreads();
+    const uint32_t warp     = threadIdx.x / WARP;
+    const uint32_t lane     = threadIdx.x % WARP;
+    const uint32_t tile_idx = blockIdx.x;
+    const uint32_t glb_offs = tile_idx * TILE;
+    const bool     full     = glb_offs + TILE <= size;
+    uint32_t*      wbuf     = xbuf[warp];
 
     state_t st[ITEMS_PER_THREAD];
-    #pragma unroll
-    for (uint32_t j = 0; j < PAIRS; j++) {
-        st[2 * j]     = state_t(pk[j] & 0xffffu);
-        st[2 * j + 1] = state_t(pk[j] >> 16);
+    if (full) {
+        const uint2* src = reinterpret_cast<const uint2*>(d_in + glb_offs + warp * WARP_ITEMS);
+        uint2*       buf = reinterpret_cast<uint2*>(wbuf);
+        uint2 v[VECS];
+        #pragma unroll
+        for (uint32_t k = 0; k < VECS; k++)
+            v[k] = src[lane + k * WARP];
+        #pragma unroll
+        for (uint32_t k = 0; k < VECS; k++)
+            buf[lane + k * WARP] = v[k];
+        __syncwarp();
+        #pragma unroll
+        for (uint32_t k = 0; k < VECS; k++) {
+            uint2 w = buf[lane * VECS + k];
+            #pragma unroll
+            for (uint32_t b = 0; b < 8; b++) {
+                uint32_t word = b < 4 ? w.x : w.y;
+                st[8 * k + b] = shmem_to_state[(word >> (8 * (b % 4))) & 0xffu];
+            }
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+            uint32_t idx = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i;
+            st[i] = idx < size ? shmem_to_state[d_in[idx]] : IDENTITY;
+        }
     }
-    if (glb_offs + BLOCK_SIZE * ITEMS_PER_THREAD <= size)
-        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st);
-    else
-        BlockStoreT(temp.store).Store(d_states_out + glb_offs, st, valid);
+
+    if constexpr (STEP >= 2) {
+        ComposeOp compose_op{shmem_compose};
+        if (STEP == 2 || tile_idx == 0) {
+            state_t block_aggregate;
+            BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, block_aggregate);
+            if (STEP == 3 && threadIdx.x == 0)
+                tile_state.SetInclusive(0, block_aggregate);
+        } else {
+            PrefixOp prefix_op(tile_state, prefix_temp, compose_op, (int)tile_idx, IDENTITY);
+            BlockScanT(scan_temp).InclusiveScan(st, st, compose_op, prefix_op);
+        }
+    }
+
+    if (full) {
+        uint4* buf = reinterpret_cast<uint4*>(wbuf);
+        __syncwarp();   // every lane has finished reading its input bytes
+        #pragma unroll
+        for (uint32_t k = 0; k < VECS; k++) {
+            const state_t* s = st + 8 * k;
+            buf[lane * VECS + k] = make_uint4(uint32_t(s[0]) | (uint32_t(s[1]) << 16),
+                                              uint32_t(s[2]) | (uint32_t(s[3]) << 16),
+                                              uint32_t(s[4]) | (uint32_t(s[5]) << 16),
+                                              uint32_t(s[6]) | (uint32_t(s[7]) << 16));
+        }
+        __syncwarp();
+        uint4* dst = reinterpret_cast<uint4*>(d_states_out + glb_offs + warp * WARP_ITEMS);
+        #pragma unroll
+        for (uint32_t k = 0; k < VECS; k++)
+            dst[lane + k * WARP] = buf[lane + k * WARP];
+    } else {
+        #pragma unroll
+        for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+            uint32_t idx = glb_offs + threadIdx.x * ITEMS_PER_THREAD + i;
+            if (idx < size)
+                d_states_out[idx] = st[i];
+        }
+    }
 }
 
 // Host reference for ladder / P1 output. scan == false: plain byte->state map.
@@ -817,21 +830,6 @@ static uint32_t num_tiles(uint32_t size) {
 
 static void reset(ScanTileState& ts, uint32_t nlb) {
     initScanTileState(ts, (int)nlb);
-}
-
-// Sets kernel's preferred shared memory carveout (percent of the maximum;
-// 8 blocks/SM x ~13 KB exceeds the default 100 KB configuration) and returns
-// the resulting resident blocks per SM. On A100, 100% = 164 KB shared
-// (~28 KB L1); CARVEOUT_132KB (81%) = 132 KB shared (~60 KB L1).
-constexpr int CARVEOUT_MAX   = (int)cudaSharedmemCarveoutMaxShared;
-constexpr int CARVEOUT_132KB = 81;
-template<typename KernelT>
-static int set_carveout_blocks_per_sm(KernelT kernel, int carveout_pct) {
-    gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                   carveout_pct));
-    int blocks = 0;
-    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, BLOCK_SIZE, 0));
-    return blocks;
 }
 
 static void reset_lookback_stats() {
@@ -981,18 +979,6 @@ int main(int argc, char** argv) {
         bench("L2 + block scan (no lookback):", u16_bytes, no_prep, launch);
     }
 
-    // L2 at <= 32 registers (__launch_bounds__(256, 8)): 8 blocks/SM
-    {
-        auto kernel = p1_ladder<BLOCK_SIZE, ITEMS_PER_THREAD, 2, 8>;
-        int  bps    = set_carveout_blocks_per_sm(kernel, CARVEOUT_MAX);
-        auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, size); };
-        char name[64];
-        snprintf(name, sizeof(name), "L2 min 8 blocks/SM (got %d):", bps);
-        poison_out(); launch(); fetch_states();
-        if (!check_states(input, size, h_states, true, BLOCK_SIZE * ITEMS_PER_THREAD, name)) exit(1);
-        bench(name, u16_bytes, no_prep, launch);
-    }
-
     // L3: + decoupled lookback = p1_transpose
     auto run_l3 = [&](auto kernel, const char* name) {
         auto prep   = [&] { reset(ts, nlb); };
@@ -1003,56 +989,25 @@ int main(int argc, char** argv) {
     };
     run_l3(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD>, "L3 + lookback (p1_transpose):");
 
-    // L3 at <= 32 registers: more resident blocks to cover the warps that
-    // idle during each block's lookback.
-    char l3_8_name[64];
+    // Vectorized load/store ladder at IPT=24: V1 ~ L1, V2 ~ L2, V3 ~ L3.
+    printf("\nVectorized load/store (IPT=24, u16 out):\n");
     {
-        auto kernel = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, false, 8>;
-        snprintf(l3_8_name, sizeof(l3_8_name), "L3 min 8 blocks/SM (got %d):",
-                 set_carveout_blocks_per_sm(kernel, CARVEOUT_MAX));
-        run_l3(kernel, l3_8_name);
-    }
-
-    // 8 blocks/SM with a 132 KB carveout (more L1 for the spills), and the
-    // register-packed kernel (P2 = per-tile scan like L2, P3 = full P1).
-    printf("\n8 blocks/SM: carveout and register packing (u16 out):\n");
-    char name_buf[64];
-    auto with_bps = [&](const char* fmt, int bps) {
-        snprintf(name_buf, sizeof(name_buf), fmt, bps);
-        return (const char*)name_buf;
-    };
-    {
-        auto kernel = p1_ladder<BLOCK_SIZE, ITEMS_PER_THREAD, 2, 8>;
-        const char* name = with_bps("L2 8 blocks/SM, 132KB (got %d):",
-                                    set_carveout_blocks_per_sm(kernel, CARVEOUT_132KB));
-        auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, size); };
-        poison_out(); launch(); fetch_states();
-        if (!check_states(input, size, h_states, true, BLOCK_SIZE * ITEMS_PER_THREAD, name)) exit(1);
-        bench(name, u16_bytes, no_prep, launch);
-    }
-    {
-        auto kernel = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, false, 8>;
-        run_l3(kernel, with_bps("L3 8 blocks/SM, 132KB (got %d):",
-                                set_carveout_blocks_per_sm(kernel, CARVEOUT_132KB)));
-    }
-    auto run_packed = [&](auto kernel, bool lookback, const char* name) {
-        auto prep   = [&] { if (lookback) reset(ts, nlb); };
-        auto launch = [&] { kernel<<<nlb, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size); };
-        poison_out(); prep(); launch(); fetch_states();
-        if (!check_states(input, size, h_states, true, lookback ? 0 : BLOCK_SIZE * ITEMS_PER_THREAD, name)) exit(1);
-        bench(name, u16_bytes, prep, launch);
-    };
-    run_packed(p1_packed<BLOCK_SIZE, ITEMS_PER_THREAD, false, 6>, false, "P2 packed (6 blocks/SM):");
-    {
-        auto kernel = p1_packed<BLOCK_SIZE, ITEMS_PER_THREAD, false, 8>;
-        run_packed(kernel, false, with_bps("P2 packed, 8 blocks/SM, 132KB (got %d):",
-                                           set_carveout_blocks_per_sm(kernel, CARVEOUT_132KB)));
-    }
-    run_packed(p1_packed<BLOCK_SIZE, ITEMS_PER_THREAD, true, 6>, true, "P3 packed (6 blocks/SM):");
-    {
-        auto kernel = p1_packed<BLOCK_SIZE, ITEMS_PER_THREAD, true, 8>;
-        run_packed(kernel, true, with_bps("P3 packed, 8 blocks/SM, 132KB (got %d):",
-                                          set_carveout_blocks_per_sm(kernel, CARVEOUT_132KB)));
+        constexpr uint32_t VEC_IPT = 24;
+        const uint32_t vec_tiles = (size + BLOCK_SIZE * VEC_IPT - 1) / (BLOCK_SIZE * VEC_IPT);
+        assert(vec_tiles <= nlb && "tile state array is sized for nlb tiles");
+        auto run_vec = [&](auto kernel, uint32_t step, const char* name) {
+            auto prep   = [&] { if (step == 3) reset(ts, vec_tiles); };
+            auto launch = [&] {
+                kernel<<<vec_tiles, BLOCK_SIZE>>>(d_compose_glb, d_to_state_glb, d_in, d_states_out, ts, size);
+            };
+            poison_out(); prep(); launch(); fetch_states();
+            if (!check_states(input, size, h_states, step >= 2,
+                              step == 2 ? BLOCK_SIZE * VEC_IPT : 0, name)) exit(1);
+            bench(name, u16_bytes, prep, launch);
+        };
+        run_vec(p1_vec<BLOCK_SIZE, VEC_IPT, 1>, 1, "V1 vec load/store:");
+        run_vec(p1_vec<BLOCK_SIZE, VEC_IPT, 2>, 2, "V2 + block scan (no lookback):");
+        run_vec(p1_vec<BLOCK_SIZE, VEC_IPT, 3>, 3, "V3 + lookback:");
     }
 
     // Lookback statistics from an instrumented copy of L3,
@@ -1075,11 +1030,6 @@ int main(int argc, char** argv) {
         print_lookback_stats(name);
     };
     run_stats(p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true>, "L3");
-    {
-        auto kernel = p1_transpose<BLOCK_SIZE, ITEMS_PER_THREAD, true, 8>;
-        set_carveout_blocks_per_sm(kernel, CARVEOUT_MAX);
-        run_stats(kernel, "L3 min 8 blocks/SM");
-    }
 
     free(h_states);
 

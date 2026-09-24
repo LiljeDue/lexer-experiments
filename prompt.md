@@ -387,6 +387,51 @@ tiles cut it by 14%) — the cost is how long each lookback takes, not how many
 there are. Larger blocks make the block scan more expensive (more warps per
 barrier; BS=1024 also drops to 50% occupancy at 63 registers).
 
+### More resident blocks (8 blocks/SM), carveout, register packing
+At 40 registers the SM holds at most 48 warps whatever the block shape, so
+more resident warps need fewer registers. `__launch_bounds__(256, 8)` caps
+registers at 32 (8 blocks/SM, 98% achieved occupancy), with the shared memory
+carveout raised so 8 × 13 KB fits.
+
+| Variant | L2 (block scan) | L3 | lookback (L3−L2) |
+|---|---|---|---|
+| 6 blocks/SM, 40 regs (baseline) | 1524–1538 μs | 1874–1878 μs | ~340–350 μs |
+| 8 blocks/SM, max carveout (~28 KB L1) | 1701–1706 μs | 1941–1942 μs | 241 μs |
+| 8 blocks/SM, 132 KB carveout (~60 KB L1) | 1697 μs | 1942 μs | 245 μs |
+| register-packed, 6 blocks/SM | 1535 μs | 1890 μs | 355 μs |
+| register-packed, 8 blocks/SM, 132 KB | 1741 μs | 1919 μs | 178 μs |
+
+(Register-packed: the in-thread scan loops hold two u16 states per 32-bit
+register; BlockScan scans only the per-thread aggregates.)
+
+Why it failed: more resident warps do hide the lookback (its cost fell from
+~345 μs to 178–245 μs, even though each lookback took longer: 1.84 μs vs
+1.30 μs lag), but the block scan got slower by ~170–220 μs. At 32 registers
+the kernels spill (~5–6 local loads/stores per warp per tile, inside CUB's
+BlockScan); the ncu profile of L2 at 8 blocks shows +12.5M instructions,
+doubled L2-cache reads from spill loads missing L1, and higher MIO-throttle
+stalls. The carveout size made no difference, and register packing did not
+remove the spills (they are in the block-scan phase, not in the state
+array). More warps help the latency-bound lookback but hurt the block scan,
+which is bound by load/store-unit (MIO) throughput.
+
+### Memory-pipe instructions per element (why the block scan is LSU-bound)
+Counted from the full-tile SASS path of L2 (BS=256, IPT=22):
+
+| Step | per element |
+|---|---|
+| `LDG.U8` byte load | 1 |
+| `to_state` lookup (LDS) | 1 |
+| load warp-transpose (STS + LDS) | 2 |
+| compose, reduce + scan (LDS) | 2 |
+| store warp-transpose (STS + LDS) | 2 |
+| `STG.U16` state store | 1 |
+
+~9 memory-pipe instructions per element, of which the scan contributes 2. L1
+(load/store only) hides the other 7 behind DRAM time; adding the scan's 2
+tips the MIO queue into throttling. Every change that added LSU work
+(column compose, spills at 8 blocks/SM) made P1 slower.
+
 ### BS=32 (warp-scan, no intra-block barriers)
 Eliminates `__syncthreads()` inside `BlockScan` by using a single warp per
 block. Result: 3.7× slower. Reason: killing occupancy (1 block/SM vs 5–6)
@@ -444,7 +489,8 @@ Levers exhausted **within the current kernel design**:
 
 - IPT=22, BS=256 is the best tile configuration of those swept (IPT 16–32,
   BS 128/256/512/1024).
-- Lookback sleep changes, a 64-tile lookback window and column compose all
+- Lookback sleep changes, a 64-tile lookback window, column compose and
+  8 blocks/SM (with or without register packing / carveout changes) all
   made P1 slower or had no effect (see "What We Tried").
 - `BLOCK_LOAD/STORE_WARP_TRANSPOSE` eliminates shmem store bank conflicts and
   reduces instruction count: +144 GB/s over the manual blocked layout.
@@ -462,5 +508,12 @@ to be irreducible**. Open directions:
    ~1.4 μs per tile regardless of sleeps, window size or tile count (see
    "Lookback statistics"); the cost is the block's other warps idling for
    it. Shortening it (sleep changes, 64-tile window, larger blocks) failed.
-2. **Two-kernel reduce-then-scan** — traffic floor ~1574 μs, below the current
+   More resident warps hide it but cost registers (see "More resident
+   blocks").
+2. **Cut load/store-unit work in the load/store path** — ~7 of ~9
+   memory-pipe instructions per element are the byte-granular load/store
+   path. Being measured: `p1_vec` (V1/V2/V3, IPT=24) with 8-byte loads,
+   16-byte stores and warp-local, bank-conflict-free exchanges (~3.75
+   instructions per element).
+3. **Two-kernel reduce-then-scan** — traffic floor ~1574 μs, below the current
    1870 μs; not yet implemented or measured.
