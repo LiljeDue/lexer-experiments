@@ -1037,39 +1037,76 @@ step (5.8 instructions per byte) for moderate/sparse; the extra barrier
 (lanes 0-30 can get the next byte by warp shuffle; lane 31 needs the next
 warp's first byte, e.g. from global memory, to avoid the race).
 
-### Emission and pass A variants (A100 numbers pending)
+### Emission and pass A variants (all failed, removed)
 
 Starting point `be346d9` (dense 1844 μs; emission ~2/3 of instructions on
-dense, ~115 warp instructions per 32 output slots). Five candidates, each
-measured as **one change against the base** (`lexerBig<..., EMIT, FLAGLESS,
-NOBAR>`; bench rows `Big S2/S3 <variant>`):
+dense, ~115 warp instructions per 32 output slots). Five candidates were
+measured in `d3e61d9`, each as **one change against the base**
+(`lexerBig<..., EMIT, FLAGLESS, NOBAR>`), then all removed: the kernel is back
+to the `be346d9` code.
 
 1. **emit-words-dense** (`EMIT 1`): CHUNK = 96 = 3 × 32, so each 32-bit
-   produce-mask word covers 32 consecutive elements. The warp walks the
+   produce-mask word covers 32 consecutive elements. The warp walked the
    owner lanes with tokens (ballot, `__ffs`) and their non-zero mask words
-   (one shuffle each); lane l takes bit l, its slot is
+   (one shuffle each); lane l took bit l, its slot was
    `base + popc(w & lower_lanes)` — no owner search, no `select_bit`. Used
-   when the warp has more than 4 tokens per non-zero word (count of non-zero
-   words by `__reduce_add_sync`), otherwise the owner search. Estimate: ~15
-   instructions per word, about half of the emission on dense; stores write
-   ~9 slots per instruction instead of 32.
-2. **emit-words-all** (`EMIT 2`): word-aligned for every warp (estimated
-   slower on moderate/sparse, ~2 tokens per lane).
+   when the warp had more than 4 tokens per non-zero word (count by
+   `__reduce_add_sync`), otherwise the owner search.
+2. **emit-words-all** (`EMIT 2`): word-aligned for every warp.
 3. **emit-owner-packed** (`EMIT 3`): owner search on one packed word per lane
-   (incl 31–20, count 19–13, popc(m0) 12–7, popc(m0)+popc(m1) 6–0): the
-   binary search compares against `(r << 20) | 0xfffff`, one shuffle gives the
-   owner's rank base and word popcounts (removes one shuffle and two `POPC`
-   per slot, adds field extraction). Expected small.
-4. **passA-flagless** (`FLAGLESS`): pass A steps through `comp_a` (index·2
-   only, no flags), so the per-byte `& 0x1e` disappears; pass B only needs the
-   index of F_i, and the incoming/last states still come from `comp`.
-   +288 B shared memory (26.3 KB, still 6 blocks/SM).
-5. **passA-no-barrier** (`NOBAR`): the next byte comes from the next lane by
-   `__shfl_down_sync` (read before that lane overwrites its chunk); lane 31
-   reads the next warp's or tile's first byte from global memory; the extra
-   `__syncthreads` is removed.
+   (incl 31–20, count 19–13, popc(m0) 12–7, popc(m0)+popc(m1) 6–0): one
+   shuffle for the owner's rank base and word popcounts instead of one
+   shuffle and two `POPC`s, at the cost of field extraction.
+4. **passA-flagless** (`FLAGLESS`): pass A stepped through `comp_a` (index·2
+   only), removing the per-byte `& 0x1e`.
+5. **passA-no-barrier** (`NOBAR`): next byte from the next lane by
+   `__shfl_down_sync` (lane 31 from global memory); the extra `__syncthreads`
+   removed.
 
-Checks: base SASS identical to `be346d9` (S1, S3; S2 differs by the order of
-three `POPC`s); all variants 40 registers, no spills, ≤ 26.3 KB shared memory
-(6 blocks/SM); other kernels unchanged; debug tests and all three datasets
-pass S3 for all variants (local, sm_75).
+A100, S3 μs (change vs base; dense rows have CIs of ±10–17 μs, even base S2
+1834 vs S3 1833, so dense differences under ~20 μs are noise):
+
+| | dense (1833) | moderate (985) | sparse (925) |
+|---|---|---|---|
+| emit-words-dense | +52 | +52 | +2 |
+| emit-words-all | +43 | +131 | −4 |
+| emit-owner-packed | +63 | −1 | −2 |
+| passA-flagless | +19 | −2 | +4 |
+| passA-no-barrier | +8 | +1 | +1 |
+
+ncu (dense S2, clocks locked at 765 MHz):
+
+| | warp instr. | duration | global store requests | store sectors to L2 | DRAM write |
+|---|---|---|---|---|---|
+| base | 700M | 2.76 ms | 9.5M | 31.2M | 0.74 GB |
+| emit-words-dense | 659M | 2.59 ms | 32.8M | 53.6M | 0.74 GB |
+| emit-words-all | 653M | 2.58 ms | 32.8M | 53.6M | 0.74 GB |
+| emit-owner-packed | 716M | 2.87 ms | 9.5M | 31.2M | 0.74 GB |
+| passA-flagless | 688M | 2.69 ms | 9.5M | 31.2M | 0.74 GB |
+| passA-no-barrier | 701M | 2.76 ms | 9.5M | 31.2M | 0.74 GB |
+
+Causes:
+1. *Word-aligned emission*: only −6–7% instructions (estimated ~−35%: the
+   second emission estimate of mine that was wrong in direction), and each
+   store instruction writes ~9 slots instead of 32 → 3.4× the store requests
+   and +72% partially filled store sectors on the L1→L2 path. L2 merges them
+   (DRAM writes unchanged), but at full clock the store path limits: slower
+   by ~45–50 μs on dense. On moderate the per-warp choice still routed
+   warps to the word loop (or cost its reduction), +52 μs; always using it
+   costs +131 μs (few tokens per word). Under ncu's locked 765 MHz SM clock
+   the same variants were *faster* (instruction issue dominates there).
+2. *Packed owner search*: field extraction costs more than the shuffle and
+   `POPC`s it removes (+2% instructions).
+3. *Flagless pass A*: −1.7% instructions, no measurable time change — pass A
+   is bound by the latency of its serial chain, not instruction count.
+4. *No barrier*: no change in instructions or time; the barrier was not on
+   the critical path.
+
+**Profiling lesson:** ncu locks the SM clock to base by default, which can
+invert the ranking of variants that shift work between the SM and the memory
+path. `make profile` now passes `--clock-control none` so profiles run at
+the real clock (A100: GPU boost clock instead of 765 MHz; durations are then
+comparable to the bench).
+
+Current `lexerBig` unchanged (`be346d9` code): A100 S3 dense 1833–1844 μs,
+moderate 985, sparse 925.

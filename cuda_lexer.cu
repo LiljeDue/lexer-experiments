@@ -757,7 +757,7 @@ void lexerVecPipe(
 // and output without look-backs (tile-local states, each tile writes its
 // outputs to its own region; output is not valid); 3 = full lexer.
 // ---------------------------------------------------------------------------
-template<typename I, I BLOCK_SIZE, I CHUNK, I STEP, I EMIT, bool FLAGLESS, bool NOBAR>
+template<typename I, I BLOCK_SIZE, I CHUNK, I STEP>
 __global__ LB_P1
 void lexerBig(
     LexerCtxShmem ctx,
@@ -774,9 +774,6 @@ void lexerBig(
     static_assert(STEP >= 1 && STEP <= 3, "STEP must be 1, 2 or 3");
     static_assert(CHUNK % 16 == 0 && CHUNK <= 96, "CHUNK: multiple of 16, at most 96 (3-word mask)");
     static_assert(NUM_STATES <= 16, "packed chain states hold index * 2 in 5 bits");
-    static_assert(EMIT <= 3, "EMIT must be 0, 1, 2 or 3");
-    static_assert(EMIT == 0 || EMIT == 3 || CHUNK % 32 == 0,
-                  "word-aligned emission: each mask word covers 32 elements");
     constexpr I VECS       = CHUNK / 16;
     constexpr I WARP_BYTES = WARP * CHUNK;
     constexpr I TILE       = BLOCK_SIZE * CHUNK;
@@ -800,9 +797,6 @@ void lexerBig(
     __shared__ __align__(8) uint16_t row_of[256];
     __shared__ __align__(8) uint16_t comp[NUM_STATES * NUM_STATES];
     __shared__ __align__(8) uint8_t  comp_pf[NUM_STATES * 16];
-    // FLAGLESS: compose results as index * 2 only, so pass A's step needs no
-    // mask (unreferenced otherwise, so it takes no space).
-    __shared__ __align__(8) uint16_t comp_a[NUM_STATES * NUM_STATES];
 
     for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES / 4; i += BLOCK_SIZE)
         reinterpret_cast<volatile uint64_t*>(shmem_compose)[i] =
@@ -816,22 +810,10 @@ void lexerBig(
         comp_pf[i] = f < NUM_STATES
             ? uint8_t(pack_chain_state(ctx.d_compose_glb[f * NUM_STATES + p])) : 0;
     }
-    if constexpr (FLAGLESS) {
-        for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES; i += BLOCK_SIZE)
-            comp_a[i] = uint16_t(get_index(ctx.d_compose_glb[i]) << 1);
-    }
     const ShmemCompose compose{shmem_compose};
     auto step = [&](uint32_t v, uint32_t byte) -> uint32_t {
         return *reinterpret_cast<const uint16_t*>(
             reinterpret_cast<const uint8_t*>(comp) + row_of[byte] + (v & 0x1eu));
-    };
-    // Pass A's chain step: FLAGLESS keeps v = index * 2 exactly, no mask.
-    auto step_a = [&](uint32_t v, uint32_t byte) -> uint32_t {
-        if constexpr (FLAGLESS)
-            return *reinterpret_cast<const uint16_t*>(
-                reinterpret_cast<const uint8_t*>(comp_a) + row_of[byte] + v);
-        else
-            return step(v, byte);
     };
 
     const I tile      = blockIdx.x;
@@ -868,27 +850,16 @@ void lexerBig(
         // Byte after my chunk: next thread's first byte, or the next tile's.
         const I next_gid  = my_offs + CHUNK;
         const bool has_nb = next_gid < size && valid == CHUNK;
-        uint8_t nb;
-        if constexpr (NOBAR) {
-            // Lanes 0-30: the next lane's first byte by shuffle (read by that
-            // lane before it overwrites its chunk); lane 31: the next warp's
-            // or tile's first byte from global memory. No block barrier.
-            const uint32_t next_first =
-                __shfl_down_sync(0xffffffffu, uint32_t(my_bytes[0]), 1);
-            nb = !has_nb ? 0 : lane + 1 < WARP ? uint8_t(next_first) : d_in[next_gid];
-        } else {
-            nb = !has_nb ? 0
-               : threadIdx.x + 1 < BLOCK_SIZE ? my_bytes[CHUNK]
-               : d_in[next_gid];
-            __syncthreads();   // next bytes read before pass A overwrites the chunks
-        }
+        const uint8_t nb  = !has_nb ? 0
+                          : threadIdx.x + 1 < BLOCK_SIZE ? my_bytes[CHUNK]
+                          : d_in[next_gid];
+        __syncthreads();   // next bytes read before pass A overwrites the chunks
 
         // Pass A: per-thread state reduction (packed chain); each prefix F_i
-        // (state byte of the chain from IDENTITY; FLAGLESS: index * 2 only) is
-        // stored in place over the input.
+        // (state byte of the chain from IDENTITY) is stored in place over the
+        // input.
         uint4* my = reinterpret_cast<uint4*>(my_bytes);
-        uint32_t va = FLAGLESS ? uint32_t(get_index(IDENTITY)) << 1
-                               : uint32_t(pack_chain_state(state_t(IDENTITY)));
+        uint32_t va = pack_chain_state(state_t(IDENTITY));
         #pragma unroll
         for (I k = 0; k < VECS; k++) {
             const uint4 v = my[k];
@@ -898,7 +869,7 @@ void lexerBig(
                 const uint32_t word = b < 4 ? v.x : b < 8 ? v.y : b < 12 ? v.z : v.w;
                 const uint32_t byte = (word >> (8 * (b % 4))) & 0xffu;
                 if (full || 16 * k + b < valid) {
-                    va = step_a(va, byte);
+                    va = step(va, byte);
                     tw[b / 4] |= (va & 0xffu) << (8 * (b % 4));
                 }
             }
@@ -1004,111 +975,33 @@ void lexerBig(
         const I warp_base  = __shfl_sync(0xffffffff, offs, 0);
         const uint8_t* warp_states = bytes + warp * WARP_BYTES;
         __syncwarp();   // state bytes of all lanes written
-
-        // Owner search (EMIT 0, 3; EMIT 1 for sparse warps): each warp writes
-        // 32 consecutive output slots per step. Lane r finds the lane owning
-        // slot r by a binary search over the lanes' inclusive counts and the
-        // element by a k-th-set-bit select in that lane's mask.
-        auto emit_owner = [&]() {
-            // EMIT 3: incl, count and the owner's word popcounts packed in
-            // one word (incl 31-20, count 19-13, c0 12-7, c0 + c1 6-0), so
-            // the owner's data takes one shuffle and no popc.
-            const uint32_t pk = EMIT == 3
-                ? (uint32_t(incl) << 20) | (uint32_t(count) << 13)
-                  | (uint32_t(__popc(m0)) << 7) | uint32_t(__popc(m0) + __popc(m1))
-                : 0u;
-            for (I j = 0; j < warp_total; j += WARP) {
-                const I r = j + lane;
-                // owner lane: smallest o with incl_o > r
-                I o = 0;
-                I k;
-                I c0, c01;
-                if constexpr (EMIT == 3) {
-                    const uint32_t rr = (uint32_t(r) << 20) | 0xfffffu;
-                    #pragma unroll
-                    for (I d = WARP / 2; d >= 1; d >>= 1) {
-                        uint32_t v = __shfl_sync(0xffffffff, pk, o + d - 1);
-                        if (v <= rr) o += d;
-                    }
-                    const uint32_t opk = __shfl_sync(0xffffffff, pk, o);
-                    k   = r - ((opk >> 20) - ((opk >> 13) & 0x7fu));   // rank
-                    c0  = (opk >> 7) & 0x3fu;
-                    c01 = opk & 0x7fu;
-                } else {
-                    #pragma unroll
-                    for (I d = WARP / 2; d >= 1; d >>= 1) {
-                        I v = __shfl_sync(0xffffffff, incl, o + d - 1);
-                        if (v <= r) o += d;
-                    }
-                    const I o_incl  = __shfl_sync(0xffffffff, incl, o);
-                    const I o_count = __shfl_sync(0xffffffff, count, o);
-                    k = r - (o_incl - o_count);   // rank within the owner's tokens
-                }
-                const uint32_t om0 = __shfl_sync(0xffffffff, m0, o);
-                const uint32_t om1 = __shfl_sync(0xffffffff, m1, o);
-                const uint32_t om2 = __shfl_sync(0xffffffff, m2, o);
-                // Word holding the k-th set bit, then the bit within it
-                // (select_bit, not __fns: __fns expands to ~140 instructions).
-                if constexpr (EMIT != 3) {
-                    c0 = __popc(om0);
-                    c01 = c0 + __popc(om1);
-                }
-                const uint32_t m = k < c0 ? om0 : k < c01 ? om1 : om2;
-                const I base     = k < c0 ? 0   : k < c01 ? 32  : 64;
-                k               -= k < c0 ? 0   : k < c01 ? c0  : c01;
-                const I pos = base + select_bit(m, k);
-                if (r < warp_total) {
-                    const I elem = o * CHUNK + pos;   // within the warp's segment
-                    d_index_out[warp_base + r] = tile_offs + warp * WARP_BYTES + elem;
-                    d_token_out[warp_base + r] = warp_states[elem] >> 5;   // token bits
-                }
-            }
-        };
-        // Word-aligned (EMIT 1 for dense warps, EMIT 2): each mask word covers
-        // 32 consecutive elements, so the warp walks the owners' non-zero
-        // words; lane l takes bit l, its slot is the popc of the lower bits.
-        auto emit_words = [&]() {
-            const uint32_t lower = (1u << lane) - 1;
-            const I seg = tile_offs + warp * WARP_BYTES;
-            uint32_t owners = __ballot_sync(0xffffffffu, count > 0);
-            I base = warp_base;
-            while (owners) {
-                const I o = __ffs(owners) - 1;
-                owners &= owners - 1;
-                #pragma unroll
-                for (I q = 0; q < CHUNK / 32; q++) {
-                    const uint32_t w = __shfl_sync(0xffffffffu, q == 0 ? m0 : q == 1 ? m1 : m2, o);
-                    if (w == 0)
-                        continue;   // warp-uniform
-                    if ((w >> lane) & 1u) {
-                        const I slot = base + __popc(w & lower);
-                        const I elem = o * CHUNK + q * 32 + lane;
-                        d_index_out[slot] = seg + elem;
-                        d_token_out[slot] = warp_states[elem] >> 5;   // token bits
-                    }
-                    base += __popc(w);
-                }
-            }
-        };
-        if constexpr (EMIT == 1) {
-            // Word-aligned when the warp has many tokens per non-zero word
-            // (~15 instructions per word vs ~115 per 32 slots).
-            I nzw = (m0 != 0) + (m1 != 0) + (m2 != 0);
-#if __CUDA_ARCH__ >= 800
-            nzw = __reduce_add_sync(0xffffffffu, nzw);
-#else
+        for (I j = 0; j < warp_total; j += WARP) {
+            const I r = j + lane;
+            // owner lane: smallest o with incl_o > r
+            I o = 0;
             #pragma unroll
-            for (I d = WARP / 2; d >= 1; d >>= 1)
-                nzw += __shfl_xor_sync(0xffffffffu, nzw, d);
-#endif
-            if (warp_total > 4 * nzw)
-                emit_words();
-            else
-                emit_owner();
-        } else if constexpr (EMIT == 2) {
-            emit_words();
-        } else {
-            emit_owner();
+            for (I d = WARP / 2; d >= 1; d >>= 1) {
+                I v = __shfl_sync(0xffffffff, incl, o + d - 1);
+                if (v <= r) o += d;
+            }
+            const I o_incl  = __shfl_sync(0xffffffff, incl, o);
+            const I o_count = __shfl_sync(0xffffffff, count, o);
+            I k = r - (o_incl - o_count);   // rank within the owner's tokens
+            const uint32_t om0 = __shfl_sync(0xffffffff, m0, o);
+            const uint32_t om1 = __shfl_sync(0xffffffff, m1, o);
+            const uint32_t om2 = __shfl_sync(0xffffffff, m2, o);
+            // Word holding the k-th set bit, then the bit within it
+            // (select_bit, not __fns: __fns expands to ~140 instructions).
+            const I c0 = __popc(om0), c01 = c0 + __popc(om1);
+            const uint32_t m = k < c0 ? om0 : k < c01 ? om1 : om2;
+            const I base     = k < c0 ? 0   : k < c01 ? 32  : 64;
+            k               -= k < c0 ? 0   : k < c01 ? c0  : c01;
+            const I pos = base + select_bit(m, k);
+            if (r < warp_total) {
+                const I elem = o * CHUNK + pos;   // within the warp's segment
+                d_index_out[warp_base + r] = tile_offs + warp * WARP_BYTES + elem;
+                d_token_out[warp_base + r] = warp_states[elem] >> 5;   // token bits
+            }
         }
     }
 }
@@ -1395,9 +1288,9 @@ void testLexerVecPipe(uint8_t* input,
 
 // Requests the maximum shared memory carveout for lexerBig (~26 KB per block;
 // 6 blocks/SM exceed the default configuration) and returns blocks/SM.
-template<typename I, I BS, I CHUNK, I STEP, I EMIT, bool FLAGLESS, bool NOBAR>
+template<typename I, I BS, I CHUNK, I STEP>
 static int lexerBigBlocksPerSM() {
-    auto kernel = lexerBig<I, BS, CHUNK, STEP, EMIT, FLAGLESS, NOBAR>;
+    auto kernel = lexerBig<I, BS, CHUNK, STEP>;
     gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                    (int)cudaSharedmemCarveoutMaxShared));
     int bps = 0;
@@ -1407,7 +1300,7 @@ static int lexerBigBlocksPerSM() {
 
 // STEP 1/2 are ladder steps (timing only, output not valid); STEP 3 is checked
 // against the expected output. GB/s always counts the full lexer's traffic.
-template<uint32_t BS, uint32_t CHUNK, uint32_t STEP, uint32_t EMIT, bool FLAGLESS, bool NOBAR>
+template<uint32_t BS, uint32_t CHUNK, uint32_t STEP>
 void testLexerBig(uint8_t* input,
                   size_t input_size,
                   uint32_t* expected_indices,
@@ -1447,7 +1340,7 @@ void testLexerBig(uint8_t* input,
     gpuAssert(cudaMemcpy(d_in, input, IN_ARRAY_BYTES, cudaMemcpyHostToDevice));
 
     LexerCtxShmem ctx = LexerCtxShmem();
-    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, EMIT, FLAGLESS, NOBAR>());
+    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP>());
     fflush(stdout);
 
     auto reset = [&]() {
@@ -1456,7 +1349,7 @@ void testLexerBig(uint8_t* input,
         initScanTileState(d_index_states, (int)NLB);
     };
     auto launch = [&]() {
-        lexerBig<I, BS, CHUNK, STEP, EMIT, FLAGLESS, NOBAR><<<NLB, BS>>>(
+        lexerBig<I, BS, CHUNK, STEP><<<NLB, BS>>>(
             ctx, d_in, d_index_out, d_token_out,
             d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid);
     };
@@ -1721,10 +1614,8 @@ bool runTest(LexerTest* test) {
         gpuAssert(cudaFree(vp_index_states.d_tile_descriptors));
     }
 
-    // Same test for lexerBig (large-tile single-pass lexer, full STEP 3), all variants.
-    auto run_big = [&](auto emit_c, auto flagless_c, auto nobar_c) {
-        constexpr I    EMIT     = decltype(emit_c)::value;
-        constexpr bool FLAGLESS = decltype(flagless_c)::value, NOBAR = decltype(nobar_c)::value;
+    // Same test for lexerBig (large-tile single-pass lexer, full STEP 3).
+    {
         const I BIG_CHUNK = 96;
         const I big_tiles = (size + BLOCK_SIZE * BIG_CHUNK - 1) / (BLOCK_SIZE * BIG_CHUNK);
         ScanTileState<state_t> bg_state_states;
@@ -1741,8 +1632,8 @@ bool runTest(LexerTest* test) {
         gpuAssert(cudaMemset(d_token_out, 0xff, size * sizeof(token_t)));
 
         LexerCtxShmem bg_ctx;
-        lexerBigBlocksPerSM<I, BLOCK_SIZE, BIG_CHUNK, 3, EMIT, FLAGLESS, NOBAR>();
-        lexerBig<I, BLOCK_SIZE, BIG_CHUNK, 3, EMIT, FLAGLESS, NOBAR><<<big_tiles, BLOCK_SIZE>>>(
+        lexerBigBlocksPerSM<I, BLOCK_SIZE, BIG_CHUNK, 3>();
+        lexerBig<I, BLOCK_SIZE, BIG_CHUNK, 3><<<big_tiles, BLOCK_SIZE>>>(
             bg_ctx, d_in, d_index_out, d_token_out, bg_state_states, bg_index_states,
             size, big_tiles, d_new_size, d_is_valid);
         gpuAssert(cudaDeviceSynchronize());
@@ -1763,23 +1654,16 @@ bool runTest(LexerTest* test) {
                           bg_tokens[i]  == test->expected_tokens[i];
         }
         if (bg_pass)
-            printf("PASS [%s] (lexerBig emit=%u flagless=%d nobar=%d)\n", test->name, (unsigned)EMIT, (int)FLAGLESS, (int)NOBAR);
+            printf("PASS [%s] (lexerBig)\n", test->name);
         else
-            fprintf(stderr, "FAIL [%s] (lexerBig emit=%u flagless=%d nobar=%d): valid=%d size=%u (expected %zu)\n",
-                    test->name, (unsigned)EMIT, (int)FLAGLESS, (int)NOBAR, (int)bg_valid, bg_size, test->expected_size);
+            fprintf(stderr, "FAIL [%s] (lexerBig): valid=%d size=%u (expected %zu)\n",
+                    test->name, (int)bg_valid, bg_size, test->expected_size);
         pass = pass && bg_pass;
 
         bg_ctx.Cleanup();
         gpuAssert(cudaFree(bg_state_states.d_tile_descriptors));
         gpuAssert(cudaFree(bg_index_states.d_tile_descriptors));
-    };
-    using F = std::false_type; using T = std::true_type;
-    run_big(std::integral_constant<I, 0>{}, F{}, F{});
-    run_big(std::integral_constant<I, 1>{}, F{}, F{});
-    run_big(std::integral_constant<I, 2>{}, F{}, F{});
-    run_big(std::integral_constant<I, 3>{}, F{}, F{});
-    run_big(std::integral_constant<I, 0>{}, T{}, F{});
-    run_big(std::integral_constant<I, 0>{}, F{}, T{});
+    }
 
     ctx.Cleanup();
     gpuAssert(cudaFree(d_in));
@@ -1870,46 +1754,13 @@ int main(int32_t argc, char *argv[]) {
     testLexerVecPipe<256, 24>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Big tile S1 (load only):");
     fflush(stdout);
-    testLexerBig<256, 96, 1, 0, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    // Variants, each one change against the base: emission (EMIT 1 word-aligned
-    // for dense warps, 2 word-aligned always, 3 packed owner search), pass A
-    // without flags, pass A without the extra barrier.
-    printf(PAD, "Big S2 base:");
+    testLexerBig<256, 96, 1>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Big tile S2 (no look-backs):");
     fflush(stdout);
-    testLexerBig<256, 96, 2, 0, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 base:");
+    testLexerBig<256, 96, 2>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Big tile S3 (full) BS256/CHUNK96:");
     fflush(stdout);
-    testLexerBig<256, 96, 3, 0, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S2 emit-words-dense:");
-    fflush(stdout);
-    testLexerBig<256, 96, 2, 1, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 emit-words-dense:");
-    fflush(stdout);
-    testLexerBig<256, 96, 3, 1, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S2 emit-words-all:");
-    fflush(stdout);
-    testLexerBig<256, 96, 2, 2, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 emit-words-all:");
-    fflush(stdout);
-    testLexerBig<256, 96, 3, 2, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S2 emit-owner-packed:");
-    fflush(stdout);
-    testLexerBig<256, 96, 2, 3, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 emit-owner-packed:");
-    fflush(stdout);
-    testLexerBig<256, 96, 3, 3, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S2 passA-flagless:");
-    fflush(stdout);
-    testLexerBig<256, 96, 2, 0, true, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 passA-flagless:");
-    fflush(stdout);
-    testLexerBig<256, 96, 3, 0, true, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S2 passA-no-barrier:");
-    fflush(stdout);
-    testLexerBig<256, 96, 2, 0, false, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 passA-no-barrier:");
-    fflush(stdout);
-    testLexerBig<256, 96, 3, 0, false, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    testLexerBig<256, 96, 3>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     free(input);
     free(expected_indices);
     free(expected_tokens);

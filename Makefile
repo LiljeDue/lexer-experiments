@@ -133,6 +133,7 @@ test: $(CUDA_DEBUG_PROGRAM)
 profile: $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
 	$(COMPILER) $(FLAGS) -DPROFILE -lineinfo -o $(CUDA_PROGRAM)_profile cuda_lexer.cu
 	-ncu --set full \
+	    --clock-control none \
 	    --import-source 1 \
 	    --source-folders . \
 	    --target-processes all \
