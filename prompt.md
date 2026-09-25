@@ -858,9 +858,10 @@ depends on its incoming state.
 Tile = 256 threads × 96 bytes (24 KB) kept in shared memory. Pass A: per-thread
 state reduction, block scan + state look-back. Pass B: rescan, produce flags
 in registers, tokens written in place over the consumed bytes; block scan of
-counts + index look-back. Pass C: warp-cooperative coalesced emission (owner
-lane by binary search over lane counts, element by k-th set bit). DFA tables
-are still copied from global into shared memory at kernel start.
+counts + index look-back. Pass C: coalesced emission (originally: owner
+lane by binary search over lane counts, element by k-th set bit; now per-lane
+expansion, see below). DFA tables are
+still copied from global into shared memory at kernel start.
 
 A100 (μs):
 
@@ -880,4 +881,44 @@ SASS) costing ~676M warp instructions (45% of the kernel), once per output
 token — hence dense (150M tokens) was slow and sparse was not. Replaced by
 `select_bit`: word chosen with two `popc`, then a 5-step branchless `popc`
 binary search (~25 instructions, no call; checked against a naive select on
-~32M (mask, k) pairs). A100 numbers pending.
+~32M (mask, k) pairs). A100 S3: dense 3183 → 2055 μs, moderate 1258 → 1179,
+sparse 1132 → 1119 (S2: 2002 / 1118 / 1065).
+
+Remaining cost after the fix (S2 − S1): passes A/B ≈ 690 μs on every dataset
+(instruction-bound: two dependent shared lookups plus index extraction per
+byte, twice), emission ≈ 935 μs extra on dense (the per-slot owner search
+and select, ~40 instructions per token), look-backs ≈ 55 μs.
+
+### Chain tables and per-lane emission (A100 numbers pending)
+
+**Passes A/B — derived chain tables.** At kernel start each block builds two
+tables in shared memory from the DFA tables it loaded (so the DFA stays
+runtime data):
+- `row_of[256]` (u16): byte offset of the compose row of `to_state[b]`;
+- `comp[144]` (u16): compose results packed as index·2 (bits 1–4), produce
+  (bit 5), token (bits 6–8), accept (bit 9).
+
+One chain step is `v = comp[row_of[b] + (v & 0x1f)]` (byte addressing): an
+AND, an add and two shared loads, of which only the `comp` load is on the
+dependency chain, instead of `to_state` load → index extraction → multiply-add
+→ `compose` load. Produce/token/accept are bit tests on `v`. The block scan
+and the look-back still use `ShmemCompose` on the plain state index
+(`(v & 0x1f) >> 1`).
+
+**Emission — per-lane expansion.** Each lane walks its own produce mask
+(`__ffs`, clear lowest bit) and writes element positions (u16, within the
+warp's 3 KB segment) into a 256-slot per-warp staging area, in rounds of 256
+warp-local output slots; after `__syncwarp` the warp copies the round out
+coalesced (index = tile offset + position, token read from the in-place
+bytes). Cost per token: ~6 instructions in the expansion + ~6 in the copy,
+instead of the binary search + `select_bit` per slot. Lanes with many tokens
+serialize the expansion (divergence), bounded by 256 per round.
+
+Resources: staging adds 4 KB → 29.9 KB static shared memory per block, so 5
+blocks/SM (was 6). Launch bounds for `lexerBig` changed to `(256, 5)`
+(`LB_BIG`), which lets ptxas use 48 registers; at the old 40-register cap
+the new kernel spilled 20 B. S2: 48 regs, no spills; S3: 48 regs, 8 B spill
+(the old kernel spilled 4 B). SASS of all other kernels is unchanged.
+`select_bit` was removed (no other users).
+
+Local (sm_75) check: debug tests and all three datasets pass S3.

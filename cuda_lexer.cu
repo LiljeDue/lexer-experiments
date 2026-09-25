@@ -12,8 +12,10 @@
 // and the hint would be out of range, producing a ptxas warning.
 #if __CUDA_ARCH__ >= 800
 #define LB_P1 __launch_bounds__(256, 6)
+#define LB_BIG __launch_bounds__(256, 5)   // lexerBig: shared memory limits it to 5 blocks/SM
 #else
 #define LB_P1 __launch_bounds__(256)
+#define LB_BIG __launch_bounds__(256)
 #endif
 
 using token_t = uint8_t;
@@ -521,17 +523,18 @@ __device__ __forceinline__ void cp_async_wait() {
 // Output staging for coalesced index/token writes reuses the consumed input
 // buffer (tokens) plus a u16 buffer (positions within the tile).
 // ---------------------------------------------------------------------------
-// Position of the k-th (0-based) set bit of m, k < popc(m): branchless binary
-// search with popc on halves, quarters, ... (~25 instructions).
-__device__ __forceinline__ uint32_t select_bit(uint32_t m, uint32_t k) {
-    uint32_t pos = 0, c;
-    c = __popc(m & 0xffffu); if (k >= c) { k -= c; m >>= 16; pos += 16; }
-    c = __popc(m & 0xffu);   if (k >= c) { k -= c; m >>= 8;  pos += 8;  }
-    c = __popc(m & 0xfu);    if (k >= c) { k -= c; m >>= 4;  pos += 4;  }
-    c = __popc(m & 0x3u);    if (k >= c) { k -= c; m >>= 2;  pos += 2;  }
-    c = m & 0x1u;            if (k >= c) {                   pos += 1;  }
-    return pos;
+// Packed chain state for lexerBig's per-byte loop: bits 1-4 = state index * 2
+// (a byte offset into a u16 compose row), bit 5 = produce, bits 6-8 = token,
+// bit 9 = accept. Built from the DFA's state encoding, so the tables derived
+// with it stay runtime data.
+__device__ __forceinline__ uint16_t pack_chain_state(state_t s) {
+    return uint16_t((get_index(s) << 1) | (uint32_t(is_produce(s)) << 5)
+                  | (uint32_t(get_token(s)) << 6) | (uint32_t(is_accept(s)) << 9));
 }
+__device__ __forceinline__ state_t  chain_state_index(uint32_t v) { return state_t((v & 0x1fu) >> 1); }
+__device__ __forceinline__ bool     chain_produce(uint32_t v)     { return v & 0x20u; }
+__device__ __forceinline__ uint32_t chain_token(uint32_t v)       { return (v >> 6) & 7u; }
+__device__ __forceinline__ bool     chain_accept(uint32_t v)      { return (v >> 9) & 1u; }
 
 // Compose functor over the block's shared-memory table (one pointer, instead of
 // the three-pointer LexerCtxShmem, to keep register pressure down).
@@ -714,18 +717,21 @@ void lexerVecPipe(
 // A block's tile is BLOCK_SIZE * CHUNK input bytes (24 KB at 256 x 96), kept
 // in shared memory; thread t owns the CHUNK contiguous bytes
 // [t * CHUNK, (t + 1) * CHUNK). Per tile:
-//   A. per-thread state reduction over its chunk (to_state + compose), block
-//      exclusive scan of the thread aggregates with the state look-back ->
-//      each thread's incoming state;
+//   A. per-thread state reduction over its chunk, block exclusive scan of
+//      the thread aggregates with the state look-back -> each thread's
+//      incoming state;
 //   B. rescan of the chunk from that state: produce flags into a CHUNK-bit
-//      register mask, 4-bit tokens written back in place over the consumed
-//      input bytes; block exclusive scan of the per-thread token counts with
-//      the index look-back -> each thread's first output slot;
-//   C. warp-cooperative emission: each warp writes 32 consecutive output
-//      slots per step (coalesced). Lane r finds the lane owning slot r by a
-//      binary search over the lanes' inclusive counts and the element by a
-//      k-th-set-bit select in that lane's mask, then reads its token from
-//      shared memory.
+//      register mask, tokens written back in place over the consumed input
+//      bytes; block exclusive scan of the per-thread token counts with the
+//      index look-back -> each thread's first output slot;
+//   C. emission: each lane expands its own produce flags (lowest set bit
+//      first) into a per-warp staging area of element positions, in rounds
+//      of STAGE output slots; the warp copies each round out coalesced,
+//      reading tokens from shared memory.
+// Passes A and B step through derived tables (row_of, comp) built at kernel
+// start from the DFA tables: one chain step is an AND, an add and one shared
+// load on a packed state (pack_chain_state), instead of two table lookups
+// plus the index extraction of compose(s, to_state[byte]).
 // The next position's state for the chunk's last element comes from the next
 // thread's first byte (read before pass B overwrites bytes) or, for the
 // block's last thread, the next tile's first byte from global memory.
@@ -735,7 +741,7 @@ void lexerVecPipe(
 // outputs to its own region; output is not valid); 3 = full lexer.
 // ---------------------------------------------------------------------------
 template<typename I, I BLOCK_SIZE, I CHUNK, I STEP>
-__global__ LB_P1
+__global__ LB_BIG
 void lexerBig(
     LexerCtxShmem ctx,
     const uint8_t* __restrict__ d_in,
@@ -750,32 +756,45 @@ void lexerBig(
 {
     static_assert(STEP >= 1 && STEP <= 3, "STEP must be 1, 2 or 3");
     static_assert(CHUNK % 16 == 0 && CHUNK <= 96, "CHUNK: multiple of 16, at most 96 (3-word mask)");
+    static_assert(NUM_STATES <= 16, "packed chain states hold index * 2 in 5 bits");
     constexpr I WARPS      = BLOCK_SIZE / WARP;
     constexpr I VECS       = CHUNK / 16;
-    constexpr I MASK_WORDS = (CHUNK + 31) / 32;
     constexpr I WARP_BYTES = WARP * CHUNK;
     constexpr I TILE       = BLOCK_SIZE * CHUNK;
+    constexpr I STAGE      = 256;   // emission staging slots per warp per round
+    static_assert(WARP_BYTES <= 65536, "staged positions are uint16_t");
 
     using BlockScanState = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
     using BlockScanI     = cub::BlockScan<I, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
     using PrefixOpState  = TilePrefixCallbackOp<state_t, ShmemCompose, true>;
     using PrefixOpIdx    = TilePrefixCallbackOp<I, Add<I>, true>;
 
-    __shared__ __align__(16) uint8_t bytes[TILE];   // input bytes, then tokens
+    __shared__ __align__(16) uint8_t  bytes[TILE];            // input bytes, then tokens
+    __shared__ __align__(16) uint16_t stage_all[WARPS][STAGE]; // emission staging
     __shared__ typename BlockScanState::TempStorage state_scan;
     __shared__ typename PrefixOpState::TempStorage  state_prefix;
     __shared__ typename BlockScanI::TempStorage     idx_scan;
     __shared__ typename PrefixOpIdx::TempStorage    idx_prefix;
-    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
-    __shared__ __align__(8) state_t shmem_to_state[256];
+    __shared__ __align__(8) state_t  shmem_compose[NUM_STATES * NUM_STATES];
+    // Chain tables derived from the DFA tables at kernel start (the DFA stays
+    // runtime data): row_of[byte] = byte offset of the byte's compose row,
+    // comp[] = compose results packed by pack_chain_state, so one chain step
+    // is v = comp[row_of[byte] + (v & 0x1f)] (bytes).
+    __shared__ __align__(8) uint16_t row_of[256];
+    __shared__ __align__(8) uint16_t comp[NUM_STATES * NUM_STATES];
 
     for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES / 4; i += BLOCK_SIZE)
         reinterpret_cast<volatile uint64_t*>(shmem_compose)[i] =
             reinterpret_cast<uint64_t*>(ctx.d_compose_glb)[i];
-    for (uint32_t i = threadIdx.x; i < 256 / 4; i += BLOCK_SIZE)
-        reinterpret_cast<volatile uint64_t*>(shmem_to_state)[i] =
-            reinterpret_cast<uint64_t*>(ctx.d_to_state)[i];
+    for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_SIZE)
+        row_of[i] = uint16_t(get_index(ctx.d_to_state[i]) * NUM_STATES * sizeof(uint16_t));
+    for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES; i += BLOCK_SIZE)
+        comp[i] = pack_chain_state(ctx.d_compose_glb[i]);
     const ShmemCompose compose{shmem_compose};
+    auto step = [&](uint32_t v, uint32_t byte) -> uint32_t {
+        return *reinterpret_cast<const uint16_t*>(
+            reinterpret_cast<const uint8_t*>(comp) + row_of[byte] + (v & 0x1fu));
+    };
 
     const I tile      = blockIdx.x;
     const I warp      = threadIdx.x / WARP;
@@ -815,9 +834,9 @@ void lexerBig(
                           : threadIdx.x + 1 < BLOCK_SIZE ? my_bytes[CHUNK]
                           : d_in[next_gid];
 
-        // Pass A: per-thread state reduction.
+        // Pass A: per-thread state reduction (packed chain).
         const uint4* my = reinterpret_cast<const uint4*>(my_bytes);
-        state_t agg = IDENTITY;
+        uint32_t va = pack_chain_state(state_t(IDENTITY));
         #pragma unroll
         for (I k = 0; k < VECS; k++) {
             const uint4 v = my[k];
@@ -826,9 +845,11 @@ void lexerBig(
                 const uint32_t word = b < 4 ? v.x : b < 8 ? v.y : b < 12 ? v.z : v.w;
                 const uint32_t byte = (word >> (8 * (b % 4))) & 0xffu;
                 if (full || 16 * k + b < valid)
-                    agg = compose(agg, shmem_to_state[byte]);
+                    va = step(va, byte);
             }
         }
+        // Scans and look-back only need the state index (compose masks it).
+        const state_t agg = chain_state_index(va);
 
         state_t prefix;
         if constexpr (STEP == 3) {
@@ -850,7 +871,7 @@ void lexerBig(
             else if (j < 64) m1 |= 1u << (j - 32);
             else             m2 |= 1u << (j - 64);
         };
-        state_t st = prefix, last = prefix;
+        uint32_t st = pack_chain_state(prefix), last = st;
         #pragma unroll
         for (I k = 0; k < VECS; k++) {
             const uint4 v = my[k];
@@ -861,11 +882,11 @@ void lexerBig(
                 const uint32_t word = b < 4 ? v.x : b < 8 ? v.y : b < 12 ? v.z : v.w;
                 const uint32_t byte = (word >> (8 * (b % 4))) & 0xffu;
                 if (full || i < valid) {
-                    st = compose(st, shmem_to_state[byte]);
+                    st = step(st, byte);
                     // element i-1 produces if the state after it (st) does
-                    if (i > 0 && is_produce(st))
+                    if (i > 0 && chain_produce(st))
                         set_bit(i - 1);
-                    tw[b / 4] |= uint32_t(get_token(st)) << (8 * (b % 4));
+                    tw[b / 4] |= chain_token(st) << (8 * (b % 4));
                     last = st;
                 }
             }
@@ -875,7 +896,7 @@ void lexerBig(
             // last element of my chunk: next state from the following byte,
             // or the end of the input (the final element always produces)
             const I li = valid - 1;
-            const bool produce = !has_nb || is_produce(compose(last, shmem_to_state[nb]));
+            const bool produce = !has_nb || chain_produce(step(last, nb));
             if (produce)
                 set_bit(li);
         }
@@ -888,7 +909,7 @@ void lexerBig(
             BlockScanI(idx_scan).ExclusiveScan(count, offs, Add<I>(), idx_op);
             if (valid > 0 && my_offs + valid == size) {   // owner of the last input byte
                 *new_size = offs + count;
-                *is_valid = is_accept(last);
+                *is_valid = chain_accept(last);
             }
         } else {
             I tile_count;
@@ -896,7 +917,10 @@ void lexerBig(
             offs += tile_offs;   // each tile writes to its own region
         }
 
-        // Pass C: warp-cooperative emission.
+        // Pass C: emission. Each lane expands its own produce flags (lowest
+        // set bit first) into the warp's staging area, in rounds of STAGE
+        // output slots; each round is copied out coalesced, tokens read from
+        // the in-place bytes.
         I incl = count;
         #pragma unroll
         for (I d = 1; d < WARP; d <<= 1) {
@@ -906,34 +930,26 @@ void lexerBig(
         const I warp_total = __shfl_sync(0xffffffff, incl, WARP - 1);
         const I warp_base  = __shfl_sync(0xffffffff, offs, 0);
         const uint8_t* warp_tokens = bytes + warp * WARP_BYTES;
-        __syncwarp();   // tokens of all lanes written
-        for (I j = 0; j < warp_total; j += WARP) {
-            const I r = j + lane;
-            // owner lane: smallest o with incl_o > r
-            I o = 0;
-            #pragma unroll
-            for (I d = WARP / 2; d >= 1; d >>= 1) {
-                I v = __shfl_sync(0xffffffff, incl, o + d - 1);
-                if (v <= r) o += d;
+        uint16_t* stage = stage_all[warp];
+        I next = incl - count;   // warp-local slot of my next token
+        __syncwarp();            // tokens of all lanes written
+        for (I r0 = 0; r0 < warp_total; r0 += STAGE) {
+            const I r1 = min(r0 + STAGE, warp_total);
+            while (next < r1 && next < incl) {
+                uint32_t pos;
+                if (m0)      { pos = __ffs(m0) - 1;      m0 &= m0 - 1; }
+                else if (m1) { pos = 31 + __ffs(m1);     m1 &= m1 - 1; }
+                else         { pos = 63 + __ffs(m2);     m2 &= m2 - 1; }
+                stage[next - r0] = uint16_t(lane * CHUNK + pos);
+                next++;
             }
-            const I o_incl  = __shfl_sync(0xffffffff, incl, o);
-            const I o_count = __shfl_sync(0xffffffff, count, o);
-            I k = r - (o_incl - o_count);   // rank within the owner's tokens
-            const uint32_t om0 = __shfl_sync(0xffffffff, m0, o);
-            const uint32_t om1 = __shfl_sync(0xffffffff, m1, o);
-            const uint32_t om2 = __shfl_sync(0xffffffff, m2, o);
-            // Word holding the k-th set bit, then the bit within it
-            // (select_bit, not __fns: __fns expands to ~140 instructions).
-            const I c0 = __popc(om0), c01 = c0 + __popc(om1);
-            const uint32_t m = k < c0 ? om0 : k < c01 ? om1 : om2;
-            const I base     = k < c0 ? 0   : k < c01 ? 32  : 64;
-            k               -= k < c0 ? 0   : k < c01 ? c0  : c01;
-            const I pos = base + select_bit(m, k);
-            if (r < warp_total) {
-                const I elem = o * CHUNK + pos;   // within the warp's segment
-                d_index_out[warp_base + r] = tile_offs + warp * WARP_BYTES + elem;
-                d_token_out[warp_base + r] = warp_tokens[elem];
+            __syncwarp();
+            for (I s = lane; s < r1 - r0; s += WARP) {
+                const I elem = stage[s];   // within the warp's segment
+                d_index_out[warp_base + r0 + s] = tile_offs + warp * WARP_BYTES + elem;
+                d_token_out[warp_base + r0 + s] = warp_tokens[elem];
             }
+            __syncwarp();   // staging area reused next round
         }
     }
 }
