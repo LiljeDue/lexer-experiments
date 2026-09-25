@@ -889,7 +889,7 @@ Remaining cost after the fix (S2 − S1): passes A/B ≈ 690 μs on every datase
 byte, twice), emission ≈ 935 μs extra on dense (the per-slot owner search
 and select, ~40 instructions per token), look-backs ≈ 55 μs.
 
-### Chain tables and per-lane emission (A100 numbers pending)
+### Chain tables and per-lane emission
 
 **Passes A/B — derived chain tables.** At kernel start each block builds two
 tables in shared memory from the DFA tables it loaded (so the DFA stays
@@ -919,6 +919,33 @@ blocks/SM (was 6). Launch bounds for `lexerBig` changed to `(256, 5)`
 (`LB_BIG`), which lets ptxas use 48 registers; at the old 40-register cap
 the new kernel spilled 20 B. S2: 48 regs, no spills; S3: 48 regs, 8 B spill
 (the old kernel spilled 4 B). SASS of all other kernels is unchanged.
-`select_bit` was removed (no other users).
+`select_bit` was removed in `10c634b` (restored for the split below).
 
 Local (sm_75) check: debug tests and all three datasets pass S3.
+
+**A100, both changes together (`10c634b`) — slower** (μs):
+
+| | S2 before → after | S3 before → after | S3 − S2 before → after |
+|---|---|---|---|
+| dense | 2002 → 2070 (+68) | 2055 → 2197 (+142) | 53 → 127 |
+| moderate | 1118 → 1098 (−20) | 1179 → 1214 (+35) | 61 → 116 |
+| sparse | 1065 → 1045 (−20) | 1119 → 1134 (+15) | 54 → 89 |
+
+Hypotheses (unmeasured): the chain tables give the ~20 μs S2 gain on the
+token-poor datasets (smaller than expected: byte extraction and address
+arithmetic cost as much per byte as the removed lookup); the staged emission
+costs ~90 μs on dense (divergent per-lane expansion, or 5 blocks/SM); the
+look-back cost grows by 35–75 μs, suspected from 5 blocks/SM (fewer tiles in
+flight).
+
+**Split (A100 numbers pending).** `lexerBig` now takes `CHAIN` and `STAGED`
+template flags; the bench runs S2 and S3 for all four combinations, and
+`make profile` profiles all four on dense. Launch bounds follow the emission
+(`LB_BIG(STAGED)`: 5 blocks/SM staged, 6 otherwise), and the staging array
+only exists when `STAGED`. Checks (sm_80 SASS): compose + select is
+identical to `7b34870` (S1, S3; S2 differs by three register renames);
+chain + staged is identical to `10c634b` up to shared-memory offsets; other
+kernels unchanged. Registers / smem: compose + select 40 / 25.5 KB,
+chain + select 40 / 25.8 KB, compose + staged 48 / 29.6 KB,
+chain + staged 48 / 29.9 KB. All four pass the debug tests and all three
+datasets locally.
