@@ -26,6 +26,7 @@ enum ScanTileStatus : uint32_t {
 //
 // Layout: TxnWord = (value << (8*sizeof(T))) | status
 //
+// T=uint8_t:  TxnWord=uint16_t,           status in bits [7:0],   value in bits [15:8]
 // T=uint16_t: TxnWord=uint32_t,           status in bits [15:0],  value in bits [31:16]
 // T=uint32_t: TxnWord=unsigned long long, status in bits [31:0],  value in bits [63:32]
 //
@@ -35,6 +36,18 @@ enum ScanTileStatus : uint32_t {
 template<typename T>
 struct TxnWordTraits;
 
+template<> struct TxnWordTraits<uint8_t> {
+    using TxnWord    = uint16_t;
+    using StatusWord = uint8_t;
+    __device__ __forceinline__
+    static TxnWord pack(StatusWord status, uint8_t value) {
+        return uint16_t((uint32_t(value) << 8) | uint32_t(status));
+    }
+    __device__ __forceinline__
+    static StatusWord unpack_status(TxnWord w) { return StatusWord(w & 0xffu); }
+    __device__ __forceinline__
+    static uint8_t    unpack_value(TxnWord w)  { return uint8_t(w >> 8); }
+};
 template<> struct TxnWordTraits<uint16_t> {
     using TxnWord    = uint32_t;
     using StatusWord = uint16_t;
@@ -75,6 +88,9 @@ __device__ __forceinline__ TxnWord load_relaxed(const TxnWord* ptr) {
 // Relaxed GPU-scope store without a fence. Status and value share one word,
 // so a reader needs no ordering beyond that word itself (measured +54 GB/s
 // over store_release for P1 in p1_bench.cu).
+__device__ __forceinline__ void store_relaxed_gpu(uint16_t* ptr, uint16_t val) {
+    asm volatile("st.relaxed.gpu.u16 [%0], %1;" :: "l"(ptr), "h"(val) : "memory");
+}
 __device__ __forceinline__ void store_relaxed_gpu(uint32_t* ptr, uint32_t val) {
     asm volatile("st.relaxed.gpu.u32 [%0], %1;" :: "l"(ptr), "r"(val) : "memory");
 }

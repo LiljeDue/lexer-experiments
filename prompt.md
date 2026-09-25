@@ -1246,3 +1246,38 @@ two help slightly. Combined rows added: **all three** and **row_of-u8 +
 comp_pf-regs** (without swizzle, for dense). Combined variants: ≤ 40
 registers, no spills, 25.7 KB shared memory; debug tests and all datasets
 pass S3 locally. A100 bench numbers pending.
+
+### state_t width and DFA size
+
+Requirement: the state-specific optimizations must work for `state_t` =
+`uint8_t`, `uint16_t` or `uint32_t`.
+
+- **Width-independent already:** the packed chain state, `comp`, `row_of`,
+  `comp_pf`, the swizzle, row_of-u8, comp_pf-regs and the 4-at-a-time
+  produce flags only read states through `get_index` / `get_token` /
+  `is_produce` / `is_accept` and use their own u16/u8 formats.
+- **Fixed — table copies:** the compose / to_state tables were copied as
+  `uint64_t` with `NUM_STATES * NUM_STATES / 4` and `256 / 4` words (4 states
+  per word: 2-byte states only; silently wrong for 1- or 4-byte states) in
+  `lexerTranspose`, `lexerVecPipe` and `lexerBig`. Now
+  `copy_states_to_shared<N, BLOCK_SIZE>` copies `N * sizeof(state_t)` bytes
+  (8 bytes at a time when the size allows, else per state). SASS of all
+  existing kernels unchanged for `uint16_t`.
+- **Fixed — look-back descriptors:** `TxnWordTraits<uint8_t>` (16-bit
+  descriptor: status in bits 7–0, value in 15–8) and a 16-bit
+  `st.relaxed.gpu.u16`. Checked with a standalone decoupled look-back scan
+  (4M elements, 32768 tiles) for uint8 (add and an order-sensitive
+  "last non-zero" operator), uint16 and uint32: no mismatches.
+- **Encoding limits → generic path:** the fast path needs at most 16 states
+  (index in 4 bits) and at most 8 tokens (3 token bits):
+  `LEXER_CHAIN_FITS = NUM_STATES <= 16 && popcount(TOKEN_MASK) <= 3`. A DFA
+  that does not fit (whatever the width of `state_t`) compiles `lexerBig`'s
+  generic path: passes A and B as plain `compose(s, to_state[b])` chains over
+  `state_t` in shared memory, per-byte produce test, tokens stored as bytes;
+  look-backs and emission are shared (the swizzle also applies). RB8 and
+  PFREG require the fast path (`static_assert`). Before, > 16 states failed
+  to compile and > 8 tokens were silently truncated.
+- **Tested:** `FORCE_GENERIC` runs the generic path on this DFA: debug tests
+  (with and without swizzle) and all three datasets pass S3; bench row
+  `Big S3 generic path (forced)` shows its cost. Not tested: a real
+  `uint8_t`/`uint32_t` DFA (none available; this DFA needs 9 bits).

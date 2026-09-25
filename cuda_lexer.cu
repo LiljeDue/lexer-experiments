@@ -83,6 +83,19 @@ __device__ __host__ __forceinline__ bool is_produce(state_t state) {
     return (state & PRODUCE_MASK) >> PRODUCE_OFFSET;
 }
 
+// Copies N state_t values from global to shared memory, 8 bytes at a time
+// when the table size allows it (any sizeof(state_t)).
+template<uint32_t N, uint32_t BLOCK_SIZE>
+__device__ __forceinline__ void copy_states_to_shared(state_t* dst, state_t* src) {
+    if constexpr ((N * sizeof(state_t)) % 8 == 0) {
+        for (uint32_t i = threadIdx.x; i < N * sizeof(state_t) / 8; i += BLOCK_SIZE)
+            reinterpret_cast<volatile uint64_t*>(dst)[i] = reinterpret_cast<uint64_t*>(src)[i];
+    } else {
+        for (uint32_t i = threadIdx.x; i < N; i += BLOCK_SIZE)
+            reinterpret_cast<volatile state_t*>(dst)[i] = src[i];
+    }
+}
+
 struct LexerCtx {
     state_t* d_to_state;
     state_t* d_compose;
@@ -374,12 +387,8 @@ void lexerTranspose(
     __shared__ state_t next_block_first_state;
 
     // Load tables into shmem (can share the load union slot, tables are separate).
-    for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES / 4; i += BLOCK_SIZE)
-        reinterpret_cast<volatile uint64_t*>(shmem_compose)[i] =
-            reinterpret_cast<uint64_t*>(ctx.d_compose_glb)[i];
-    for (uint32_t i = threadIdx.x; i < 256 / 4; i += BLOCK_SIZE)
-        reinterpret_cast<volatile uint64_t*>(shmem_to_state)[i] =
-            reinterpret_cast<uint64_t*>(ctx.d_to_state)[i];
+    copy_states_to_shared<NUM_STATES * NUM_STATES, BLOCK_SIZE>(shmem_compose, ctx.d_compose_glb);
+    copy_states_to_shared<256, BLOCK_SIZE>(shmem_to_state, ctx.d_to_state);
     ctx.d_compose = shmem_compose;
 
     if (threadIdx.x == 0)
@@ -542,6 +551,12 @@ __device__ __forceinline__ uint16_t pack_chain_state(state_t s) {
     return uint16_t(uint32_t(is_produce(s)) | (get_index(s) << 1)
                   | (uint32_t(get_token(s)) << 5) | (uint32_t(is_accept(s)) << 8));
 }
+// The packed chain state / state byte hold the index in 4 bits and the token
+// in 3; DFAs that do not fit use lexerBig's generic path (plain state_t
+// compose chains), whatever the width of state_t.
+constexpr uint32_t popcount_const(uint32_t x) { return x ? (x & 1u) + popcount_const(x >> 1) : 0; }
+constexpr bool LEXER_CHAIN_FITS = NUM_STATES <= 16 && popcount_const(TOKEN_MASK) <= 3;
+
 __device__ __forceinline__ state_t  chain_state_index(uint32_t v) { return state_t((v & 0x1eu) >> 1); }
 __device__ __forceinline__ bool     chain_produce(uint32_t v)     { return v & 1u; }
 __device__ __forceinline__ uint32_t chain_token(uint32_t v)       { return (v >> 5) & 7u; }
@@ -598,12 +613,8 @@ void lexerVecPipe(
     __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
     __shared__ __align__(8) state_t shmem_to_state[256];
 
-    for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES / 4; i += BLOCK_SIZE)
-        reinterpret_cast<volatile uint64_t*>(shmem_compose)[i] =
-            reinterpret_cast<uint64_t*>(ctx.d_compose_glb)[i];
-    for (uint32_t i = threadIdx.x; i < 256 / 4; i += BLOCK_SIZE)
-        reinterpret_cast<volatile uint64_t*>(shmem_to_state)[i] =
-            reinterpret_cast<uint64_t*>(ctx.d_to_state)[i];
+    copy_states_to_shared<NUM_STATES * NUM_STATES, BLOCK_SIZE>(shmem_compose, ctx.d_compose_glb);
+    copy_states_to_shared<256, BLOCK_SIZE>(shmem_to_state, ctx.d_to_state);
     const ShmemCompose compose{shmem_compose};
     __syncthreads();
 
@@ -762,7 +773,8 @@ void lexerVecPipe(
 // and output without look-backs (tile-local states, each tile writes its
 // outputs to its own region; output is not valid); 3 = full lexer.
 // ---------------------------------------------------------------------------
-template<typename I, I BLOCK_SIZE, I CHUNK, I STEP, bool SWZ = false, bool RB8 = false, bool PFREG = false>
+template<typename I, I BLOCK_SIZE, I CHUNK, I STEP, bool SWZ = false, bool RB8 = false, bool PFREG = false,
+         bool FORCE_GENERIC = false>
 __global__ LB_P1
 void lexerBig(
     LexerCtxShmem ctx,
@@ -778,7 +790,10 @@ void lexerBig(
 {
     static_assert(STEP >= 1 && STEP <= 3, "STEP must be 1, 2 or 3");
     static_assert(CHUNK % 16 == 0 && CHUNK <= 96, "CHUNK: multiple of 16, at most 96 (3-word mask)");
-    static_assert(NUM_STATES <= 16, "packed chain states hold index * 2 in 5 bits");
+    // FAST: packed chain states and state bytes (needs LEXER_CHAIN_FITS);
+    // otherwise the generic path (state_t compose chains in passes A and B).
+    constexpr bool FAST = LEXER_CHAIN_FITS && !FORCE_GENERIC;
+    static_assert(!(RB8 || PFREG) || FAST, "RB8 / PFREG need the packed fast path");
     static_assert(!SWZ || CHUNK % 32 == 0, "SWZ: chunk offsets must keep bit 4 free");
     static_assert(!RB8 || (NUM_STATES * sizeof(uint16_t)) % 8 == 0, "RB8: compose rows in 8-byte units");
     constexpr I VECS       = CHUNK / 16;
@@ -807,23 +822,27 @@ void lexerBig(
     // RB8: row_of as bytes, in 8-byte units (row offset >> 3): 256 bytes, so
     // bytes < 128 (ASCII) all fall in different banks (unreferenced otherwise).
     __shared__ __align__(8) uint8_t  row_of8[256];
+    // Generic path: to_state as loaded (unreferenced on the fast path).
+    __shared__ __align__(8) state_t shmem_to_state[256];
 
-    for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES / 4; i += BLOCK_SIZE)
-        reinterpret_cast<volatile uint64_t*>(shmem_compose)[i] =
-            reinterpret_cast<uint64_t*>(ctx.d_compose_glb)[i];
-    if constexpr (RB8) {
-        for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_SIZE)
-            row_of8[i] = uint8_t(get_index(ctx.d_to_state[i]) * NUM_STATES * sizeof(uint16_t) / 8);
+    copy_states_to_shared<NUM_STATES * NUM_STATES, BLOCK_SIZE>(shmem_compose, ctx.d_compose_glb);
+    if constexpr (!FAST) {
+        copy_states_to_shared<256, BLOCK_SIZE>(shmem_to_state, ctx.d_to_state);
     } else {
-        for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_SIZE)
-            row_of[i] = uint16_t(get_index(ctx.d_to_state[i]) * NUM_STATES * sizeof(uint16_t));
-    }
-    for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES; i += BLOCK_SIZE)
-        comp[i] = pack_chain_state(ctx.d_compose_glb[i]);
-    for (uint32_t i = threadIdx.x; i < NUM_STATES * 16; i += BLOCK_SIZE) {
-        const uint32_t p = i / 16, f = i % 16;
-        comp_pf[i] = f < NUM_STATES
-            ? uint8_t(pack_chain_state(ctx.d_compose_glb[f * NUM_STATES + p])) : 0;
+        if constexpr (RB8) {
+            for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_SIZE)
+                row_of8[i] = uint8_t(get_index(ctx.d_to_state[i]) * NUM_STATES * sizeof(uint16_t) / 8);
+        } else {
+            for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_SIZE)
+                row_of[i] = uint16_t(get_index(ctx.d_to_state[i]) * NUM_STATES * sizeof(uint16_t));
+        }
+        for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES; i += BLOCK_SIZE)
+            comp[i] = pack_chain_state(ctx.d_compose_glb[i]);
+        for (uint32_t i = threadIdx.x; i < NUM_STATES * 16; i += BLOCK_SIZE) {
+            const uint32_t p = i / 16, f = i % 16;
+            comp_pf[i] = f < NUM_STATES
+                ? uint8_t(pack_chain_state(ctx.d_compose_glb[f * NUM_STATES + p])) : 0;
+        }
     }
     const ShmemCompose compose{shmem_compose};
     auto step = [&](uint32_t v, uint32_t byte) -> uint32_t {
@@ -885,25 +904,41 @@ void lexerBig(
         // Pass A: per-thread state reduction (packed chain); each prefix F_i
         // (state byte of the chain from IDENTITY) is stored in place over the
         // input.
+        // Generic path: plain state_t chain, input bytes left in place.
         uint4* my = reinterpret_cast<uint4*>(my_bytes);
         uint32_t va = pack_chain_state(state_t(IDENTITY));
-        #pragma unroll
-        for (I k = 0; k < VECS; k++) {
-            const uint4 v = my[SWZ ? k ^ sw : k];
-            uint32_t tw[4] = {0, 0, 0, 0};
+        state_t  ga = IDENTITY;
+        if constexpr (FAST) {
             #pragma unroll
-            for (I b = 0; b < 16; b++) {
-                const uint32_t word = b < 4 ? v.x : b < 8 ? v.y : b < 12 ? v.z : v.w;
-                const uint32_t byte = (word >> (8 * (b % 4))) & 0xffu;
-                if (full || 16 * k + b < valid) {
-                    va = step(va, byte);
-                    tw[b / 4] |= (va & 0xffu) << (8 * (b % 4));
+            for (I k = 0; k < VECS; k++) {
+                const uint4 v = my[SWZ ? k ^ sw : k];
+                uint32_t tw[4] = {0, 0, 0, 0};
+                #pragma unroll
+                for (I b = 0; b < 16; b++) {
+                    const uint32_t word = b < 4 ? v.x : b < 8 ? v.y : b < 12 ? v.z : v.w;
+                    const uint32_t byte = (word >> (8 * (b % 4))) & 0xffu;
+                    if (full || 16 * k + b < valid) {
+                        va = step(va, byte);
+                        tw[b / 4] |= (va & 0xffu) << (8 * (b % 4));
+                    }
+                }
+                my[SWZ ? k ^ sw : k] = make_uint4(tw[0], tw[1], tw[2], tw[3]);
+            }
+        } else {
+            #pragma unroll
+            for (I k = 0; k < VECS; k++) {
+                const uint4 v = my[SWZ ? k ^ sw : k];
+                #pragma unroll
+                for (I b = 0; b < 16; b++) {
+                    const uint32_t word = b < 4 ? v.x : b < 8 ? v.y : b < 12 ? v.z : v.w;
+                    const uint32_t byte = (word >> (8 * (b % 4))) & 0xffu;
+                    if (full || 16 * k + b < valid)
+                        ga = compose(ga, shmem_to_state[byte]);
                 }
             }
-            my[SWZ ? k ^ sw : k] = make_uint4(tw[0], tw[1], tw[2], tw[3]);
         }
         // Scans and look-back only need the state index (compose masks it).
-        const state_t agg = chain_state_index(va);
+        const state_t agg = FAST ? chain_state_index(va) : ga;
 
         state_t prefix;
         if constexpr (STEP == 3) {
@@ -919,6 +954,37 @@ void lexerBig(
         // F_{4q+j} under my prefix. State bytes (produce bit 0, token bits
         // 5-7) are written in place; produce flags are gathered 4 bytes at a
         // time (p bit i = state i produces).
+        // Generic path: rescan with the state_t chain from the incoming state,
+        // per-byte produce test, tokens written in place.
+        uint32_t m0, m1, m2;
+        state_t  last_g = prefix;   // generic: state after my last valid byte
+        if constexpr (!FAST) {
+            m0 = m1 = m2 = 0;
+            state_t st = prefix;
+            #pragma unroll
+            for (I k = 0; k < VECS; k++) {
+                const uint4 v = my[SWZ ? k ^ sw : k];
+                uint32_t tw[4] = {0, 0, 0, 0};
+                #pragma unroll
+                for (I b = 0; b < 16; b++) {
+                    const I i = 16 * k + b;
+                    const uint32_t word = b < 4 ? v.x : b < 8 ? v.y : b < 12 ? v.z : v.w;
+                    const uint32_t byte = (word >> (8 * (b % 4))) & 0xffu;
+                    if (full || i < valid) {
+                        st = compose(st, shmem_to_state[byte]);
+                        // element i-1 produces if the state after it (st) does
+                        if (i > 0 && is_produce(st)) {
+                            if (i - 1 < 32)      m0 |= 1u << (i - 1);
+                            else if (i - 1 < 64) m1 |= 1u << (i - 1 - 32);
+                            else                 m2 |= 1u << (i - 1 - 64);
+                        }
+                        tw[b / 4] |= uint32_t(uint8_t(get_token(st))) << (8 * (b % 4));
+                        last_g = st;
+                    }
+                }
+                my[SWZ ? k ^ sw : k] = make_uint4(tw[0], tw[1], tw[2], tw[3]);
+            }
+        } else {
         const uint32_t pf_base = uint32_t(get_index(prefix)) * 16u * 0x01010101u;
         // PFREG: my prefix's 16-entry comp_pf row in 4 registers; each state
         // byte is selected with PRMT (entries 0-7 and 8-15, blended by bit 3
@@ -966,14 +1032,9 @@ void lexerBig(
         // Produce flags: element j (bit j of the chunk, in word j / 32)
         // produces if state j + 1 does. Scalars, so the compiler cannot place
         // them in local memory.
-        uint32_t m0 = (p0 >> 1) | (p1 << 31);
-        uint32_t m1 = (p1 >> 1) | (p2 << 31);
-        uint32_t m2 = p2 >> 1;
-        auto set_bit = [&](I j) {
-            if (j < 32)      m0 |= 1u << j;
-            else if (j < 64) m1 |= 1u << (j - 32);
-            else             m2 |= 1u << (j - 64);
-        };
+        m0 = (p0 >> 1) | (p1 << 31);
+        m1 = (p1 >> 1) | (p2 << 31);
+        m2 = p2 >> 1;
         if (!full) {
             // states of bytes past my valid input are garbage: keep elements
             // [0, valid - 1) (the last one is set below)
@@ -982,12 +1043,27 @@ void lexerBig(
             m1 &= n >= 64 ? ~0u : n <= 32 ? 0u : (1u << (n - 32)) - 1;
             m2 &= n <= 64 ? 0u : (1u << (n - 64)) - 1;
         }
-        const uint32_t last = pack_chain_state(compose(prefix, chain_state_index(va)));
+        }
+        auto set_bit = [&](I j) {
+            if (j < 32)      m0 |= 1u << j;
+            else if (j < 64) m1 |= 1u << (j - 32);
+            else             m2 |= 1u << (j - 64);
+        };
+        const uint32_t last = FAST ? pack_chain_state(compose(prefix, chain_state_index(va))) : 0u;
+        // Next state after my last element produces / my last state accepts.
+        auto next_produces = [&]() -> bool {
+            if constexpr (FAST) return chain_produce(step(last, nb));
+            else                return is_produce(compose(last_g, shmem_to_state[nb]));
+        };
+        auto last_accepts = [&]() -> bool {
+            if constexpr (FAST) return chain_accept(last);
+            else                return is_accept(last_g);
+        };
         if (valid > 0) {
             // last element of my chunk: next state from the following byte,
             // or the end of the input (the final element always produces)
             const I li = valid - 1;
-            const bool produce = !has_nb || chain_produce(step(last, nb));
+            const bool produce = !has_nb || next_produces();
             if (produce)
                 set_bit(li);
         }
@@ -1000,7 +1076,7 @@ void lexerBig(
             BlockScanI(idx_scan).ExclusiveScan(count, offs, Add<I>(), idx_op);
             if (valid > 0 && my_offs + valid == size) {   // owner of the last input byte
                 *new_size = offs + count;
-                *is_valid = chain_accept(last);
+                *is_valid = last_accepts();
             }
         } else {
             I tile_count;
@@ -1045,7 +1121,7 @@ void lexerBig(
                 const I elem = o * CHUNK + pos;   // within the warp's segment
                 d_index_out[warp_base + r] = tile_offs + warp * WARP_BYTES + elem;
                 d_token_out[warp_base + r] =
-                    warp_states[SWZ ? elem ^ (((o >> 2) & 1) << 4) : elem] >> 5;   // token bits
+                    warp_states[SWZ ? elem ^ (((o >> 2) & 1) << 4) : elem] >> (FAST ? 5 : 0);   // token
             }
         }
     }
@@ -1333,9 +1409,10 @@ void testLexerVecPipe(uint8_t* input,
 
 // Requests the maximum shared memory carveout for lexerBig (~26 KB per block;
 // 6 blocks/SM exceed the default configuration) and returns blocks/SM.
-template<typename I, I BS, I CHUNK, I STEP, bool SWZ = false, bool RB8 = false, bool PFREG = false>
+template<typename I, I BS, I CHUNK, I STEP, bool SWZ = false, bool RB8 = false, bool PFREG = false,
+         bool FORCE_GENERIC = false>
 static int lexerBigBlocksPerSM() {
-    auto kernel = lexerBig<I, BS, CHUNK, STEP, SWZ, RB8, PFREG>;
+    auto kernel = lexerBig<I, BS, CHUNK, STEP, SWZ, RB8, PFREG, FORCE_GENERIC>;
     gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                    (int)cudaSharedmemCarveoutMaxShared));
     int bps = 0;
@@ -1345,7 +1422,8 @@ static int lexerBigBlocksPerSM() {
 
 // STEP 1/2 are ladder steps (timing only, output not valid); STEP 3 is checked
 // against the expected output. GB/s always counts the full lexer's traffic.
-template<uint32_t BS, uint32_t CHUNK, uint32_t STEP, bool SWZ = false, bool RB8 = false, bool PFREG = false>
+template<uint32_t BS, uint32_t CHUNK, uint32_t STEP, bool SWZ = false, bool RB8 = false, bool PFREG = false,
+         bool FORCE_GENERIC = false>
 void testLexerBig(uint8_t* input,
                   size_t input_size,
                   uint32_t* expected_indices,
@@ -1385,7 +1463,7 @@ void testLexerBig(uint8_t* input,
     gpuAssert(cudaMemcpy(d_in, input, IN_ARRAY_BYTES, cudaMemcpyHostToDevice));
 
     LexerCtxShmem ctx = LexerCtxShmem();
-    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, SWZ, RB8, PFREG>());
+    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, SWZ, RB8, PFREG, FORCE_GENERIC>());
     fflush(stdout);
 
     auto reset = [&]() {
@@ -1394,7 +1472,7 @@ void testLexerBig(uint8_t* input,
         initScanTileState(d_index_states, (int)NLB);
     };
     auto launch = [&]() {
-        lexerBig<I, BS, CHUNK, STEP, SWZ, RB8, PFREG><<<NLB, BS>>>(
+        lexerBig<I, BS, CHUNK, STEP, SWZ, RB8, PFREG, FORCE_GENERIC><<<NLB, BS>>>(
             ctx, d_in, d_index_out, d_token_out,
             d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid);
     };
@@ -1660,9 +1738,9 @@ bool runTest(LexerTest* test) {
     }
 
     // Same test for lexerBig (large-tile single-pass lexer, full STEP 3), all variants.
-    auto run_big = [&](auto swz_c, auto rb8_c, auto pfreg_c) {
+    auto run_big = [&](auto swz_c, auto rb8_c, auto pfreg_c, auto gen_c) {
         constexpr bool SWZ = decltype(swz_c)::value, RB8 = decltype(rb8_c)::value,
-                       PFREG = decltype(pfreg_c)::value;
+                       PFREG = decltype(pfreg_c)::value, GEN = decltype(gen_c)::value;
         const I BIG_CHUNK = 96;
         const I big_tiles = (size + BLOCK_SIZE * BIG_CHUNK - 1) / (BLOCK_SIZE * BIG_CHUNK);
         ScanTileState<state_t> bg_state_states;
@@ -1679,8 +1757,8 @@ bool runTest(LexerTest* test) {
         gpuAssert(cudaMemset(d_token_out, 0xff, size * sizeof(token_t)));
 
         LexerCtxShmem bg_ctx;
-        lexerBigBlocksPerSM<I, BLOCK_SIZE, BIG_CHUNK, 3, SWZ, RB8, PFREG>();
-        lexerBig<I, BLOCK_SIZE, BIG_CHUNK, 3, SWZ, RB8, PFREG><<<big_tiles, BLOCK_SIZE>>>(
+        lexerBigBlocksPerSM<I, BLOCK_SIZE, BIG_CHUNK, 3, SWZ, RB8, PFREG, GEN>();
+        lexerBig<I, BLOCK_SIZE, BIG_CHUNK, 3, SWZ, RB8, PFREG, GEN><<<big_tiles, BLOCK_SIZE>>>(
             bg_ctx, d_in, d_index_out, d_token_out, bg_state_states, bg_index_states,
             size, big_tiles, d_new_size, d_is_valid);
         gpuAssert(cudaDeviceSynchronize());
@@ -1701,22 +1779,24 @@ bool runTest(LexerTest* test) {
                           bg_tokens[i]  == test->expected_tokens[i];
         }
         if (bg_pass)
-            printf("PASS [%s] (lexerBig swz=%d rb8=%d pfreg=%d)\n", test->name, (int)SWZ, (int)RB8, (int)PFREG);
+            printf("PASS [%s] (lexerBig swz=%d rb8=%d pfreg=%d generic=%d)\n", test->name, (int)SWZ, (int)RB8, (int)PFREG, (int)GEN);
         else
-            fprintf(stderr, "FAIL [%s] (lexerBig swz=%d rb8=%d pfreg=%d): valid=%d size=%u (expected %zu)\n",
-                    test->name, (int)SWZ, (int)RB8, (int)PFREG, (int)bg_valid, bg_size, test->expected_size);
+            fprintf(stderr, "FAIL [%s] (lexerBig swz=%d rb8=%d pfreg=%d generic=%d): valid=%d size=%u (expected %zu)\n",
+                    test->name, (int)SWZ, (int)RB8, (int)PFREG, (int)GEN, (int)bg_valid, bg_size, test->expected_size);
         pass = pass && bg_pass;
 
         bg_ctx.Cleanup();
         gpuAssert(cudaFree(bg_state_states.d_tile_descriptors));
         gpuAssert(cudaFree(bg_index_states.d_tile_descriptors));
     };
-    run_big(std::false_type{}, std::false_type{}, std::false_type{});
-    run_big(std::true_type{},  std::false_type{}, std::false_type{});
-    run_big(std::false_type{}, std::true_type{},  std::false_type{});
-    run_big(std::false_type{}, std::false_type{}, std::true_type{});
-    run_big(std::true_type{},  std::true_type{},  std::true_type{});
-    run_big(std::false_type{}, std::true_type{},  std::true_type{});
+    run_big(std::false_type{}, std::false_type{}, std::false_type{}, std::false_type{});
+    run_big(std::true_type{},  std::false_type{}, std::false_type{}, std::false_type{});
+    run_big(std::false_type{}, std::true_type{},  std::false_type{}, std::false_type{});
+    run_big(std::false_type{}, std::false_type{}, std::true_type{}, std::false_type{});
+    run_big(std::true_type{},  std::true_type{},  std::true_type{}, std::false_type{});
+    run_big(std::false_type{}, std::true_type{},  std::true_type{}, std::false_type{});
+    run_big(std::false_type{}, std::false_type{}, std::false_type{}, std::true_type{});
+    run_big(std::true_type{},  std::false_type{}, std::false_type{}, std::true_type{});
 
     ctx.Cleanup();
     gpuAssert(cudaFree(d_in));
@@ -1836,6 +1916,10 @@ int main(int32_t argc, char *argv[]) {
     testLexerBig<256, 96, 2, false, true, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Big S3 row_of-u8 + comp_pf-regs:"); fflush(stdout);
     testLexerBig<256, 96, 3, false, true, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    // Generic path (state_t compose chains), forced on this DFA: the cost of
+    // DFAs that do not fit the packed fast path.
+    printf(PAD, "Big S3 generic path (forced):"); fflush(stdout);
+    testLexerBig<256, 96, 3, false, false, false, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     free(input);
     free(expected_indices);
     free(expected_tokens);
