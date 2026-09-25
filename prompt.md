@@ -1110,3 +1110,23 @@ comparable to the bench).
 
 Current `lexerBig` unchanged (`be346d9` code): A100 S3 dense 1833–1844 μs,
 moderate 985, sparse 925.
+
+### Diagnostic: do load and compute overlap? (A100 numbers pending)
+
+Estimated issue time alone on dense is ~1.15 ms (700M warp instructions /
+432 schedulers at 1.41 GHz), the load alone (S1) 375 μs, and S2 1834 μs ≈
+S1 + compute + stores; on sparse S2 (871) ≈ S1 (375) + compute as well. The
+flagless pass A saved 12M instructions but no time. Hypothesis: DRAM reads
+and compute add up instead of overlapping.
+
+Test: `lexerBig<..., L2IN = true>` makes every block read the input of tile
+`blockIdx.x % 64` (1.5 MB, stays in L2), bench rows `Big S2/S3 L2-resident
+input` (output not valid; outputs are still written to DRAM). The first 64
+tiles have the whole file's token density (tokens per byte: dense 0.2862 vs
+0.2864, moderate 0.0219 vs 0.0216, sparse 0.0022 vs 0.0023), so emission
+work is representative. The default kernel's SASS is unchanged
+(byte-identical to `be346d9`).
+
+Reading: S2 ≈ S1 + S2-L2 → load and compute do not overlap (prefetching /
+pipelining is the target); S2 ≈ S2-L2 → compute-bound (pass A / emission are
+the targets).

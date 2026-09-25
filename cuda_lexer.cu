@@ -757,7 +757,7 @@ void lexerVecPipe(
 // and output without look-backs (tile-local states, each tile writes its
 // outputs to its own region; output is not valid); 3 = full lexer.
 // ---------------------------------------------------------------------------
-template<typename I, I BLOCK_SIZE, I CHUNK, I STEP>
+template<typename I, I BLOCK_SIZE, I CHUNK, I STEP, bool L2IN = false>
 __global__ LB_P1
 void lexerBig(
     LexerCtxShmem ctx,
@@ -824,17 +824,21 @@ void lexerBig(
     const I my_offs   = tile_offs + threadIdx.x * CHUNK;          // first byte of my chunk
     const I valid     = my_offs < size ? min(size - my_offs, CHUNK) : 0;
     uint8_t* my_bytes = bytes + threadIdx.x * CHUNK;
+    // Input reads: L2IN (diagnostic) reads tile blockIdx.x % 64 instead of
+    // its own, so the input stays in L2 and the run measures compute without
+    // DRAM reads (output not valid).
+    const uint8_t* __restrict__ in = L2IN ? d_in + (tile % 64) * TILE - tile_offs : d_in;
 
     // Load the tile: coalesced 16-byte vectors over each warp's segment.
     if (full) {
-        const uint4* src = reinterpret_cast<const uint4*>(d_in + tile_offs + warp * WARP_BYTES);
+        const uint4* src = reinterpret_cast<const uint4*>(in + tile_offs + warp * WARP_BYTES);
         uint4*       dst = reinterpret_cast<uint4*>(bytes + warp * WARP_BYTES);
         #pragma unroll
         for (I k = 0; k < VECS; k++)
             dst[lane + k * WARP] = src[lane + k * WARP];
     } else {
         for (I i = 0; i < CHUNK; i++)
-            my_bytes[i] = i < valid ? d_in[my_offs + i] : 0;
+            my_bytes[i] = i < valid ? in[my_offs + i] : 0;
     }
     __syncthreads();   // tables and all chunks (the next thread's first byte) loaded
 
@@ -852,7 +856,7 @@ void lexerBig(
         const bool has_nb = next_gid < size && valid == CHUNK;
         const uint8_t nb  = !has_nb ? 0
                           : threadIdx.x + 1 < BLOCK_SIZE ? my_bytes[CHUNK]
-                          : d_in[next_gid];
+                          : in[next_gid];
         __syncthreads();   // next bytes read before pass A overwrites the chunks
 
         // Pass A: per-thread state reduction (packed chain); each prefix F_i
@@ -1288,9 +1292,9 @@ void testLexerVecPipe(uint8_t* input,
 
 // Requests the maximum shared memory carveout for lexerBig (~26 KB per block;
 // 6 blocks/SM exceed the default configuration) and returns blocks/SM.
-template<typename I, I BS, I CHUNK, I STEP>
+template<typename I, I BS, I CHUNK, I STEP, bool L2IN = false>
 static int lexerBigBlocksPerSM() {
-    auto kernel = lexerBig<I, BS, CHUNK, STEP>;
+    auto kernel = lexerBig<I, BS, CHUNK, STEP, L2IN>;
     gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                    (int)cudaSharedmemCarveoutMaxShared));
     int bps = 0;
@@ -1299,8 +1303,9 @@ static int lexerBigBlocksPerSM() {
 }
 
 // STEP 1/2 are ladder steps (timing only, output not valid); STEP 3 is checked
-// against the expected output. GB/s always counts the full lexer's traffic.
-template<uint32_t BS, uint32_t CHUNK, uint32_t STEP>
+// against the expected output (unless L2IN: diagnostic, every block reads the
+// input of tile blockIdx.x % 64). GB/s always counts the full lexer's traffic.
+template<uint32_t BS, uint32_t CHUNK, uint32_t STEP, bool L2IN = false>
 void testLexerBig(uint8_t* input,
                   size_t input_size,
                   uint32_t* expected_indices,
@@ -1340,7 +1345,7 @@ void testLexerBig(uint8_t* input,
     gpuAssert(cudaMemcpy(d_in, input, IN_ARRAY_BYTES, cudaMemcpyHostToDevice));
 
     LexerCtxShmem ctx = LexerCtxShmem();
-    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP>());
+    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, L2IN>());
     fflush(stdout);
 
     auto reset = [&]() {
@@ -1349,7 +1354,7 @@ void testLexerBig(uint8_t* input,
         initScanTileState(d_index_states, (int)NLB);
     };
     auto launch = [&]() {
-        lexerBig<I, BS, CHUNK, STEP><<<NLB, BS>>>(
+        lexerBig<I, BS, CHUNK, STEP, L2IN><<<NLB, BS>>>(
             ctx, d_in, d_index_out, d_token_out,
             d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid);
     };
@@ -1374,7 +1379,7 @@ void testLexerBig(uint8_t* input,
     }
 
     bool test_passes = true;
-    if (STEP == 3) {
+    if (STEP == 3 && !L2IN) {
         reset();
         launch();
         cudaDeviceSynchronize(); gpuAssert(cudaPeekAtLastError());
@@ -1415,7 +1420,7 @@ void testLexerBig(uint8_t* input,
         const size_t TOTAL_BYTES = IN_ARRAY_BYTES
             + (STEP == 1 ? 0 : expected_size * (sizeof(I) + sizeof(token_t)));
         printf("\n");
-        printf("  %-36s ", STEP == 3 ? "Total:" : "Total (ladder, output not valid):");
+        printf("  %-36s ", STEP == 3 && !L2IN ? "Total:" : "Total (ladder, output not valid):");
         compute_descriptors(temp_total, RUNS, TOTAL_BYTES);
     }
 
@@ -1761,6 +1766,14 @@ int main(int32_t argc, char *argv[]) {
     printf(PAD, "Big tile S3 (full) BS256/CHUNK96:");
     fflush(stdout);
     testLexerBig<256, 96, 3>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    // Diagnostic: input served from L2 (each block reads tile blockIdx.x % 64),
+    // i.e. the compute time without DRAM reads; compare with S1 and S2/S3.
+    printf(PAD, "Big S2 L2-resident input:");
+    fflush(stdout);
+    testLexerBig<256, 96, 2, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Big S3 L2-resident input:");
+    fflush(stdout);
+    testLexerBig<256, 96, 3, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     free(input);
     free(expected_indices);
     free(expected_tokens);
