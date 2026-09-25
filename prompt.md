@@ -966,3 +966,39 @@ buffer free before the whole block's tokens are read.
 speed of light), moderate 1144 μs (37%), sparse 1086 μs (36%). Its SASS is
 identical to the benchmarked chain + select variant (S2, S3; S1 differs only
 by the table setup). Local: debug tests and all three datasets pass S3.
+
+### Pass B: packed flags and independent lookups (A100 numbers pending)
+
+Profile of chain + select (dense S2): emission ~50% of warp instructions
+(~43% of stall samples), passes A/B 33% (37%). A chain step costs ~5.8
+instructions per byte; pass B adds ~4.4 per byte for the produce test,
+`set_bit` and token packing (~17.5 per byte for A + B).
+
+`lexerBig` takes a `PASSB` template parameter; the bench runs S2/S3 for each:
+- **0**: current pass B (chain rescan, per-byte produce test, tokens in place).
+- **1 — packed flags**: chain rescan, but the state byte (low byte of the
+  chain state) is written in place, and produce flags are gathered 4 bytes at
+  a time: `((w & 0x01010101) * 0x10204080) >> 28` (checked exhaustively
+  against a per-byte loop on 20M random words). Element mask = produce mask
+  of states shifted by one; the emission extracts the token as `byte >> 5`.
+- **2 — independent lookups**: as 1, and pass A also writes each prefix
+  function F_i (state byte) in place; pass B computes state i as
+  `compose(prefix, F_i)` from `comp_pf[p * 16 + f]` (192 B, u8 state bytes),
+  four at a time: `((w >> 1) & 0x0f0f0f0f) | prefix * 16 * 0x01010101` gives
+  four table indices, then `PRMT` + `LDS.U8` per byte — no serial chain in
+  pass B. Needs one more `__syncthreads` (the next thread's first byte is
+  read before pass A overwrites it), and in partial tiles the elements from
+  bytes past the valid input are masked off. Correct only if every state
+  index has a single full state value in the compose table (flags a function
+  of the index); checked for this DFA (12 indices, 12 distinct values; the
+  table is associative on full values).
+
+To make the state byte complete, the chain state layout changed to produce
+bit 0, index·2 bits 1–4, token bits 5–7, accept bit 8 (step mask `0x1e`).
+Hence variant 0 is not byte-identical to `0905f95`: SASS is 1–2% shorter
+(the flag tests changed); treat it as a near-control.
+
+sm_80: all variants 40 registers, 25.8–26.0 KB shared memory (6 blocks/SM);
+variant 0 spills 8–12 B as before, variants 1 and 2 do not spill. Static
+code size (S2): 8708 / 7456 / 5792 SASS lines. Other kernels' SASS unchanged.
+Local: debug tests and all three datasets pass S3 for all variants.
