@@ -12,11 +12,8 @@
 // and the hint would be out of range, producing a ptxas warning.
 #if __CUDA_ARCH__ >= 800
 #define LB_P1 __launch_bounds__(256, 6)
-// lexerBig: the STAGED emission's staging area limits it to 5 blocks/SM.
-#define LB_BIG(STAGED) __launch_bounds__(256, (STAGED) ? 5 : 6)
 #else
 #define LB_P1 __launch_bounds__(256)
-#define LB_BIG(STAGED) __launch_bounds__(256)
 #endif
 
 using token_t = uint8_t;
@@ -737,19 +734,15 @@ void lexerVecPipe(
 //      register mask, tokens written back in place over the consumed input
 //      bytes; block exclusive scan of the per-thread token counts with the
 //      index look-back -> each thread's first output slot;
-//   C. coalesced emission, tokens read from shared memory.
-// Variants (under evaluation):
-//   CHAIN  = false: passes A/B step with compose(s, to_state[byte]);
-//            true:  through derived tables (row_of, comp) built at kernel
-//            start from the DFA tables: one chain step is an AND, an add and
-//            one shared load on a packed state (pack_chain_state).
-//   STAGED = false: each warp writes 32 consecutive output slots per step;
-//            lane r finds the lane owning slot r by a binary search over the
-//            lanes' inclusive counts and the element by a k-th-set-bit select;
-//            true:  each lane expands its own produce flags (lowest set bit
-//            first) into a per-warp staging area of element positions, in
-//            rounds of STAGE output slots, copied out coalesced (4 KB more
-//            shared memory: 5 blocks/SM instead of 6).
+//   C. warp-cooperative emission: each warp writes 32 consecutive output
+//      slots per step (coalesced). Lane r finds the lane owning slot r by a
+//      binary search over the lanes' inclusive counts and the element by a
+//      k-th-set-bit select in that lane's mask, then reads its token from
+//      shared memory.
+// Passes A and B step through derived tables (row_of, comp) built at kernel
+// start from the DFA tables: one chain step is an AND, an add and one shared
+// load on a packed state (pack_chain_state), instead of two table lookups
+// plus the index extraction of compose(s, to_state[byte]).
 // The next position's state for the chunk's last element comes from the next
 // thread's first byte (read before pass B overwrites bytes) or, for the
 // block's last thread, the next tile's first byte from global memory.
@@ -758,8 +751,8 @@ void lexerVecPipe(
 // and output without look-backs (tile-local states, each tile writes its
 // outputs to its own region; output is not valid); 3 = full lexer.
 // ---------------------------------------------------------------------------
-template<typename I, I BLOCK_SIZE, I CHUNK, I STEP, bool CHAIN, bool STAGED>
-__global__ LB_BIG(STAGED)
+template<typename I, I BLOCK_SIZE, I CHUNK, I STEP>
+__global__ LB_P1
 void lexerBig(
     LexerCtxShmem ctx,
     const uint8_t* __restrict__ d_in,
@@ -774,20 +767,15 @@ void lexerBig(
 {
     static_assert(STEP >= 1 && STEP <= 3, "STEP must be 1, 2 or 3");
     static_assert(CHUNK % 16 == 0 && CHUNK <= 96, "CHUNK: multiple of 16, at most 96 (3-word mask)");
-    static_assert(!CHAIN || NUM_STATES <= 16, "packed chain states hold index * 2 in 5 bits");
-    constexpr I WARPS      = BLOCK_SIZE / WARP;
+    static_assert(NUM_STATES <= 16, "packed chain states hold index * 2 in 5 bits");
     constexpr I VECS       = CHUNK / 16;
     constexpr I WARP_BYTES = WARP * CHUNK;
     constexpr I TILE       = BLOCK_SIZE * CHUNK;
-    constexpr I STAGE      = 256;   // emission staging slots per warp per round
-    static_assert(WARP_BYTES <= 65536, "staged positions are uint16_t");
 
     using BlockScanState = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
     using BlockScanI     = cub::BlockScan<I, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
     using PrefixOpState  = TilePrefixCallbackOp<state_t, ShmemCompose, true>;
     using PrefixOpIdx    = TilePrefixCallbackOp<I, Add<I>, true>;
-    // Per-byte chain state: packed (CHAIN) or a plain DFA state.
-    using chain_t        = std::conditional_t<CHAIN, uint32_t, state_t>;
 
     __shared__ __align__(16) uint8_t bytes[TILE];   // input bytes, then tokens
     __shared__ typename BlockScanState::TempStorage state_scan;
@@ -795,54 +783,24 @@ void lexerBig(
     __shared__ typename BlockScanI::TempStorage     idx_scan;
     __shared__ typename PrefixOpIdx::TempStorage    idx_prefix;
     __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
-    // Arrays of the variant not compiled in are unreferenced and take no space.
-    __shared__ __align__(8) state_t shmem_to_state[256];                 // !CHAIN
     // Chain tables derived from the DFA tables at kernel start (the DFA stays
     // runtime data): row_of[byte] = byte offset of the byte's compose row,
     // comp[] = compose results packed by pack_chain_state, so one chain step
     // is v = comp[row_of[byte] + (v & 0x1f)] (bytes).
-    __shared__ __align__(8) uint16_t row_of[256];                         // CHAIN
-    __shared__ __align__(8) uint16_t comp[NUM_STATES * NUM_STATES];       // CHAIN
-    __shared__ __align__(16) uint16_t stage_all[WARPS][STAGE];            // STAGED
+    __shared__ __align__(8) uint16_t row_of[256];
+    __shared__ __align__(8) uint16_t comp[NUM_STATES * NUM_STATES];
 
     for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES / 4; i += BLOCK_SIZE)
         reinterpret_cast<volatile uint64_t*>(shmem_compose)[i] =
             reinterpret_cast<uint64_t*>(ctx.d_compose_glb)[i];
-    if constexpr (CHAIN) {
-        for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_SIZE)
-            row_of[i] = uint16_t(get_index(ctx.d_to_state[i]) * NUM_STATES * sizeof(uint16_t));
-        for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES; i += BLOCK_SIZE)
-            comp[i] = pack_chain_state(ctx.d_compose_glb[i]);
-    } else {
-        for (uint32_t i = threadIdx.x; i < 256 / 4; i += BLOCK_SIZE)
-            reinterpret_cast<volatile uint64_t*>(shmem_to_state)[i] =
-                reinterpret_cast<uint64_t*>(ctx.d_to_state)[i];
-    }
+    for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_SIZE)
+        row_of[i] = uint16_t(get_index(ctx.d_to_state[i]) * NUM_STATES * sizeof(uint16_t));
+    for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES; i += BLOCK_SIZE)
+        comp[i] = pack_chain_state(ctx.d_compose_glb[i]);
     const ShmemCompose compose{shmem_compose};
-
-    // Chain-state operations of the two variants.
-    auto step = [&](chain_t v, uint32_t byte) -> chain_t {
-        if constexpr (CHAIN)
-            return *reinterpret_cast<const uint16_t*>(
-                reinterpret_cast<const uint8_t*>(comp) + row_of[byte] + (v & 0x1fu));
-        else
-            return compose(v, shmem_to_state[byte]);
-    };
-    auto from_state = [](state_t s) -> chain_t {
-        if constexpr (CHAIN) return pack_chain_state(s); else return s;
-    };
-    // Scans and look-back only need the state index (compose masks it).
-    auto to_state = [](chain_t v) -> state_t {
-        if constexpr (CHAIN) return chain_state_index(v); else return v;
-    };
-    auto c_produce = [](chain_t v) -> bool {
-        if constexpr (CHAIN) return chain_produce(v); else return is_produce(v);
-    };
-    auto c_token = [](chain_t v) -> uint32_t {
-        if constexpr (CHAIN) return chain_token(v); else return uint32_t(get_token(v));
-    };
-    auto c_accept = [](chain_t v) -> bool {
-        if constexpr (CHAIN) return chain_accept(v); else return is_accept(v);
+    auto step = [&](uint32_t v, uint32_t byte) -> uint32_t {
+        return *reinterpret_cast<const uint16_t*>(
+            reinterpret_cast<const uint8_t*>(comp) + row_of[byte] + (v & 0x1fu));
     };
 
     const I tile      = blockIdx.x;
@@ -883,9 +841,9 @@ void lexerBig(
                           : threadIdx.x + 1 < BLOCK_SIZE ? my_bytes[CHUNK]
                           : d_in[next_gid];
 
-        // Pass A: per-thread state reduction.
+        // Pass A: per-thread state reduction (packed chain).
         const uint4* my = reinterpret_cast<const uint4*>(my_bytes);
-        chain_t va = from_state(IDENTITY);
+        uint32_t va = pack_chain_state(state_t(IDENTITY));
         #pragma unroll
         for (I k = 0; k < VECS; k++) {
             const uint4 v = my[k];
@@ -897,7 +855,8 @@ void lexerBig(
                     va = step(va, byte);
             }
         }
-        const state_t agg = to_state(va);
+        // Scans and look-back only need the state index (compose masks it).
+        const state_t agg = chain_state_index(va);
 
         state_t prefix;
         if constexpr (STEP == 3) {
@@ -919,7 +878,7 @@ void lexerBig(
             else if (j < 64) m1 |= 1u << (j - 32);
             else             m2 |= 1u << (j - 64);
         };
-        chain_t st = from_state(prefix), last = st;
+        uint32_t st = pack_chain_state(prefix), last = st;
         #pragma unroll
         for (I k = 0; k < VECS; k++) {
             const uint4 v = my[k];
@@ -932,9 +891,9 @@ void lexerBig(
                 if (full || i < valid) {
                     st = step(st, byte);
                     // element i-1 produces if the state after it (st) does
-                    if (i > 0 && c_produce(st))
+                    if (i > 0 && chain_produce(st))
                         set_bit(i - 1);
-                    tw[b / 4] |= c_token(st) << (8 * (b % 4));
+                    tw[b / 4] |= chain_token(st) << (8 * (b % 4));
                     last = st;
                 }
             }
@@ -944,7 +903,7 @@ void lexerBig(
             // last element of my chunk: next state from the following byte,
             // or the end of the input (the final element always produces)
             const I li = valid - 1;
-            const bool produce = !has_nb || c_produce(step(last, nb));
+            const bool produce = !has_nb || chain_produce(step(last, nb));
             if (produce)
                 set_bit(li);
         }
@@ -957,7 +916,7 @@ void lexerBig(
             BlockScanI(idx_scan).ExclusiveScan(count, offs, Add<I>(), idx_op);
             if (valid > 0 && my_offs + valid == size) {   // owner of the last input byte
                 *new_size = offs + count;
-                *is_valid = c_accept(last);
+                *is_valid = chain_accept(last);
             }
         } else {
             I tile_count;
@@ -965,7 +924,7 @@ void lexerBig(
             offs += tile_offs;   // each tile writes to its own region
         }
 
-        // Pass C: emission.
+        // Pass C: warp-cooperative emission.
         I incl = count;
         #pragma unroll
         for (I d = 1; d < WARP; d <<= 1) {
@@ -975,63 +934,33 @@ void lexerBig(
         const I warp_total = __shfl_sync(0xffffffff, incl, WARP - 1);
         const I warp_base  = __shfl_sync(0xffffffff, offs, 0);
         const uint8_t* warp_tokens = bytes + warp * WARP_BYTES;
-        if constexpr (STAGED) {
-            // Each lane expands its own produce flags (lowest set bit first)
-            // into the warp's staging area, in rounds of STAGE output slots;
-            // each round is copied out coalesced.
-            uint16_t* stage = stage_all[warp];
-            I next = incl - count;   // warp-local slot of my next token
-            __syncwarp();            // tokens of all lanes written
-            for (I r0 = 0; r0 < warp_total; r0 += STAGE) {
-                const I r1 = min(r0 + STAGE, warp_total);
-                while (next < r1 && next < incl) {
-                    uint32_t pos;
-                    if (m0)      { pos = __ffs(m0) - 1;      m0 &= m0 - 1; }
-                    else if (m1) { pos = 31 + __ffs(m1);     m1 &= m1 - 1; }
-                    else         { pos = 63 + __ffs(m2);     m2 &= m2 - 1; }
-                    stage[next - r0] = uint16_t(lane * CHUNK + pos);
-                    next++;
-                }
-                __syncwarp();
-                for (I s = lane; s < r1 - r0; s += WARP) {
-                    const I elem = stage[s];   // within the warp's segment
-                    d_index_out[warp_base + r0 + s] = tile_offs + warp * WARP_BYTES + elem;
-                    d_token_out[warp_base + r0 + s] = warp_tokens[elem];
-                }
-                __syncwarp();   // staging area reused next round
+        __syncwarp();   // tokens of all lanes written
+        for (I j = 0; j < warp_total; j += WARP) {
+            const I r = j + lane;
+            // owner lane: smallest o with incl_o > r
+            I o = 0;
+            #pragma unroll
+            for (I d = WARP / 2; d >= 1; d >>= 1) {
+                I v = __shfl_sync(0xffffffff, incl, o + d - 1);
+                if (v <= r) o += d;
             }
-        } else {
-            // Warp-cooperative: 32 consecutive output slots per step. Lane r
-            // finds the owner lane of slot r by binary search over the lanes'
-            // inclusive counts, and the element by a k-th-set-bit select.
-            __syncwarp();   // tokens of all lanes written
-            for (I j = 0; j < warp_total; j += WARP) {
-                const I r = j + lane;
-                // owner lane: smallest o with incl_o > r
-                I o = 0;
-                #pragma unroll
-                for (I d = WARP / 2; d >= 1; d >>= 1) {
-                    I v = __shfl_sync(0xffffffff, incl, o + d - 1);
-                    if (v <= r) o += d;
-                }
-                const I o_incl  = __shfl_sync(0xffffffff, incl, o);
-                const I o_count = __shfl_sync(0xffffffff, count, o);
-                I k = r - (o_incl - o_count);   // rank within the owner's tokens
-                const uint32_t om0 = __shfl_sync(0xffffffff, m0, o);
-                const uint32_t om1 = __shfl_sync(0xffffffff, m1, o);
-                const uint32_t om2 = __shfl_sync(0xffffffff, m2, o);
-                // Word holding the k-th set bit, then the bit within it
-                // (select_bit, not __fns: __fns expands to ~140 instructions).
-                const I c0 = __popc(om0), c01 = c0 + __popc(om1);
-                const uint32_t m = k < c0 ? om0 : k < c01 ? om1 : om2;
-                const I base     = k < c0 ? 0   : k < c01 ? 32  : 64;
-                k               -= k < c0 ? 0   : k < c01 ? c0  : c01;
-                const I pos = base + select_bit(m, k);
-                if (r < warp_total) {
-                    const I elem = o * CHUNK + pos;   // within the warp's segment
-                    d_index_out[warp_base + r] = tile_offs + warp * WARP_BYTES + elem;
-                    d_token_out[warp_base + r] = warp_tokens[elem];
-                }
+            const I o_incl  = __shfl_sync(0xffffffff, incl, o);
+            const I o_count = __shfl_sync(0xffffffff, count, o);
+            I k = r - (o_incl - o_count);   // rank within the owner's tokens
+            const uint32_t om0 = __shfl_sync(0xffffffff, m0, o);
+            const uint32_t om1 = __shfl_sync(0xffffffff, m1, o);
+            const uint32_t om2 = __shfl_sync(0xffffffff, m2, o);
+            // Word holding the k-th set bit, then the bit within it
+            // (select_bit, not __fns: __fns expands to ~140 instructions).
+            const I c0 = __popc(om0), c01 = c0 + __popc(om1);
+            const uint32_t m = k < c0 ? om0 : k < c01 ? om1 : om2;
+            const I base     = k < c0 ? 0   : k < c01 ? 32  : 64;
+            k               -= k < c0 ? 0   : k < c01 ? c0  : c01;
+            const I pos = base + select_bit(m, k);
+            if (r < warp_total) {
+                const I elem = o * CHUNK + pos;   // within the warp's segment
+                d_index_out[warp_base + r] = tile_offs + warp * WARP_BYTES + elem;
+                d_token_out[warp_base + r] = warp_tokens[elem];
             }
         }
     }
@@ -1319,9 +1248,9 @@ void testLexerVecPipe(uint8_t* input,
 
 // Requests the maximum shared memory carveout for lexerBig (~26 KB per block;
 // 6 blocks/SM exceed the default configuration) and returns blocks/SM.
-template<typename I, I BS, I CHUNK, I STEP, bool CHAIN, bool STAGED>
+template<typename I, I BS, I CHUNK, I STEP>
 static int lexerBigBlocksPerSM() {
-    auto kernel = lexerBig<I, BS, CHUNK, STEP, CHAIN, STAGED>;
+    auto kernel = lexerBig<I, BS, CHUNK, STEP>;
     gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                    (int)cudaSharedmemCarveoutMaxShared));
     int bps = 0;
@@ -1331,7 +1260,7 @@ static int lexerBigBlocksPerSM() {
 
 // STEP 1/2 are ladder steps (timing only, output not valid); STEP 3 is checked
 // against the expected output. GB/s always counts the full lexer's traffic.
-template<uint32_t BS, uint32_t CHUNK, uint32_t STEP, bool CHAIN, bool STAGED>
+template<uint32_t BS, uint32_t CHUNK, uint32_t STEP>
 void testLexerBig(uint8_t* input,
                   size_t input_size,
                   uint32_t* expected_indices,
@@ -1371,7 +1300,7 @@ void testLexerBig(uint8_t* input,
     gpuAssert(cudaMemcpy(d_in, input, IN_ARRAY_BYTES, cudaMemcpyHostToDevice));
 
     LexerCtxShmem ctx = LexerCtxShmem();
-    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, CHAIN, STAGED>());
+    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP>());
     fflush(stdout);
 
     auto reset = [&]() {
@@ -1380,7 +1309,7 @@ void testLexerBig(uint8_t* input,
         initScanTileState(d_index_states, (int)NLB);
     };
     auto launch = [&]() {
-        lexerBig<I, BS, CHUNK, STEP, CHAIN, STAGED><<<NLB, BS>>>(
+        lexerBig<I, BS, CHUNK, STEP><<<NLB, BS>>>(
             ctx, d_in, d_index_out, d_token_out,
             d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid);
     };
@@ -1645,9 +1574,8 @@ bool runTest(LexerTest* test) {
         gpuAssert(cudaFree(vp_index_states.d_tile_descriptors));
     }
 
-    // Same test for lexerBig (large-tile single-pass lexer, full STEP 3), all variants.
-    auto run_big = [&](auto chain_c, auto staged_c) {
-        constexpr bool CHAIN = decltype(chain_c)::value, STAGED = decltype(staged_c)::value;
+    // Same test for lexerBig (large-tile single-pass lexer, full STEP 3).
+    {
         const I BIG_CHUNK = 96;
         const I big_tiles = (size + BLOCK_SIZE * BIG_CHUNK - 1) / (BLOCK_SIZE * BIG_CHUNK);
         ScanTileState<state_t> bg_state_states;
@@ -1664,8 +1592,8 @@ bool runTest(LexerTest* test) {
         gpuAssert(cudaMemset(d_token_out, 0xff, size * sizeof(token_t)));
 
         LexerCtxShmem bg_ctx;
-        lexerBigBlocksPerSM<I, BLOCK_SIZE, BIG_CHUNK, 3, CHAIN, STAGED>();
-        lexerBig<I, BLOCK_SIZE, BIG_CHUNK, 3, CHAIN, STAGED><<<big_tiles, BLOCK_SIZE>>>(
+        lexerBigBlocksPerSM<I, BLOCK_SIZE, BIG_CHUNK, 3>();
+        lexerBig<I, BLOCK_SIZE, BIG_CHUNK, 3><<<big_tiles, BLOCK_SIZE>>>(
             bg_ctx, d_in, d_index_out, d_token_out, bg_state_states, bg_index_states,
             size, big_tiles, d_new_size, d_is_valid);
         gpuAssert(cudaDeviceSynchronize());
@@ -1686,20 +1614,16 @@ bool runTest(LexerTest* test) {
                           bg_tokens[i]  == test->expected_tokens[i];
         }
         if (bg_pass)
-            printf("PASS [%s] (lexerBig chain=%d staged=%d)\n", test->name, (int)CHAIN, (int)STAGED);
+            printf("PASS [%s] (lexerBig)\n", test->name);
         else
-            fprintf(stderr, "FAIL [%s] (lexerBig chain=%d staged=%d): valid=%d size=%u (expected %zu)\n",
-                    test->name, (int)CHAIN, (int)STAGED, (int)bg_valid, bg_size, test->expected_size);
+            fprintf(stderr, "FAIL [%s] (lexerBig): valid=%d size=%u (expected %zu)\n",
+                    test->name, (int)bg_valid, bg_size, test->expected_size);
         pass = pass && bg_pass;
 
         bg_ctx.Cleanup();
         gpuAssert(cudaFree(bg_state_states.d_tile_descriptors));
         gpuAssert(cudaFree(bg_index_states.d_tile_descriptors));
-    };
-    run_big(std::false_type{}, std::false_type{});
-    run_big(std::true_type{},  std::false_type{});
-    run_big(std::false_type{}, std::true_type{});
-    run_big(std::true_type{},  std::true_type{});
+    }
 
     ctx.Cleanup();
     gpuAssert(cudaFree(d_in));
@@ -1790,32 +1714,13 @@ int main(int32_t argc, char *argv[]) {
     testLexerVecPipe<256, 24>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Big tile S1 (load only):");
     fflush(stdout);
-    testLexerBig<256, 96, 1, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    // Variants: passes A/B (compose / chain tables) x emission (select / staged).
-    printf(PAD, "Big S2 compose + select:");
+    testLexerBig<256, 96, 1>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Big tile S2 (no look-backs):");
     fflush(stdout);
-    testLexerBig<256, 96, 2, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 compose + select:");
+    testLexerBig<256, 96, 2>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Big tile S3 (full) BS256/CHUNK96:");
     fflush(stdout);
-    testLexerBig<256, 96, 3, false, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S2 chain + select:");
-    fflush(stdout);
-    testLexerBig<256, 96, 2, true, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 chain + select:");
-    fflush(stdout);
-    testLexerBig<256, 96, 3, true, false>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S2 compose + staged:");
-    fflush(stdout);
-    testLexerBig<256, 96, 2, false, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 compose + staged:");
-    fflush(stdout);
-    testLexerBig<256, 96, 3, false, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S2 chain + staged:");
-    fflush(stdout);
-    testLexerBig<256, 96, 2, true, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 chain + staged:");
-    fflush(stdout);
-    testLexerBig<256, 96, 3, true, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    testLexerBig<256, 96, 3>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     free(input);
     free(expected_indices);
     free(expected_tokens);

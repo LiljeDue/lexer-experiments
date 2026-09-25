@@ -889,11 +889,15 @@ Remaining cost after the fix (S2 − S1): passes A/B ≈ 690 μs on every datase
 byte, twice), emission ≈ 935 μs extra on dense (the per-slot owner search
 and select, ~40 instructions per token), look-backs ≈ 55 μs.
 
-### Chain tables and per-lane emission
+### Chain tables (kept) and per-lane staged emission (failed)
 
-**Passes A/B — derived chain tables.** At kernel start each block builds two
-tables in shared memory from the DFA tables it loaded (so the DFA stays
-runtime data):
+Two changes were tried together (`10c634b`), were slower together, and were
+then split with template flags (`635e6a0`) to measure each on the A100 and
+with ncu. Result: keep the chain tables, drop the staged emission.
+
+**Passes A/B — derived chain tables (kept).** At kernel start each block
+builds two tables in shared memory from the DFA tables it loaded (so the DFA
+stays runtime data):
 - `row_of[256]` (u16): byte offset of the compose row of `to_state[b]`;
 - `comp[144]` (u16): compose results packed as index·2 (bits 1–4), produce
   (bit 5), token (bits 6–8), accept (bit 9).
@@ -903,49 +907,62 @@ AND, an add and two shared loads, of which only the `comp` load is on the
 dependency chain, instead of `to_state` load → index extraction → multiply-add
 → `compose` load. Produce/token/accept are bit tests on `v`. The block scan
 and the look-back still use `ShmemCompose` on the plain state index
-(`(v & 0x1f) >> 1`).
+(`(v & 0x1f) >> 1`). 40 registers, 25.8 KB shared memory, 6 blocks/SM.
 
-**Emission — per-lane expansion.** Each lane walks its own produce mask
-(`__ffs`, clear lowest bit) and writes element positions (u16, within the
-warp's 3 KB segment) into a 256-slot per-warp staging area, in rounds of 256
-warp-local output slots; after `__syncwarp` the warp copies the round out
-coalesced (index = tile offset + position, token read from the in-place
-bytes). Cost per token: ~6 instructions in the expansion + ~6 in the copy,
-instead of the binary search + `select_bit` per slot. Lanes with many tokens
-serialize the expansion (divergence), bounded by 256 per round.
+**Emission — per-lane staged expansion (failed, removed).** Each lane walked
+its own produce mask (`__ffs`, clear lowest bit) and wrote element positions
+into a 256-slot per-warp u16 staging area, in rounds of 256 warp-local slots;
+the warp then copied each round out coalesced. It replaced the owner binary
+search + `select_bit` per output slot. The staging area added 4 KB of shared
+memory per block → 5 blocks/SM (launch bounds `(256, 5)`, 48 registers).
 
-Resources: staging adds 4 KB → 29.9 KB static shared memory per block, so 5
-blocks/SM (was 6). Launch bounds for `lexerBig` changed to `(256, 5)`
-(`LB_BIG`), which lets ptxas use 48 registers; at the old 40-register cap
-the new kernel spilled 20 B. S2: 48 regs, no spills; S3: 48 regs, 8 B spill
-(the old kernel spilled 4 B). SASS of all other kernels is unchanged.
-`select_bit` was removed in `10c634b` (restored for the split below).
+A100 split, μs (compose + select = `7b34870`):
 
-Local (sm_75) check: debug tests and all three datasets pass S3.
+| S3 | compose + select | chain + select | compose + staged | chain + staged |
+|---|---|---|---|---|
+| dense | 2057 | **1959** | 2260 | 2185 |
+| moderate | 1178 | **1144** | 1260 | 1227 |
+| sparse | 1123 | **1086** | 1178 | 1132 |
 
-**A100, both changes together (`10c634b`) — slower** (μs):
+| S2 | compose + select | chain + select | compose + staged | chain + staged |
+|---|---|---|---|---|
+| dense | 1996 | 1918 | 2169 | 2079 |
+| moderate | 1119 | 1103 | 1158 | 1108 |
+| sparse | 1065 | 1053 | 1089 | 1054 |
 
-| | S2 before → after | S3 before → after | S3 − S2 before → after |
-|---|---|---|---|
-| dense | 2002 → 2070 (+68) | 2055 → 2197 (+142) | 53 → 127 |
-| moderate | 1118 → 1098 (−20) | 1179 → 1214 (+35) | 61 → 116 |
-| sparse | 1065 → 1045 (−20) | 1119 → 1134 (+15) | 54 → 89 |
+S3 − S2 (look-back cost): select variants 33–61 μs, staged variants 78–119 μs.
 
-Hypotheses (unmeasured): the chain tables give the ~20 μs S2 gain on the
-token-poor datasets (smaller than expected: byte extraction and address
-arithmetic cost as much per byte as the removed lookup); the staged emission
-costs ~90 μs on dense (divergent per-lane expansion, or 5 blocks/SM); the
-look-back cost grows by 35–75 μs, suspected from 5 blocks/SM (fewer tiles in
-flight).
+ncu, dense (clocks locked at 765 MHz):
 
-**Split (A100 numbers pending).** `lexerBig` now takes `CHAIN` and `STAGED`
-template flags; the bench runs S2 and S3 for all four combinations, and
-`make profile` profiles all four on dense. Launch bounds follow the emission
-(`LB_BIG(STAGED)`: 5 blocks/SM staged, 6 otherwise), and the staging array
-only exists when `STAGED`. Checks (sm_80 SASS): compose + select is
-identical to `7b34870` (S1, S3; S2 differs by three register renames);
-chain + staged is identical to `10c634b` up to shared-memory offsets; other
-kernels unchanged. Registers / smem: compose + select 40 / 25.5 KB,
-chain + select 40 / 25.8 KB, compose + staged 48 / 29.6 KB,
-chain + staged 48 / 29.9 KB. All four pass the debug tests and all three
-datasets locally.
+| | blocks/SM | warps active | warp instr. (S2) | S2 | S3 − S2 |
+|---|---|---|---|---|---|
+| compose + select | 6 | 73% | 843M | 3.23 ms | 0.092 ms |
+| chain + select | 6 | 73% | 782M | 3.03 ms | 0.090 ms |
+| compose + staged | 5 | 59% | 1033M | 3.64 ms | 0.167 ms |
+| chain + staged | 5 | 59% | 976M | 3.47 ms | 0.190 ms |
+
+Causes:
+1. *Chain tables*: −61M warp instructions (−7%), all datasets faster; the
+   look-backs also got ~20 μs cheaper on the A100.
+2. *Staged emission executes more instructions, not fewer* (+190M, +22%).
+   Per source line, the expansion loop costs ~631M warp instructions vs
+   ~520M for the owner search + `select_bit` + shuffles. 443M of it is the
+   three-way `if (m0) / else if (m1) / else` word selection: lanes whose next
+   token is in different mask words diverge, so the warp runs the paths one
+   after another; and the loop runs as many iterations as the busiest lane
+   has tokens, not the average. My estimate (~12 instructions per token)
+   ignored both.
+3. *5 blocks/SM*: warps active 73% → 59%, and the look-back cost roughly
+   doubles (fewer tiles in flight to hide predecessor waits). This is why
+   staged also lost on sparse, which has almost no emission work.
+
+Alternatives not pursued: a branchless 96-bit lowest-set-bit (removes the
+divergent word selection but not the busiest-lane iteration count) would still
+pay the 5-blocks/SM occupancy and look-back cost; staging in the consumed
+input buffer instead of a separate area would keep 6 blocks/SM but needs the
+buffer free before the whole block's tokens are read.
+
+**Current `lexerBig` (chain + select), A100 S3:** dense 1959 μs (48% of
+speed of light), moderate 1144 μs (37%), sparse 1086 μs (36%). Its SASS is
+identical to the benchmarked chain + select variant (S2, S3; S1 differs only
+by the table setup). Local: debug tests and all three datasets pass S3.
