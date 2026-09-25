@@ -1036,3 +1036,40 @@ Next targets: the emission on dense (~2/3 of instructions); pass A's chain
 step (5.8 instructions per byte) for moderate/sparse; the extra barrier
 (lanes 0-30 can get the next byte by warp shuffle; lane 31 needs the next
 warp's first byte, e.g. from global memory, to avoid the race).
+
+### Emission and pass A variants (A100 numbers pending)
+
+Starting point `be346d9` (dense 1844 μs; emission ~2/3 of instructions on
+dense, ~115 warp instructions per 32 output slots). Five candidates, each
+measured as **one change against the base** (`lexerBig<..., EMIT, FLAGLESS,
+NOBAR>`; bench rows `Big S2/S3 <variant>`):
+
+1. **emit-words-dense** (`EMIT 1`): CHUNK = 96 = 3 × 32, so each 32-bit
+   produce-mask word covers 32 consecutive elements. The warp walks the
+   owner lanes with tokens (ballot, `__ffs`) and their non-zero mask words
+   (one shuffle each); lane l takes bit l, its slot is
+   `base + popc(w & lower_lanes)` — no owner search, no `select_bit`. Used
+   when the warp has more than 4 tokens per non-zero word (count of non-zero
+   words by `__reduce_add_sync`), otherwise the owner search. Estimate: ~15
+   instructions per word, about half of the emission on dense; stores write
+   ~9 slots per instruction instead of 32.
+2. **emit-words-all** (`EMIT 2`): word-aligned for every warp (estimated
+   slower on moderate/sparse, ~2 tokens per lane).
+3. **emit-owner-packed** (`EMIT 3`): owner search on one packed word per lane
+   (incl 31–20, count 19–13, popc(m0) 12–7, popc(m0)+popc(m1) 6–0): the
+   binary search compares against `(r << 20) | 0xfffff`, one shuffle gives the
+   owner's rank base and word popcounts (removes one shuffle and two `POPC`
+   per slot, adds field extraction). Expected small.
+4. **passA-flagless** (`FLAGLESS`): pass A steps through `comp_a` (index·2
+   only, no flags), so the per-byte `& 0x1e` disappears; pass B only needs the
+   index of F_i, and the incoming/last states still come from `comp`.
+   +288 B shared memory (26.3 KB, still 6 blocks/SM).
+5. **passA-no-barrier** (`NOBAR`): the next byte comes from the next lane by
+   `__shfl_down_sync` (read before that lane overwrites its chunk); lane 31
+   reads the next warp's or tile's first byte from global memory; the extra
+   `__syncthreads` is removed.
+
+Checks: base SASS identical to `be346d9` (S1, S3; S2 differs by the order of
+three `POPC`s); all variants 40 registers, no spills, ≤ 26.3 KB shared memory
+(6 blocks/SM); other kernels unchanged; debug tests and all three datasets
+pass S3 for all variants (local, sm_75).
