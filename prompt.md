@@ -967,38 +967,72 @@ speed of light), moderate 1144 μs (37%), sparse 1086 μs (36%). Its SASS is
 identical to the benchmarked chain + select variant (S2, S3; S1 differs only
 by the table setup). Local: debug tests and all three datasets pass S3.
 
-### Pass B: packed flags and independent lookups (A100 numbers pending)
+### Pass B: independent lookups (kept) and packed flags
 
 Profile of chain + select (dense S2): emission ~50% of warp instructions
 (~43% of stall samples), passes A/B 33% (37%). A chain step costs ~5.8
-instructions per byte; pass B adds ~4.4 per byte for the produce test,
+instructions per byte; pass B added ~4.4 per byte for the produce test,
 `set_bit` and token packing (~17.5 per byte for A + B).
 
-`lexerBig` takes a `PASSB` template parameter; the bench runs S2/S3 for each:
-- **0**: current pass B (chain rescan, per-byte produce test, tokens in place).
+Three pass B variants were measured (`db3621e`, template parameter `PASSB`):
+- **0**: chain rescan, per-byte produce test, tokens written in place.
 - **1 — packed flags**: chain rescan, but the state byte (low byte of the
   chain state) is written in place, and produce flags are gathered 4 bytes at
   a time: `((w & 0x01010101) * 0x10204080) >> 28` (checked exhaustively
   against a per-byte loop on 20M random words). Element mask = produce mask
   of states shifted by one; the emission extracts the token as `byte >> 5`.
-- **2 — independent lookups**: as 1, and pass A also writes each prefix
-  function F_i (state byte) in place; pass B computes state i as
+- **2 — independent lookups** (kept): as 1, and pass A also writes each
+  prefix function F_i (state byte) in place; pass B computes state i as
   `compose(prefix, F_i)` from `comp_pf[p * 16 + f]` (192 B, u8 state bytes),
   four at a time: `((w >> 1) & 0x0f0f0f0f) | prefix * 16 * 0x01010101` gives
   four table indices, then `PRMT` + `LDS.U8` per byte — no serial chain in
   pass B. Needs one more `__syncthreads` (the next thread's first byte is
   read before pass A overwrites it), and in partial tiles the elements from
-  bytes past the valid input are masked off. Correct only if every state
-  index has a single full state value in the compose table (flags a function
-  of the index); checked for this DFA (12 indices, 12 distinct values; the
-  table is associative on full values).
+  bytes past the valid input are masked off.
+
+**Requirement on the DFA (variant 2):** every state index must have a single
+full state value in the compose table (flags a function of the index);
+otherwise `compose(p, F_i)` can differ in its produce/token flags from the
+chain's state i. Checked for this DFA: 12 indices, 12 distinct values, and
+the table is associative on full values. A DFA loaded at run time must
+satisfy this (it holds when the states are the endomorphisms with fixed
+flags, as generated here).
 
 To make the state byte complete, the chain state layout changed to produce
 bit 0, index·2 bits 1–4, token bits 5–7, accept bit 8 (step mask `0x1e`).
-Hence variant 0 is not byte-identical to `0905f95`: SASS is 1–2% shorter
-(the flag tests changed); treat it as a near-control.
+All variants: 40 registers, 25.8–26.0 KB shared memory (6 blocks/SM).
 
-sm_80: all variants 40 registers, 25.8–26.0 KB shared memory (6 blocks/SM);
-variant 0 spills 8–12 B as before, variants 1 and 2 do not spill. Static
-code size (S2): 8708 / 7456 / 5792 SASS lines. Other kernels' SASS unchanged.
-Local: debug tests and all three datasets pass S3 for all variants.
+A100, μs (variant 0 ≈ chain + select: 1949 / 1143 / 1088 vs 1959 / 1144 / 1086):
+
+| S3 | 0 | 1 | 2 |
+|---|---|---|---|
+| dense | 1949 | 1892 (−57) | **1844 (−105)** |
+| moderate | 1143 | 1115 (−28) | **986 (−157)** |
+| sparse | 1088 | 1056 (−32) | **925 (−163)** |
+
+| S2 | 0 | 1 | 2 |
+|---|---|---|---|
+| dense | 1900 | 1886 (CI ±11) | 1808 (CI ±14) |
+| moderate | 1088 | 1063 | 920 |
+| sparse | 1043 | 1021 | 872 |
+
+ncu (dense S2, clocks locked at 765 MHz): warp instructions 775M / 738M /
+700M (variant 2: −10%), duration 2.99 / 2.93 / 2.76 ms; warps active ~73% and
+the stall mix unchanged across variants. Per source line, variant 0 → 2:
+pass B ~185M → 82M instructions (~5 per byte; the shared-memory latency of
+the serial chain is gone), pass A ~100M → 114M (~7 per byte: storing F_i
+costs ~1.2 per byte), emission unchanged at ~540M incl. shuffles (now ~2/3
+of the instructions and ~47% of stall samples on dense). The extra
+`__syncthreads` shows as the load + next-byte region rising from 3% to 8% of
+stall samples.
+
+Variant 1 helped but is dominated by variant 2 and was removed; variant 0
+was removed. **Current `lexerBig` (variant 2), A100 S3:** dense 1844 μs (51%
+of speed of light), moderate 986 μs (43%), sparse 925 μs (42%). SASS
+identical to the benchmarked variant 2 (S1–S3); debug tests and all three
+datasets pass S3 locally.
+
+Next targets: the emission on dense (~2/3 of instructions); pass A's chain
+step (5.8 instructions per byte) for moderate/sparse; the extra barrier
+(lanes 0-30 can get the next byte by warp shuffle; lane 31 needs the next
+warp's first byte, e.g. from global memory, to avoid the race).
