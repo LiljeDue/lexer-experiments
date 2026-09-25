@@ -1281,3 +1281,35 @@ Requirement: the state-specific optimizations must work for `state_t` =
   (with and without swizzle) and all three datasets pass S3; bench row
   `Big S3 generic path (forced)` shows its cost. Not tested: a real
   `uint8_t`/`uint32_t` DFA (none available; this DFA needs 9 bits).
+
+### Shared-memory variants: results and adoption (all three kept)
+
+ncu (real clock, `f8682ba`), S3 average per launch, change vs base:
+
+| | dense | moderate | sparse |
+|---|---|---|---|
+| base | 1.574 ms | 0.917 ms | 0.868 ms |
+| swizzle | +0.7% | −9% | −10% |
+| row_of-u8 | −1.2% | −7% | −8% |
+| comp_pf-regs | −1.1% | −6% | −7% |
+| **all three** | −0.9% | **−16%** (0.771) | **−19%** (0.703) |
+| row_of-u8 + comp_pf-regs | −2.6% | −13% (0.800) | −15% (0.740) |
+| generic path (forced, unswizzled) | +16% | +21% | +22% |
+
+All three together (S2): shared wavefronts sparse 115.0M → 66.5M, bank conflicts
+34.2M → 1.4M (moderate 35.3M → 2.0M), shared pipe 93% → 74%, issue 54% → 71%:
+moderate/sparse are no longer shared-memory bound. On dense (issue-bound)
+the swizzle's extra instructions cancel most of its gain.
+
+**Adopted: all three** (best on moderate/sparse, −0.9% on dense vs −2.6%
+without the swizzle). The `SWZ`/`RB8`/`PFREG` flags and the code they
+switched off were removed; the swizzle also applies to the generic path.
+`row_of8` generalized: 8-byte units when compose rows are a multiple of 8
+bytes, else 2-byte units (class · NUM_STATES ≤ 240 fits a byte). S2/S3 SASS
+identical to the benchmarked all-three variant up to shared-memory offsets;
+debug tests (fast and forced generic) and all three datasets pass S3.
+Decided on ncu numbers (single launches, no power cap); the sustained bench
+has not been checked for this choice.
+
+**Next:** with less compute per tile, the look-backs show on moderate and
+sparse: S3 − S2 grew from 52–68 μs (base) to 107–122 μs (all three).
