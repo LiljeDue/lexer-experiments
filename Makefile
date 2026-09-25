@@ -130,16 +130,19 @@ test: $(CUDA_DEBUG_PROGRAM)
 	@./$(CUDA_DEBUG_PROGRAM)
 	@echo -e "$(GREEN)==============================$(DEFAULT)"
 
-profile: $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out
+# Profile the lexer on one dataset: make profile [DATA=dense|moderate|sparse]
+# (default dense). Writes profile_lexer_$(DATA).ncu-rep / .txt.
+DATA ?= dense
+profile: $(DATA_PATH)/tokens_$(DATA)_500MiB.in tokens_indices_$(DATA)_500MiB.out tokens_tokens_$(DATA)_500MiB.out
 	$(COMPILER) $(FLAGS) -DPROFILE -lineinfo -o $(CUDA_PROGRAM)_profile cuda_lexer.cu
-	-ncu --set full \
+	-ncu --set full -f \
 	    --clock-control none \
 	    --import-source 1 \
 	    --source-folders . \
 	    --target-processes all \
-	    --export profile_lexer \
-	    ./$(CUDA_PROGRAM)_profile $(DATA_PATH)/tokens_dense_500MiB.in tokens_indices_dense_500MiB.out tokens_tokens_dense_500MiB.out 2>&1
-	-ncu --import profile_lexer.ncu-rep > profile_lexer.txt 2>&1
+	    --export profile_lexer_$(DATA) \
+	    ./$(CUDA_PROGRAM)_profile $(DATA_PATH)/tokens_$(DATA)_500MiB.in tokens_indices_$(DATA)_500MiB.out tokens_tokens_$(DATA)_500MiB.out 2>&1
+	-ncu --import profile_lexer_$(DATA).ncu-rep > profile_lexer_$(DATA).txt 2>&1
 
 profile_p1: $(DATA_PATH)/tokens_dense_500MiB.in
 	$(COMPILER) $(FLAGS) -DPROFILE -lineinfo -o $(P1_BENCH_PROGRAM)_profile p1_bench.cu
