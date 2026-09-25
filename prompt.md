@@ -1171,3 +1171,52 @@ Consequences:
    cap (1140–1275 MHz within one row), not from the kernel.
 3. ncu durations (single launches with idle gaps, no cap) are shorter than
    the bench's sustained numbers; compare variants within one tool only.
+
+### Moderate/sparse are shared-memory bound; shared-memory variants (A100 numbers pending)
+
+`make profile DATA=moderate|sparse` (real clock, `be346d9` kernel), S2:
+
+| | moderate | sparse | dense |
+|---|---|---|---|
+| duration | 0.853 ms | 0.820 ms | 1.511 ms |
+| warp instructions | 291M | 264M | 700M |
+| issue active | 57% | 54% | 77% |
+| shared-memory pipe (data wavefronts) | 92% | 93% | 74% |
+| top stalls | mio_throttle, short_scoreboard | same | — |
+
+Moderate and sparse are bound by the shared-memory pipe, not by issue. Sparse
+S2: 109M shared wavefronts, 33.5M (31%) of them from bank conflicts:
+
+| source | wavefronts | from conflicts |
+|---|---|---|
+| pass A chain step (`row_of[byte]` + `comp[...]`, 2 loads/byte) | 49.0M | 15.9M |
+| own-chunk `LDS/STS.128`, stride 96 B (pass A/B read + write, 4 × 6) | 32.8M | 16.4M (all 2-way) |
+| pass B `comp_pf` lookups | 16.4M | 0 |
+| tile load `STS.128` | 4.1M | 0 |
+
+Three variants, each one change against the base (`lexerBig<..., SWZ, RB8,
+PFREG>`, bench rows `Big S2/S3 swizzle | row_of-u8 | comp_pf-regs`):
+
+1. **swizzle** (`SWZ`): vector k of thread t's chunk is stored at slot
+   `k ^ ((t >> 2) & 1)`. With stride 96 B, lanes t and t+4 of an 8-lane
+   `LDS.128` phase hit the same bank group; flipping the slot's parity for
+   lanes 4–7 puts them in the other half (bank units `6t + k` mod 8: lanes
+   0–3 even + k, lanes 4–7 even + (k^1)). The coalesced tile load, the partial
+   tile load, the next-byte read and the emission's token read use the same
+   mapping (byte offset ^ 16 when CHUNK % 32 == 0). +32 SASS instructions.
+2. **row_of-u8** (`RB8`): `row_of8[byte] = class * 3` (row offset in 8-byte
+   units), step address `comp + (row_of8[b] << 3) + (v & 0x1e)`. A 256-byte
+   table maps all bytes < 128 to different banks (no conflicts for ASCII);
+   193 `LDS.U16` become `LDS.U8`, no extra instructions.
+3. **comp_pf-regs** (`PFREG`): each thread loads its prefix's 16-byte
+   `comp_pf` row once (`LDS.128`) and selects pass B's state bytes four at a
+   time: nibble selector from `f & 7` (3 ALU), `PRMT` from entries 0–7 and
+   8–15, blend mask by `prmt.b32` sign replication of bit 3 of f (inline PTX:
+   `__byte_perm` ignores the sign bit of the selector — the first version
+   using it mismatched 65511 of 65536 cases), `LOP3` blend: ~10 ALU per 4
+   bytes, no shared loads (96 `LDS.U8` per thread removed). Checked
+   exhaustively on the GPU against a table lookup (all 16^4 f combinations).
+
+Checks: base SASS byte-identical to `be346d9`; all variants ≤ 40 registers, no
+spills, ≤ 26.0 KB shared memory (6 blocks/SM); other kernels unchanged; debug
+tests and all three datasets pass S3 for every variant (local, sm_75).
