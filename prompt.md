@@ -1111,22 +1111,63 @@ comparable to the bench).
 Current `lexerBig` unchanged (`be346d9` code): A100 S3 dense 1833–1844 μs,
 moderate 985, sparse 925.
 
-### Diagnostic: do load and compute overlap? (A100 numbers pending)
+### Diagnostic: load/compute overlap and the power cap
 
-Estimated issue time alone on dense is ~1.15 ms (700M warp instructions /
-432 schedulers at 1.41 GHz), the load alone (S1) 375 μs, and S2 1834 μs ≈
-S1 + compute + stores; on sparse S2 (871) ≈ S1 (375) + compute as well. The
-flagless pass A saved 12M instructions but no time. Hypothesis: DRAM reads
-and compute add up instead of overlapping.
+**Question.** Estimated issue time alone on dense is ~1.15 ms (700M warp
+instructions / 432 schedulers at 1.41 GHz), the load alone (S1) 375 μs, and
+the bench's S2 (1834 μs) looked like S1 + compute + stores. Do DRAM reads and
+compute add up instead of overlapping?
 
-Test: `lexerBig<..., L2IN = true>` makes every block read the input of tile
-`blockIdx.x % 64` (1.5 MB, stays in L2), bench rows `Big S2/S3 L2-resident
-input` (output not valid; outputs are still written to DRAM). The first 64
-tiles have the whole file's token density (tokens per byte: dense 0.2862 vs
-0.2864, moderate 0.0219 vs 0.0216, sparse 0.0022 vs 0.0023), so emission
-work is representative. The default kernel's SASS is unchanged
-(byte-identical to `be346d9`).
+**Test** (`b43e6c3`, removed afterwards): `lexerBig<..., L2IN = true>` made
+every block read the input of tile `blockIdx.x % 64` (1.5 MB, stays in L2;
+outputs still written to DRAM). The first 64 tiles have the whole file's
+token density (tokens per byte: dense 0.2862 vs 0.2864, moderate 0.0219 vs
+0.0216, sparse 0.0022 vs 0.0023), so the emission work is representative.
 
-Reading: S2 ≈ S1 + S2-L2 → load and compute do not overlap (prefetching /
-pipelining is the target); S2 ≈ S2-L2 → compute-bound (pass A / emission are
-the targets).
+**Result: load and compute overlap; the kernel is compute-bound.** ncu at
+the real clock (`--clock-control none`, ~1.40 GHz), dense, single launches:
+
+| | duration | DRAM read | warp instr. | issue active |
+|---|---|---|---|---|
+| S1 (load only) | 0.366 ms | 524 MB | 12M | 6% |
+| S2 | 1.511 ms | 529 MB | 700M | 77% |
+| S2, L2-resident input | 1.499 ms | 6 MB | 700M | 78% |
+| S3 | 1.575 ms | 527 MB | 709M | 75% |
+| S3, L2-resident input | 1.537 ms | 5 MB | 709M | 77% |
+
+Removing the DRAM reads saves only 12 μs (S2) / ~38 μs (S3): prefetching or
+pipelining the next tile would not help. Targets remain instruction count and
+issue efficiency (pass A, emission).
+
+**Finding: the bench is power-capped.** ncu measured dense S2 at 1.51 ms, the
+bench at 1834 μs (1808–1900 μs over recent runs), 18% slower. The bench's
+timed region (launch + `cudaDeviceSynchronize` between the events) adds only
+a few μs. Logging during the bench on the A100 (PCIe, 250 W limit):
+
+```
+nvidia-smi --query-gpu=timestamp,clocks.sm,power.draw,power.limit,clocks_throttle_reasons.active \
+  --format=csv -lms 200 > smi.log & SMI=$!; timeout 1500 make bench; kill $SMI
+```
+
+| bench rows (in order) | SM clock | power | software power cap (0x4) |
+|---|---|---|---|
+| dense transpose, vecPipe | 1335–1395 MHz | ~250 W | yes |
+| dense Big S2 / S3 | 1140–1230 MHz | 250–258 W | yes |
+| dense Big S2/S3, L2-resident | 1245–1275 MHz | ~255 W | yes |
+| moderate transpose | 1410 MHz | 221 W | no |
+| moderate Big S2 / S3 | 1320–1395 MHz | ~255 W | yes |
+| sparse transpose | 1410 MHz | 219 W | no |
+| sparse Big S2 / S3 | 1335–1365 MHz | ~255 W | yes |
+
+(Rows assigned to the ~1.2 s high-power bursts in bench order.) At ~1.2 GHz
+instead of ~1.40 GHz, ncu's 1.51 ms becomes ~1.76 ms, most of the 1834 μs.
+
+Consequences:
+1. All `lexerBig` rows run at the 250 W cap; the memory-bound transpose
+   kernels on moderate/sparse do not. Energy per byte (instructions, shared
+   memory traffic) therefore sets the clock: saving instructions pays twice
+   (less issue time and a higher clock), most on dense.
+2. The dense rows' wide CIs (±10–17 μs) come from the clock varying under the
+   cap (1140–1275 MHz within one row), not from the kernel.
+3. ncu durations (single launches with idle gaps, no cap) are shorter than
+   the bench's sustained numbers; compare variants within one tool only.
