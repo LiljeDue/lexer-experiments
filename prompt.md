@@ -1220,3 +1220,29 @@ PFREG>`, bench rows `Big S2/S3 swizzle | row_of-u8 | comp_pf-regs`):
 Checks: base SASS byte-identical to `be346d9`; all variants ≤ 40 registers, no
 spills, ≤ 26.0 KB shared memory (6 blocks/SM); other kernels unchanged; debug
 tests and all three datasets pass S3 for every variant (local, sm_75).
+
+ncu per variant (real clock, average per launch), sparse:
+
+| | S2 | S3 | shared wavefronts | of which conflicts | issue active |
+|---|---|---|---|---|---|
+| base | 0.820 ms | 0.865 ms | 115.0M | 34.2M | 54% |
+| swizzle | 0.710 (−13%) | 0.779 (−10%) | 98.4M | 17.1M | 64% |
+| row_of-u8 | 0.720 (−12%) | 0.795 (−8%) | 99.2M | 18.4M | 60% |
+| comp_pf-regs | 0.734 (−10%) | 0.808 (−7%) | 99.2M | 34.3M | 57% |
+
+dense:
+
+| | S2 | S3 | warp instr. | shared pipe |
+|---|---|---|---|---|
+| base | 1.511 ms | 1.576 ms | 700M | 74% |
+| swizzle | 1.517 (+0.4%) | 1.585 (+0.6%) | 717M | 66% |
+| row_of-u8 | 1.488 (−1.5%) | 1.552 (−1.5%) | 692M | 69% |
+| comp_pf-regs | 1.488 (−1.6%) | 1.560 (−1.0%) | 688M | 68% |
+
+Each variant removed the traffic it targeted (~16M wavefronts each on
+sparse); they hit different sources. On dense (issue-bound) swizzle costs
++17M instructions (mostly the XOR on each emitted token's read) and the other
+two help slightly. Combined rows added: **all three** and **row_of-u8 +
+comp_pf-regs** (without swizzle, for dense). Combined variants: ≤ 40
+registers, no spills, 25.7 KB shared memory; debug tests and all datasets
+pass S3 locally. A100 bench numbers pending.

@@ -1715,6 +1715,8 @@ bool runTest(LexerTest* test) {
     run_big(std::true_type{},  std::false_type{}, std::false_type{});
     run_big(std::false_type{}, std::true_type{},  std::false_type{});
     run_big(std::false_type{}, std::false_type{}, std::true_type{});
+    run_big(std::true_type{},  std::true_type{},  std::true_type{});
+    run_big(std::false_type{}, std::true_type{},  std::true_type{});
 
     ctx.Cleanup();
     gpuAssert(cudaFree(d_in));
@@ -1825,6 +1827,15 @@ int main(int32_t argc, char *argv[]) {
     testLexerBig<256, 96, 2, false, false, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Big S3 comp_pf-regs:"); fflush(stdout);
     testLexerBig<256, 96, 3, false, false, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    // Combinations.
+    printf(PAD, "Big S2 all three:"); fflush(stdout);
+    testLexerBig<256, 96, 2, true, true, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Big S3 all three:"); fflush(stdout);
+    testLexerBig<256, 96, 3, true, true, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Big S2 row_of-u8 + comp_pf-regs:"); fflush(stdout);
+    testLexerBig<256, 96, 2, false, true, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Big S3 row_of-u8 + comp_pf-regs:"); fflush(stdout);
+    testLexerBig<256, 96, 3, false, true, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     free(input);
     free(expected_indices);
     free(expected_tokens);
