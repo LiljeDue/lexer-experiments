@@ -1509,3 +1509,35 @@ emission (3.4× store requests), packed owner search, flagless pass A (before
 the shared-memory fixes), no-barrier next byte, look-back delay 0 / 100 /
 200 ns, 384-thread tiles, 128-thread blocks, and the convergence-based
 look-back skip (data-dependent).
+
+## Cost of alpacc's output semantics (max + add) (A100 numbers pending)
+
+alpacc's CUDA lexer (`CoderDue/alpacc`, `backends/cuda/lexer.cu`) outputs,
+per token whose terminal is not `IGNORE_TOKEN`, the terminal, its start and
+its length: an add-scan over kept produce flags gives output slots, a
+max-scan over start codes gives token starts, and both share one look-back
+round (`lookbackPrefixPair`). This benchmark's lexer outputs (end, token) for
+every token. To measure what those semantics cost in `lexerBig`,
+`lexerBig<..., MAXADD = true>` (fast path) implements them:
+
+- `IGNORE_TOKEN = 0` (whitespace in this DFA: 21.6% of dense's tokens).
+- Pass B also gathers "token of state j != IGNORE_TOKEN" 4 bytes at a time
+  (`t = (w ^ ign·0x20202020) & 0xe0e0e0e0`, OR of three shifts, multiply
+  movemask; checked on 40M random words × 8 ignore values); kept mask =
+  produce mask & not-ignored.
+- One pair scan + one look-back: `MaxAdd {max = last token end + 1, cnt =
+  kept tokens}`, packed into one 64-bit descriptor (status bits 1-0, max
+  bits 32-2, cnt bits 63-33; inputs and counts < 2^31), reusing the index
+  tile-state buffer. The look-back's final broadcast now uses
+  `cub::ShuffleIndex` for types wider than 4 bytes (unchanged SASS for the
+  others).
+- Emission: rank select on the kept mask; start = after the owner's previous
+  token end below the element (all-produce mask, `clz` over up to 3 words),
+  else the owner's incoming max; length = end − start + 1; writes terminal,
+  start and length (9 B per kept token instead of 5 B per token).
+
+Checks: 40 registers, no spills, 25.7 KB shared memory (6 blocks/SM); S3
+kernel 7072 vs 6148 static instructions; base, generic and other kernels'
+SASS unchanged (up to parameter offsets); debug tests and all three datasets
+pass against `maxadd_reference` (derived from the expected (end, token)
+output). Bench rows `Big S2/S3 max+add` (GB/s counts 9 B per kept token).

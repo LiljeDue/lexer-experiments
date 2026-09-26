@@ -271,7 +271,11 @@ struct TilePrefixCallbackOp {
 
         // Broadcast exclusive_prefix from lane 0 to all warp lanes via shuffle
         // (avoids shared-memory write + unsynchronized read across warp lanes).
-        T ep = (T) __shfl_sync(0xffffffff, (uint32_t) exclusive_prefix, 0);
+        T ep;
+        if constexpr (sizeof(T) <= sizeof(uint32_t))
+            ep = (T) __shfl_sync(0xffffffff, (uint32_t) exclusive_prefix, 0);
+        else
+            ep = cub::ShuffleIndex<WARP>(exclusive_prefix, 0, 0xffffffff);
 
         if (threadIdx.x == 0) {
             inclusive_prefix = scan_op(ep, block_aggregate);

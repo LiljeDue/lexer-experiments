@@ -144,6 +144,38 @@ constexpr LexerChainTables make_lexer_chain_tables() {
 }
 constexpr LexerChainTables h_chain_tables = make_lexer_chain_tables();
 
+// alpacc's lexer output (lexerBig MAXADD): per kept token (terminal !=
+// IGNORE_TOKEN) the terminal, its start and its length. Starts come from a
+// max-scan over "last token end + 1" (0 = input start), output slots from an
+// add-scan over kept tokens; both share one look-back round via MaxAdd.
+constexpr token_t IGNORE_TOKEN = 0;   // whitespace in this DFA
+struct MaxAdd {
+    uint32_t max;   // start of the next token: last token end + 1 (0: none yet)
+    uint32_t cnt;   // kept tokens
+};
+struct MaxAddOp {
+    __device__ __forceinline__ MaxAdd operator()(const MaxAdd& a, const MaxAdd& b) const {
+        return MaxAdd{a.max > b.max ? a.max : b.max, a.cnt + b.cnt};
+    }
+};
+// One 64-bit tile descriptor: status in bits 1-0, max in bits 32-2, cnt in
+// bits 63-33 (inputs and token counts < 2^31). Same size and zero layout as
+// ScanTileState<uint32_t>, so an index tile state can be reused for it.
+template<> struct TxnWordTraits<MaxAdd> {
+    using TxnWord    = unsigned long long;
+    using StatusWord = uint32_t;
+    __device__ __forceinline__
+    static TxnWord pack(StatusWord status, MaxAdd v) {
+        return TxnWord(status) | (TxnWord(v.max) << 2) | (TxnWord(v.cnt) << 33);
+    }
+    __device__ __forceinline__
+    static StatusWord unpack_status(TxnWord w) { return StatusWord(w & 3ull); }
+    __device__ __forceinline__
+    static MaxAdd unpack_value(TxnWord w) {
+        return MaxAdd{uint32_t((w >> 2) & 0x7fffffffull), uint32_t(w >> 33)};
+    }
+};
+
 struct LexerCtx {
     state_t* d_to_state;
     state_t* d_compose;
@@ -815,13 +847,14 @@ void lexerVecPipe(
 // and output without look-backs (tile-local states, each tile writes its
 // outputs to its own region; output is not valid); 3 = full lexer.
 // ---------------------------------------------------------------------------
-template<typename I, I BLOCK_SIZE, I CHUNK, I STEP, bool FORCE_GENERIC = false>
+template<typename I, I BLOCK_SIZE, I CHUNK, I STEP, bool FORCE_GENERIC = false, bool MAXADD = false>
 __global__ LB_BIG(BLOCK_SIZE)
 void lexerBig(
     LexerCtxShmem ctx,
     const uint8_t* __restrict__ d_in,
-    uint32_t* d_index_out,
+    uint32_t* d_index_out,   // token end positions (MAXADD: token starts)
     token_t* d_token_out,
+    uint32_t* d_len_out,     // MAXADD: token lengths (unused otherwise)
     ScanTileState<state_t> state_states,
     ScanTileState<I> index_states,
     I size,
@@ -835,6 +868,8 @@ void lexerBig(
     // FAST: packed chain states and state bytes (needs LEXER_CHAIN_FITS);
     // otherwise the generic path (state_t compose chains in passes A and B).
     constexpr bool FAST = LEXER_CHAIN_FITS && !FORCE_GENERIC;
+    // MAXADD: alpacc's output (terminal, start, length of non-ignored tokens).
+    static_assert(!MAXADD || FAST, "MAXADD is implemented on the fast path");
     constexpr uint32_t ROW_SHIFT = LEXER_ROW_SHIFT;
     constexpr I VECS       = CHUNK / 16;
     constexpr I WARP_BYTES = WARP * CHUNK;
@@ -844,12 +879,16 @@ void lexerBig(
     using BlockScanI     = cub::BlockScan<I, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
     using PrefixOpState  = TilePrefixCallbackOp<state_t, ShmemCompose, true>;
     using PrefixOpIdx    = TilePrefixCallbackOp<I, Add<I>, true>;
+    using BlockScanMA    = cub::BlockScan<MaxAdd, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;   // MAXADD
+    using PrefixOpMA     = TilePrefixCallbackOp<MaxAdd, MaxAddOp, true>;
 
     __shared__ __align__(16) uint8_t bytes[TILE];   // input bytes, then F_i, then state bytes
     __shared__ typename BlockScanState::TempStorage state_scan;
     __shared__ typename PrefixOpState::TempStorage  state_prefix;
     __shared__ typename BlockScanI::TempStorage     idx_scan;
     __shared__ typename PrefixOpIdx::TempStorage    idx_prefix;
+    __shared__ typename BlockScanMA::TempStorage    ma_scan;     // MAXADD (unreferenced otherwise)
+    __shared__ typename PrefixOpMA::TempStorage     ma_prefix;
     __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
     // Derived tables (LexerChainTables, built at compile time from the DFA
     // tables and copied here as 16-byte vectors): one chain step is
@@ -980,6 +1019,7 @@ void lexerBig(
         // Generic path: rescan with the state_t chain from the incoming state,
         // per-byte produce test, tokens written in place.
         uint32_t m0, m1, m2;
+        uint32_t n0 = 0, n1 = 0, n2 = 0;   // MAXADD: bit j = token of state j != IGNORE_TOKEN
         state_t  last_g = prefix;   // generic: state after my last valid byte
         if constexpr (!FAST) {
             m0 = m1 = m2 = 0;
@@ -1038,6 +1078,15 @@ void lexerBig(
                 if (wi < 8)       p0 |= f4 << (4 * (wi % 8));
                 else if (wi < 16) p1 |= f4 << (4 * (wi % 8));
                 else              p2 |= f4 << (4 * (wi % 8));
+                if constexpr (MAXADD) {
+                    // token bits (7-5) of each state byte != IGNORE_TOKEN, gathered like f4
+                    const uint32_t t  = (tw[q] ^ (uint32_t(IGNORE_TOKEN) * 0x20202020u)) & 0xe0e0e0e0u;
+                    const uint32_t nz = ((t >> 5) | (t >> 6) | (t >> 7)) & 0x01010101u;
+                    const uint32_t n4 = (nz * 0x10204080u) >> 28;
+                    if (wi < 8)       n0 |= n4 << (4 * (wi % 8));
+                    else if (wi < 16) n1 |= n4 << (4 * (wi % 8));
+                    else              n2 |= n4 << (4 * (wi % 8));
+                }
             }
         }
         // Produce flags: element j (bit j of the chunk, in word j / 32)
@@ -1078,11 +1127,38 @@ void lexerBig(
             if (produce)
                 set_bit(li);
         }
-        const I count = __popc(m0) + __popc(m1) + __popc(m2);
+        // MAXADD: emitted tokens are the kept ones (produce and terminal !=
+        // IGNORE_TOKEN; bit j: element j = token of state j); m0-m2 (all
+        // produce flags) still give the token starts.
+        const uint32_t e0 = MAXADD ? m0 & n0 : m0;
+        const uint32_t e1 = MAXADD ? m1 & n1 : m1;
+        const uint32_t e2 = MAXADD ? m2 & n2 : m2;
+        const I count = __popc(e0) + __popc(e1) + __popc(e2);
 
         // Output slots.
         I offs;
-        if constexpr (STEP == 3) {
+        uint32_t max_in = 0;   // MAXADD: start of my chunk's first token
+        if constexpr (MAXADD) {
+            // "last token end + 1" in my chunk (0: no token ends here)
+            const int last_end = m2 ? 95 - __clz(m2) : m1 ? 63 - __clz(m1) : m0 ? 31 - __clz(m0) : -1;
+            const MaxAdd agg{last_end >= 0 ? uint32_t(my_offs + last_end + 1) : 0u, count};
+            MaxAdd pfx;
+            if constexpr (STEP == 3) {
+                ScanTileState<MaxAdd> ma_states{index_states.d_tile_descriptors};
+                PrefixOpMA ma_op(ma_states, ma_prefix, MaxAddOp(), (int)tile, MaxAdd{0u, 0u});
+                BlockScanMA(ma_scan).ExclusiveScan(agg, pfx, MaxAddOp(), ma_op);
+                if (valid > 0 && my_offs + valid == size) {   // owner of the last input byte
+                    *new_size = pfx.cnt + count;
+                    *is_valid = last_accepts();
+                }
+            } else {
+                MaxAdd tile_agg;
+                BlockScanMA(ma_scan).ExclusiveScan(agg, pfx, MaxAdd{0u, 0u}, MaxAddOp(), tile_agg);
+                pfx.cnt += tile_offs;   // each tile writes to its own region
+            }
+            offs   = pfx.cnt;
+            max_in = pfx.max;
+        } else if constexpr (STEP == 3) {
             PrefixOpIdx idx_op(index_states, idx_prefix, Add<I>(), (int)tile, I(0));
             BlockScanI(idx_scan).ExclusiveScan(count, offs, Add<I>(), idx_op);
             if (valid > 0 && my_offs + valid == size) {   // owner of the last input byte
@@ -1118,9 +1194,9 @@ void lexerBig(
             const I o_incl  = __shfl_sync(0xffffffff, incl, o);
             const I o_count = __shfl_sync(0xffffffff, count, o);
             I k = r - (o_incl - o_count);   // rank within the owner's tokens
-            const uint32_t om0 = __shfl_sync(0xffffffff, m0, o);
-            const uint32_t om1 = __shfl_sync(0xffffffff, m1, o);
-            const uint32_t om2 = __shfl_sync(0xffffffff, m2, o);
+            const uint32_t om0 = __shfl_sync(0xffffffff, e0, o);
+            const uint32_t om1 = __shfl_sync(0xffffffff, e1, o);
+            const uint32_t om2 = __shfl_sync(0xffffffff, e2, o);
             // Word holding the k-th set bit, then the bit within it
             // (select_bit, not __fns: __fns expands to ~140 instructions).
             const I c0 = __popc(om0), c01 = c0 + __popc(om1);
@@ -1128,11 +1204,32 @@ void lexerBig(
             const I base     = k < c0 ? 0   : k < c01 ? 32  : 64;
             k               -= k < c0 ? 0   : k < c01 ? c0  : c01;
             const I pos = base + select_bit(m, k);
-            if (r < warp_total) {
-                const I elem = o * CHUNK + pos;   // within the warp's segment
-                d_index_out[warp_base + r] = tile_offs + warp * WARP_BYTES + elem;
-                d_token_out[warp_base + r] =
-                    warp_states[elem ^ (((o >> 2) & 1) << 4)] >> (FAST ? 5 : 0);   // token
+            if constexpr (MAXADD) {
+                // start: after the owner's previous token end (any terminal)
+                // below pos, else the owner's incoming max
+                const uint32_t am0 = __shfl_sync(0xffffffff, m0, o);
+                const uint32_t am1 = __shfl_sync(0xffffffff, m1, o);
+                const uint32_t am2 = __shfl_sync(0xffffffff, m2, o);
+                const uint32_t o_max = __shfl_sync(0xffffffff, max_in, o);
+                const uint32_t b0 = pos >= 32 ? am0 : am0 & ((1u << pos) - 1);
+                const uint32_t b1 = pos >= 64 ? am1 : pos < 32 ? 0u : am1 & ((1u << (pos - 32)) - 1);
+                const uint32_t b2 = pos < 64 ? 0u : am2 & ((1u << (pos - 64)) - 1);
+                const int prev = b2 ? 95 - __clz(b2) : b1 ? 63 - __clz(b1) : b0 ? 31 - __clz(b0) : -1;
+                if (r < warp_total) {
+                    const I elem  = o * CHUNK + pos;   // within the warp's segment
+                    const I chunk = tile_offs + warp * WARP_BYTES + o * CHUNK;
+                    const I start = prev >= 0 ? chunk + prev + 1 : o_max;
+                    d_index_out[warp_base + r] = start;
+                    d_len_out[warp_base + r]   = chunk + pos - start + 1;
+                    d_token_out[warp_base + r] = warp_states[elem ^ (((o >> 2) & 1) << 4)] >> 5;
+                }
+            } else {
+                if (r < warp_total) {
+                    const I elem = o * CHUNK + pos;   // within the warp's segment
+                    d_index_out[warp_base + r] = tile_offs + warp * WARP_BYTES + elem;
+                    d_token_out[warp_base + r] =
+                        warp_states[elem ^ (((o >> 2) & 1) << 4)] >> (FAST ? 5 : 0);   // token
+                }
             }
         }
     }
@@ -1420,9 +1517,9 @@ void testLexerVecPipe(uint8_t* input,
 
 // Requests the maximum shared memory carveout for lexerBig (~26 KB per block;
 // 6 blocks/SM exceed the default configuration) and returns blocks/SM.
-template<typename I, I BS, I CHUNK, I STEP, bool FORCE_GENERIC = false>
+template<typename I, I BS, I CHUNK, I STEP, bool FORCE_GENERIC = false, bool MAXADD = false>
 static int lexerBigBlocksPerSM() {
-    auto kernel = lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC>;
+    auto kernel = lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC, MAXADD>;
     gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                    (int)cudaSharedmemCarveoutMaxShared));
     int bps = 0;
@@ -1430,9 +1527,27 @@ static int lexerBigBlocksPerSM() {
     return bps;
 }
 
+// alpacc's lexer output (lexerBig MAXADD) from the (token end, token) form:
+// the tokens with terminal != IGNORE_TOKEN, start = previous token end + 1 (0
+// for the first token), length = end - start + 1.
+static size_t maxadd_reference(const uint32_t* ends, const token_t* toks, size_t n,
+                               std::vector<token_t>& t, std::vector<uint32_t>& s,
+                               std::vector<uint32_t>& l) {
+    t.clear(); s.clear(); l.clear();
+    uint32_t start = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (toks[i] != IGNORE_TOKEN) {
+            t.push_back(toks[i]); s.push_back(start); l.push_back(ends[i] - start + 1);
+        }
+        start = ends[i] + 1;
+    }
+    return t.size();
+}
+
 // STEP 1/2 are ladder steps (timing only, output not valid); STEP 3 is checked
-// against the expected output. GB/s always counts the full lexer's traffic.
-template<uint32_t BS, uint32_t CHUNK, uint32_t STEP, bool FORCE_GENERIC = false>
+// against the expected output (MAXADD: against maxadd_reference). GB/s always
+// counts the full lexer's traffic.
+template<uint32_t BS, uint32_t CHUNK, uint32_t STEP, bool FORCE_GENERIC = false, bool MAXADD = false>
 void testLexerBig(uint8_t* input,
                   size_t input_size,
                   uint32_t* expected_indices,
@@ -1451,12 +1566,18 @@ void testLexerBig(uint8_t* input,
 #endif
     std::vector<token_t> h_token_out(size, 0);
     std::vector<I>       h_index_out(size, 0);
+    std::vector<I>       h_len_out(MAXADD ? size : 0, 0);
+    std::vector<token_t> ref_t; std::vector<uint32_t> ref_s, ref_l;   // MAXADD reference
+    const size_t out_tokens = MAXADD
+        ? maxadd_reference(expected_indices, expected_tokens, expected_size, ref_t, ref_s, ref_l)
+        : expected_size;
 
     I*       d_new_size;
     bool*    d_is_valid;
     uint8_t* d_in;
     I*       d_index_out;
     token_t* d_token_out;
+    I*       d_len_out = nullptr;   // MAXADD: token lengths
     ScanTileState<state_t> d_state_states;
     ScanTileState<I>       d_index_states;
 
@@ -1469,10 +1590,11 @@ void testLexerBig(uint8_t* input,
     gpuAssert(cudaMalloc((void**)&d_in,        IN_ARRAY_BYTES));
     gpuAssert(cudaMalloc((void**)&d_index_out, INDEX_OUT_BYTES));
     gpuAssert(cudaMalloc((void**)&d_token_out, TOKEN_OUT_BYTES));
+    if (MAXADD) gpuAssert(cudaMalloc((void**)&d_len_out, INDEX_OUT_BYTES));
     gpuAssert(cudaMemcpy(d_in, input, IN_ARRAY_BYTES, cudaMemcpyHostToDevice));
 
     LexerCtxShmem ctx = LexerCtxShmem();
-    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, FORCE_GENERIC>());
+    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, FORCE_GENERIC, MAXADD>());
     fflush(stdout);
 
     auto reset = [&]() {
@@ -1481,8 +1603,8 @@ void testLexerBig(uint8_t* input,
         initScanTileState(d_index_states, (int)NLB);
     };
     auto launch = [&]() {
-        lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC><<<NLB, BS>>>(
-            ctx, d_in, d_index_out, d_token_out,
+        lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC, MAXADD><<<NLB, BS>>>(
+            ctx, d_in, d_index_out, d_token_out, d_len_out,
             d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid);
     };
     reset();
@@ -1521,11 +1643,21 @@ void testLexerBig(uint8_t* input,
         test_passes = is_valid;
         if (!test_passes)
             std::cout << "Lexer Test Failed: The input given to the lexer does not result in an accepting state." << std::endl;
-        if (test_passes && temp_size != (I)expected_size) {
-            printf("Lexer Test Failed: Expected size=%zu but got size=%u\n", expected_size, temp_size);
+        if (test_passes && temp_size != (I)out_tokens) {
+            printf("Lexer Test Failed: Expected size=%zu but got size=%u\n", out_tokens, temp_size);
             test_passes = false;
         }
-        if (test_passes) {
+        if (test_passes && MAXADD) {
+            gpuAssert(cudaMemcpy(h_len_out.data(), d_len_out, INDEX_OUT_BYTES, cudaMemcpyDeviceToHost));
+            for (I i = 0; i < (I)out_tokens; ++i) {
+                if (h_token_out[i] != ref_t[i] || h_index_out[i] != ref_s[i] || h_len_out[i] != ref_l[i]) {
+                    printf("Lexer Test Failed: (token, start, length) mismatch at i=%u: expected=(%u, %u, %u) got=(%u, %u, %u)\n",
+                           i, (unsigned)ref_t[i], ref_s[i], ref_l[i],
+                           (unsigned)h_token_out[i], h_index_out[i], h_len_out[i]);
+                    test_passes = false; break;
+                }
+            }
+        } else if (test_passes) {
             for (I i = 0; i < (I)expected_size; ++i) {
                 if (h_index_out[i] != expected_indices[i]) {
                     printf("Lexer Test Failed: index mismatch at i=%u: expected=%u got=%u\n",
@@ -1543,9 +1675,10 @@ void testLexerBig(uint8_t* input,
 
     if (test_passes) {
         // Bytes this variant actually moves: S1 only reads the input; S2 and S3
-        // also write one index and one token per output token.
+        // also write one index and one token per output token (MAXADD: a
+        // token, start and length per kept token).
         const size_t TOTAL_BYTES = IN_ARRAY_BYTES
-            + (STEP == 1 ? 0 : expected_size * (sizeof(I) + sizeof(token_t)));
+            + (STEP == 1 ? 0 : out_tokens * ((MAXADD ? 2 : 1) * sizeof(I) + sizeof(token_t)));
         printf("\n");
         printf("  %-36s ", STEP == 3 ? "Total:" : "Total (ladder, output not valid):");
         compute_descriptors(temp_total, RUNS, TOTAL_BYTES);
@@ -1553,7 +1686,7 @@ void testLexerBig(uint8_t* input,
 
     free(temp_total);
     gpuAssert(cudaFree(d_in)); gpuAssert(cudaFree(d_index_out));
-    gpuAssert(cudaFree(d_token_out));
+    gpuAssert(cudaFree(d_token_out)); if (d_len_out) gpuAssert(cudaFree(d_len_out));
     gpuAssert(cudaFree(d_index_states.d_tile_descriptors));
     gpuAssert(cudaFree(d_state_states.d_tile_descriptors));
     gpuAssert(cudaFree(d_new_size)); gpuAssert(cudaFree(d_is_valid));
@@ -1767,7 +1900,7 @@ bool runTest(LexerTest* test) {
         LexerCtxShmem bg_ctx;
         lexerBigBlocksPerSM<I, BLOCK_SIZE, BIG_CHUNK, 3, GEN>();
         lexerBig<I, BLOCK_SIZE, BIG_CHUNK, 3, GEN><<<big_tiles, BLOCK_SIZE>>>(
-            bg_ctx, d_in, d_index_out, d_token_out, bg_state_states, bg_index_states,
+            bg_ctx, d_in, d_index_out, d_token_out, nullptr, bg_state_states, bg_index_states,
             size, big_tiles, d_new_size, d_is_valid);
         gpuAssert(cudaDeviceSynchronize());
         gpuAssert(cudaPeekAtLastError());
@@ -1799,6 +1932,64 @@ bool runTest(LexerTest* test) {
     };
     run_big(std::false_type{});
     run_big(std::true_type{});
+
+    // lexerBig MAXADD (alpacc output: terminal, start, length of non-ignored
+    // tokens) against maxadd_reference.
+    {
+        const I BIG_CHUNK = 96;
+        const I big_tiles = (size + BLOCK_SIZE * BIG_CHUNK - 1) / (BLOCK_SIZE * BIG_CHUNK);
+        ScanTileState<state_t> ma_state_states;
+        ScanTileState<I>       ma_index_states;
+        I* d_len = nullptr;
+        gpuAssert(cudaMalloc((void**)&ma_state_states.d_tile_descriptors,
+            ScanTileState<state_t>::AllocationSize(big_tiles)));
+        gpuAssert(cudaMalloc((void**)&ma_index_states.d_tile_descriptors,
+            ScanTileState<I>::AllocationSize(big_tiles)));
+        gpuAssert(cudaMalloc((void**)&d_len, size * sizeof(I)));
+        initScanTileState(ma_state_states, (int)big_tiles);
+        initScanTileState(ma_index_states, (int)big_tiles);
+        gpuAssert(cudaMemset(d_is_valid, 0, sizeof(bool)));
+        gpuAssert(cudaMemset(d_new_size, 0xff, sizeof(I)));
+        gpuAssert(cudaMemset(d_index_out, 0xff, size * sizeof(I)));
+        gpuAssert(cudaMemset(d_token_out, 0xff, size * sizeof(token_t)));
+        gpuAssert(cudaMemset(d_len, 0xff, size * sizeof(I)));
+
+        LexerCtxShmem ma_ctx;
+        lexerBigBlocksPerSM<I, BLOCK_SIZE, BIG_CHUNK, 3, false, true>();
+        lexerBig<I, BLOCK_SIZE, BIG_CHUNK, 3, false, true><<<big_tiles, BLOCK_SIZE>>>(
+            ma_ctx, d_in, d_index_out, d_token_out, d_len, ma_state_states, ma_index_states,
+            size, big_tiles, d_new_size, d_is_valid);
+        gpuAssert(cudaDeviceSynchronize());
+        gpuAssert(cudaPeekAtLastError());
+
+        std::vector<token_t> ref_t; std::vector<uint32_t> ref_s, ref_l;
+        const size_t ref_n = maxadd_reference(test->expected_indices, test->expected_tokens,
+                                              test->expected_size, ref_t, ref_s, ref_l);
+        I    ma_size  = 0;
+        bool ma_valid = false;
+        gpuAssert(cudaMemcpy(&ma_size,  d_new_size, sizeof(I),    cudaMemcpyDeviceToHost));
+        gpuAssert(cudaMemcpy(&ma_valid, d_is_valid, sizeof(bool), cudaMemcpyDeviceToHost));
+        bool ma_pass = ma_valid && ma_size == (I)ref_n;
+        if (ma_pass) {
+            std::vector<I> s(ma_size), l(ma_size); std::vector<token_t> t(ma_size);
+            gpuAssert(cudaMemcpy(s.data(), d_index_out, ma_size * sizeof(I),       cudaMemcpyDeviceToHost));
+            gpuAssert(cudaMemcpy(l.data(), d_len,       ma_size * sizeof(I),       cudaMemcpyDeviceToHost));
+            gpuAssert(cudaMemcpy(t.data(), d_token_out, ma_size * sizeof(token_t), cudaMemcpyDeviceToHost));
+            for (I i = 0; i < ma_size && ma_pass; i++)
+                ma_pass = t[i] == ref_t[i] && s[i] == ref_s[i] && l[i] == ref_l[i];
+        }
+        if (ma_pass)
+            printf("PASS [%s] (lexerBig maxadd)\n", test->name);
+        else
+            fprintf(stderr, "FAIL [%s] (lexerBig maxadd): valid=%d size=%u (expected %zu)\n",
+                    test->name, (int)ma_valid, ma_size, ref_n);
+        pass = pass && ma_pass;
+
+        ma_ctx.Cleanup();
+        gpuAssert(cudaFree(d_len));
+        gpuAssert(cudaFree(ma_state_states.d_tile_descriptors));
+        gpuAssert(cudaFree(ma_index_states.d_tile_descriptors));
+    }
 
     ctx.Cleanup();
     gpuAssert(cudaFree(d_in));
@@ -1900,6 +2091,12 @@ int main(int32_t argc, char *argv[]) {
     // DFAs that do not fit the packed fast path.
     printf(PAD, "Big S3 generic path (forced):"); fflush(stdout);
     testLexerBig<256, 96, 3, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    // alpacc's output semantics (terminal, start, length of tokens != IGNORE_TOKEN)
+    // with one (max, add) look-back round.
+    printf(PAD, "Big S2 max+add:"); fflush(stdout);
+    testLexerBig<256, 96, 2, false, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Big S3 max+add:"); fflush(stdout);
+    testLexerBig<256, 96, 3, false, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     free(input);
     free(expected_indices);
     free(expected_tokens);
