@@ -1308,8 +1308,42 @@ switched off were removed; the swizzle also applies to the generic path.
 bytes, else 2-byte units (class · NUM_STATES ≤ 240 fits a byte). S2/S3 SASS
 identical to the benchmarked all-three variant up to shared-memory offsets;
 debug tests (fast and forced generic) and all three datasets pass S3.
-Decided on ncu numbers (single launches, no power cap); the sustained bench
-has not been checked for this choice.
+Decided on ncu numbers; confirmed by the sustained (power-capped) A100 bench
+at `76be63b`:
+
+| S3 | before (`be346d9` code) | now | change | % of speed of light |
+|---|---|---|---|---|
+| dense | 1833 μs | 1815 μs | −1.0% | 51.3% → 51.8% |
+| moderate | 985 μs | 840 μs | −14.7% | 43.5% → 51.0% |
+| sparse | 925 μs | 769 μs | −16.9% | 42.3% → 50.8% |
+
+Bench S3 − S2 (look-backs): moderate 62 → 88 μs, sparse 54 → 88 μs (dense
+within noise). Forced generic path: dense 2062, moderate 1135, sparse
+1074 μs (+14% / +35% / +40% over the fast path).
 
 **Next:** with less compute per tile, the look-backs show on moderate and
-sparse: S3 − S2 grew from 52–68 μs (base) to 107–122 μs (all three).
+sparse: S3 − S2 grew from 52–68 μs (base) to 107–122 μs (all three) in ncu,
+54–62 → 88 μs in the bench.
+
+### Look-back cost: delay sweep and 384-thread tiles (A100 numbers pending)
+
+Sparse profile (all three shared-memory changes), S3 vs S2: barrier stalls
+1.7 → 6.6 per issue (7 warps wait at the block scans while warp 0 does the
+state and then the index look-back), sleeping 0.2 (the look-back warp's
+`__nanosleep`), long scoreboard 0.84 → 1.14 (descriptor loads). Each
+look-back sleeps 450 ns before its first poll (tuned for P1): ~0.9 μs per
+tile, with ~33 tiles per block slot (21334 tiles / 648 resident blocks).
+
+Variants (bench rows, S3 only where S2 cannot change):
+- **look-back delay 0 / 100 / 200** (`lexerBig<..., LB_DELAY>`, passed to
+  `TilePrefixCallbackOp<..., FIRST_DELAY_NS>`; default 450 keeps all other
+  kernels unchanged). The 350 ns sleeps between later polls are unchanged.
+- **BS384**: 384 threads × 96 B = 36 KB tiles, 38 KB shared memory,
+  `__launch_bounds__(384, 4)` (`LB_BIG(BS)` = 1536 threads/SM, 40 registers,
+  no spills): 4 blocks/SM, same threads per SM, 14222 instead of 21334 tiles.
+- **BS384 delay 0 / 100 / 200**: the combination.
+
+Checks: base, generic and all other kernels' SASS identical to `76be63b`;
+SASS shows the first-poll `NANOSLEEP` immediates 0x64 / 0xc8 / 0x1c2 and none
+for delay 0; debug tests (256/384, delay 0/450, fast/generic) and all three
+datasets pass S3 locally.

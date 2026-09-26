@@ -153,7 +153,8 @@ struct ScanTileState {
     // initial_delay_ns: sleep before first load (absorbs L2 write latency from predecessor).
     __device__ __forceinline__ void WaitForValid(int tile_idx, StatusWord& status, T& value,
                                                  uint32_t initial_delay_ns = 450) {
-        __nanosleep(initial_delay_ns);
+        if (initial_delay_ns > 0)
+            __nanosleep(initial_delay_ns);
         TxnWord word = load_relaxed(d_tile_descriptors + TILE_STATUS_PADDING + tile_idx);
         while (__any_sync(0xffffffff,
                TxnWordTraits<T>::unpack_status(word) == StatusWord(SCAN_TILE_INVALID))) {
@@ -179,9 +180,10 @@ struct ScanTileState {
 // reaches no INCLUSIVE tiles at all (all OOB) — but the identity field is used
 // to seed an artificial INCLUSIVE at the OOB boundary instead.
 // RELAXED = true publishes PARTIAL/INCLUSIVE with store_relaxed_gpu instead of
-// store_release (default false keeps existing kernels unchanged).
+// store_release (default false keeps existing kernels unchanged). FIRST_DELAY_NS
+// is the sleep before the first window's poll (0 = none).
 // ---------------------------------------------------------------------------
-template<typename T, typename ScanOpT, bool RELAXED = false>
+template<typename T, typename ScanOpT, bool RELAXED = false, uint32_t FIRST_DELAY_NS = 450>
 struct TilePrefixCallbackOp {
     using StatusWord  = typename ScanTileState<T>::StatusWord;
     using WarpReduceT = cub::WarpReduce<T, WARP>;
@@ -256,8 +258,8 @@ struct TilePrefixCallbackOp {
         int predecessor_idx = tile_idx - threadIdx.x - 1;
         StatusWord predecessor_status;
 
-        // First window: use 450ns initial delay to absorb L2 write latency from predecessor.
-        exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status, 450);
+        // First window: initial delay (default 450ns) to absorb L2 write latency from predecessor.
+        exclusive_prefix = ProcessWindow(predecessor_idx, predecessor_status, FIRST_DELAY_NS);
 
         // Slide window back until we find an INCLUSIVE tile (or hit all-OOB).
         while (__all_sync(0xffffffff, predecessor_status != StatusWord(SCAN_TILE_INCLUSIVE)
