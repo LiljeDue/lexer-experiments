@@ -778,7 +778,7 @@ void lexerVecPipe(
 // and output without look-backs (tile-local states, each tile writes its
 // outputs to its own region; output is not valid); 3 = full lexer.
 // ---------------------------------------------------------------------------
-template<typename I, I BLOCK_SIZE, I CHUNK, I STEP, bool FORCE_GENERIC = false, uint32_t LB_DELAY = 450>
+template<typename I, I BLOCK_SIZE, I CHUNK, I STEP, bool FORCE_GENERIC = false>
 __global__ LB_BIG(BLOCK_SIZE)
 void lexerBig(
     LexerCtxShmem ctx,
@@ -807,8 +807,8 @@ void lexerBig(
 
     using BlockScanState = cub::BlockScan<state_t, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
     using BlockScanI     = cub::BlockScan<I, BLOCK_SIZE, cub::BLOCK_SCAN_WARP_SCANS>;
-    using PrefixOpState  = TilePrefixCallbackOp<state_t, ShmemCompose, true, LB_DELAY>;
-    using PrefixOpIdx    = TilePrefixCallbackOp<I, Add<I>, true, LB_DELAY>;
+    using PrefixOpState  = TilePrefixCallbackOp<state_t, ShmemCompose, true>;
+    using PrefixOpIdx    = TilePrefixCallbackOp<I, Add<I>, true>;
 
     __shared__ __align__(16) uint8_t bytes[TILE];   // input bytes, then F_i, then state bytes
     __shared__ typename BlockScanState::TempStorage state_scan;
@@ -1392,9 +1392,9 @@ void testLexerVecPipe(uint8_t* input,
 
 // Requests the maximum shared memory carveout for lexerBig (~26 KB per block;
 // 6 blocks/SM exceed the default configuration) and returns blocks/SM.
-template<typename I, I BS, I CHUNK, I STEP, bool FORCE_GENERIC = false, uint32_t LB_DELAY = 450>
+template<typename I, I BS, I CHUNK, I STEP, bool FORCE_GENERIC = false>
 static int lexerBigBlocksPerSM() {
-    auto kernel = lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC, LB_DELAY>;
+    auto kernel = lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC>;
     gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                    (int)cudaSharedmemCarveoutMaxShared));
     int bps = 0;
@@ -1404,7 +1404,7 @@ static int lexerBigBlocksPerSM() {
 
 // STEP 1/2 are ladder steps (timing only, output not valid); STEP 3 is checked
 // against the expected output. GB/s always counts the full lexer's traffic.
-template<uint32_t BS, uint32_t CHUNK, uint32_t STEP, bool FORCE_GENERIC = false, uint32_t LB_DELAY = 450>
+template<uint32_t BS, uint32_t CHUNK, uint32_t STEP, bool FORCE_GENERIC = false>
 void testLexerBig(uint8_t* input,
                   size_t input_size,
                   uint32_t* expected_indices,
@@ -1444,7 +1444,7 @@ void testLexerBig(uint8_t* input,
     gpuAssert(cudaMemcpy(d_in, input, IN_ARRAY_BYTES, cudaMemcpyHostToDevice));
 
     LexerCtxShmem ctx = LexerCtxShmem();
-    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, FORCE_GENERIC, LB_DELAY>());
+    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, FORCE_GENERIC>());
     fflush(stdout);
 
     auto reset = [&]() {
@@ -1453,7 +1453,7 @@ void testLexerBig(uint8_t* input,
         initScanTileState(d_index_states, (int)NLB);
     };
     auto launch = [&]() {
-        lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC, LB_DELAY><<<NLB, BS>>>(
+        lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC><<<NLB, BS>>>(
             ctx, d_in, d_index_out, d_token_out,
             d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid);
     };
@@ -1719,11 +1719,10 @@ bool runTest(LexerTest* test) {
     }
 
     // Same test for lexerBig (large-tile single-pass lexer, full STEP 3), all variants.
-    auto run_big = [&](auto gen_c, auto bs_c, auto delay_c) {
+    auto run_big = [&](auto gen_c) {
         constexpr bool GEN = decltype(gen_c)::value;
-        constexpr I BS = decltype(bs_c)::value, DELAY = decltype(delay_c)::value;
         const I BIG_CHUNK = 96;
-        const I big_tiles = (size + BS * BIG_CHUNK - 1) / (BS * BIG_CHUNK);
+        const I big_tiles = (size + BLOCK_SIZE * BIG_CHUNK - 1) / (BLOCK_SIZE * BIG_CHUNK);
         ScanTileState<state_t> bg_state_states;
         ScanTileState<I>       bg_index_states;
         gpuAssert(cudaMalloc((void**)&bg_state_states.d_tile_descriptors,
@@ -1738,8 +1737,8 @@ bool runTest(LexerTest* test) {
         gpuAssert(cudaMemset(d_token_out, 0xff, size * sizeof(token_t)));
 
         LexerCtxShmem bg_ctx;
-        lexerBigBlocksPerSM<I, BS, BIG_CHUNK, 3, GEN, DELAY>();
-        lexerBig<I, BS, BIG_CHUNK, 3, GEN, DELAY><<<big_tiles, BS>>>(
+        lexerBigBlocksPerSM<I, BLOCK_SIZE, BIG_CHUNK, 3, GEN>();
+        lexerBig<I, BLOCK_SIZE, BIG_CHUNK, 3, GEN><<<big_tiles, BLOCK_SIZE>>>(
             bg_ctx, d_in, d_index_out, d_token_out, bg_state_states, bg_index_states,
             size, big_tiles, d_new_size, d_is_valid);
         gpuAssert(cudaDeviceSynchronize());
@@ -1760,23 +1759,18 @@ bool runTest(LexerTest* test) {
                           bg_tokens[i]  == test->expected_tokens[i];
         }
         if (bg_pass)
-            printf("PASS [%s] (lexerBig generic=%d bs=%u delay=%u)\n", test->name, (int)GEN, (unsigned)BS, (unsigned)DELAY);
+            printf("PASS [%s] (lexerBig generic=%d)\n", test->name, (int)GEN);
         else
-            fprintf(stderr, "FAIL [%s] (lexerBig generic=%d bs=%u delay=%u): valid=%d size=%u (expected %zu)\n",
-                    test->name, (int)GEN, (unsigned)BS, (unsigned)DELAY, (int)bg_valid, bg_size, test->expected_size);
+            fprintf(stderr, "FAIL [%s] (lexerBig generic=%d): valid=%d size=%u (expected %zu)\n",
+                    test->name, (int)GEN, (int)bg_valid, bg_size, test->expected_size);
         pass = pass && bg_pass;
 
         bg_ctx.Cleanup();
         gpuAssert(cudaFree(bg_state_states.d_tile_descriptors));
         gpuAssert(cudaFree(bg_index_states.d_tile_descriptors));
     };
-    using BS256 = std::integral_constant<I, 256>; using BS384 = std::integral_constant<I, 384>;
-    using D450 = std::integral_constant<I, 450>;  using D0    = std::integral_constant<I, 0>;
-    run_big(std::false_type{}, BS256{}, D450{});
-    run_big(std::true_type{},  BS256{}, D450{});
-    run_big(std::false_type{}, BS256{}, D0{});
-    run_big(std::false_type{}, BS384{}, D450{});
-    run_big(std::true_type{},  BS384{}, D450{});
+    run_big(std::false_type{});
+    run_big(std::true_type{});
 
     ctx.Cleanup();
     gpuAssert(cudaFree(d_in));
@@ -1878,24 +1872,6 @@ int main(int32_t argc, char *argv[]) {
     // DFAs that do not fit the packed fast path.
     printf(PAD, "Big S3 generic path (forced):"); fflush(stdout);
     testLexerBig<256, 96, 3, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    // Look-back tuning: first-poll delay (default 450 ns) and 384-thread tiles
-    // (36 KB, 4 blocks/SM, a third fewer tiles and look-backs).
-    printf(PAD, "Big S3 look-back delay 0:"); fflush(stdout);
-    testLexerBig<256, 96, 3, false, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 look-back delay 100:"); fflush(stdout);
-    testLexerBig<256, 96, 3, false, 100>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 look-back delay 200:"); fflush(stdout);
-    testLexerBig<256, 96, 3, false, 200>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S2 BS384:"); fflush(stdout);
-    testLexerBig<384, 96, 2>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 BS384:"); fflush(stdout);
-    testLexerBig<384, 96, 3>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 BS384 delay 0:"); fflush(stdout);
-    testLexerBig<384, 96, 3, false, 0>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 BS384 delay 100:"); fflush(stdout);
-    testLexerBig<384, 96, 3, false, 100>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 BS384 delay 200:"); fflush(stdout);
-    testLexerBig<384, 96, 3, false, 200>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     free(input);
     free(expected_indices);
     free(expected_tokens);

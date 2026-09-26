@@ -1325,7 +1325,7 @@ within noise). Forced generic path: dense 2062, moderate 1135, sparse
 sparse: S3 − S2 grew from 52–68 μs (base) to 107–122 μs (all three) in ncu,
 54–62 → 88 μs in the bench.
 
-### Look-back cost: delay sweep and 384-thread tiles (A100 numbers pending)
+### Look-back cost: delay sweep and 384-thread tiles (failed, removed)
 
 Sparse profile (all three shared-memory changes), S3 vs S2: barrier stalls
 1.7 → 6.6 per issue (7 warps wait at the block scans while warp 0 does the
@@ -1334,16 +1334,43 @@ state and then the index look-back), sleeping 0.2 (the look-back warp's
 look-back sleeps 450 ns before its first poll (tuned for P1): ~0.9 μs per
 tile, with ~33 tiles per block slot (21334 tiles / 648 resident blocks).
 
-Variants (bench rows, S3 only where S2 cannot change):
-- **look-back delay 0 / 100 / 200** (`lexerBig<..., LB_DELAY>`, passed to
-  `TilePrefixCallbackOp<..., FIRST_DELAY_NS>`; default 450 keeps all other
-  kernels unchanged). The 350 ns sleeps between later polls are unchanged.
+Variants measured at `e1a604d`:
+- **look-back delay 0 / 100 / 200 ns** instead of 450 (first poll only; the
+  350 ns sleeps between later polls unchanged);
 - **BS384**: 384 threads × 96 B = 36 KB tiles, 38 KB shared memory,
-  `__launch_bounds__(384, 4)` (`LB_BIG(BS)` = 1536 threads/SM, 40 registers,
-  no spills): 4 blocks/SM, same threads per SM, 14222 instead of 21334 tiles.
-- **BS384 delay 0 / 100 / 200**: the combination.
+  `__launch_bounds__(384, 4)`: 4 blocks/SM (same 1536 threads/SM), 14222
+  instead of 21334 tiles;
+- **BS384 with delay 0 / 100 / 200**.
 
-Checks: base, generic and all other kernels' SASS identical to `76be63b`;
-SASS shows the first-poll `NANOSLEEP` immediates 0x64 / 0xc8 / 0x1c2 and none
-for delay 0; debug tests (256/384, delay 0/450, fast/generic) and all three
-datasets pass S3 locally.
+A100 bench, S3 μs (change vs base of the same run; dense CIs ±10–17 μs):
+
+| | dense (1821) | moderate (848) | sparse (780) |
+|---|---|---|---|
+| delay 0 | +31 | +18 | +18 |
+| delay 100 | +17 | −6 | −1 |
+| delay 200 | +26 | −2 | −1 |
+| BS384 | +24 | +16 | +12 |
+| BS384 delay 0 | +43 | +42 | +36 |
+| BS384 delay 100 | +22 | +15 | +3 |
+| BS384 delay 200 | +25 | +15 | +7 |
+
+Causes:
+1. *Delay 0* is slower (+18 μs on moderate/sparse): polling without the
+   initial sleep adds L2 traffic that slows the other blocks. 100–200 ns
+   gain at most 6 μs, within the run-to-run drift (this run's base is
+   8–11 μs slower than the previous one).
+2. *BS384* shortens the look-back share (moderate S3 − S2 93 → 79 μs) but
+   the compute gets slower (S2 +26–30 μs: block scans and barriers over 12
+   warps instead of 8, and fewer, larger blocks per SM).
+
+Removed from the bench and kernel. Kept, since they change no current SASS:
+`FIRST_DELAY_NS` (template parameter of `TilePrefixCallbackOp`, default 450)
+and `LB_BIG(BS)` (lexerBig's launch bounds follow the block size, 1536
+threads/SM).
+
+Current state (`be346d9` + shared-memory changes, `76be63b` code), A100 S3:
+dense 1815–1821 μs, moderate 840–848, sparse 769–780 (~51% of speed of light
+on all three). The look-backs (~90 μs on moderate/sparse) remain the largest
+cost not reduced; an idea not yet investigated: stop a look-back early at a
+predecessor whose aggregate state is a constant function (maps every
+incoming state to the same state), common in lexers.
