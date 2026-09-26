@@ -19,6 +19,12 @@
 #endif
 
 using token_t = uint8_t;
+
+// DFA: the parenthesis/identifier benchmark DFA below, or with
+// -DLEXER_DFA_JSON alpacc's JSON lexer (dfa/json.h).
+#ifdef LEXER_DFA_JSON
+#include "dfa/json.h"
+#else
 using state_t = uint16_t;
 
 const uint32_t NUM_STATES = 12;
@@ -67,6 +73,15 @@ constexpr state_t h_compose[NUM_STATES * NUM_STATES] =
      153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 153, 75,
      128, 161, 178, 147, 132, 421, 438, 407, 392, 153, 74, 75,
      75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75};
+constexpr token_t IGNORE_TOKEN = 0;          // whitespace
+constexpr bool COMPOSE_LATER_MAJOR = true;   // compose(a, b) = h_compose[b * N + a]
+#endif
+
+// compose(a, b) (a then b) as an index into the compose table, in the DFA's
+// table order.
+__device__ __host__ __forceinline__ constexpr uint32_t compose_index(uint32_t ia, uint32_t ib) {
+    return COMPOSE_LATER_MAJOR ? ib * NUM_STATES + ia : ia * NUM_STATES + ib;
+}
 
 
 __device__ __host__ __forceinline__ constexpr state_t get_index(state_t state) {
@@ -77,9 +92,24 @@ __device__ __host__ __forceinline__ constexpr token_t get_token(state_t state) {
     return (state & TOKEN_MASK) >> TOKEN_OFFSET;
 }
 
+#ifdef LEXER_ACCEPT_TABLE
+// Acceptance is a table per endofunction (h_accept), copied to d_accept at
+// program start; derived tables using it are then not compile-time.
+__device__ bool d_accept[NUM_STATES];
+#define LEXER_CX
+__device__ __host__ __forceinline__ bool is_accept(state_t state) {
+#ifdef __CUDA_ARCH__
+    return d_accept[get_index(state)];
+#else
+    return h_accept[get_index(state)];
+#endif
+}
+#else
+#define LEXER_CX constexpr
 __device__ __host__ __forceinline__ constexpr bool is_accept(state_t state) {
     return (state & ACCEPT_MASK) >> ACCEPT_OFFSET;
 }
+#endif
 
 __device__ __host__ __forceinline__ constexpr bool is_produce(state_t state) {
     return (state & PRODUCE_MASK) >> PRODUCE_OFFSET;
@@ -103,7 +133,7 @@ __device__ __forceinline__ void copy_states_to_shared(state_t* dst, state_t* src
 // bit 8 = accept. The low byte is a complete "state byte" (all but accept).
 // Built from the DFA's state encoding, so the tables derived with it stay
 // runtime data.
-__device__ __host__ __forceinline__ constexpr uint16_t pack_chain_state(state_t s) {
+__device__ __host__ __forceinline__ LEXER_CX uint16_t pack_chain_state(state_t s) {
     return uint16_t(uint32_t(is_produce(s)) | (get_index(s) << 1)
                   | (uint32_t(get_token(s)) << 5) | (uint32_t(is_accept(s)) << 8));
 }
@@ -118,37 +148,39 @@ constexpr bool LEXER_CHAIN_FITS = NUM_STATES <= 16 && popcount_const(TOKEN_MASK)
 //   row_of8[byte] = offset of the byte's compose row in (1 << LEXER_ROW_SHIFT)
 //                   byte units (8-byte units when compose rows are a multiple
 //                   of 8 bytes, else 2-byte units: class * NUM_STATES <= 240);
-//   comp[]        = compose results packed by pack_chain_state;
+//   comp[b * N + a] = compose(a, b) packed by pack_chain_state;
 //   comp_pf[p * 16 + f] = state byte of compose(p, f) (one 16-byte row per p).
+// Only sized for DFAs that fit the fast path.
 constexpr uint32_t LEXER_ROW_SHIFT = (NUM_STATES * sizeof(uint16_t)) % 8 == 0 ? 3 : 1;
 struct alignas(16) LexerChainTables {
     uint8_t  row_of8[256];
-    uint16_t comp[NUM_STATES * NUM_STATES];
-    uint8_t  comp_pf[NUM_STATES * 16];
+    uint16_t comp[LEXER_CHAIN_FITS ? NUM_STATES * NUM_STATES : 8];
+    uint8_t  comp_pf[LEXER_CHAIN_FITS ? NUM_STATES * 16 : 16];
 };
 static_assert(sizeof(LexerChainTables) % 16 == 0, "copied as 16-byte vectors");
 static_assert(offsetof(LexerChainTables, comp_pf) % 16 == 0, "comp_pf rows are read as uint4");
-constexpr LexerChainTables make_lexer_chain_tables() {
+LEXER_CX LexerChainTables make_lexer_chain_tables() {
     LexerChainTables t{};
     if constexpr (LEXER_CHAIN_FITS) {
         for (uint32_t i = 0; i < 256; i++)
             t.row_of8[i] = uint8_t(get_index(h_to_state[i]) * ((NUM_STATES * sizeof(uint16_t)) >> LEXER_ROW_SHIFT));
-        for (uint32_t i = 0; i < NUM_STATES * NUM_STATES; i++)
-            t.comp[i] = pack_chain_state(h_compose[i]);
+        for (uint32_t b = 0; b < NUM_STATES; b++)
+            for (uint32_t a = 0; a < NUM_STATES; a++)
+                t.comp[b * NUM_STATES + a] = pack_chain_state(h_compose[compose_index(a, b)]);
         for (uint32_t i = 0; i < NUM_STATES * 16; i++) {
             const uint32_t p = i / 16, f = i % 16;
-            t.comp_pf[i] = f < NUM_STATES ? uint8_t(pack_chain_state(h_compose[f * NUM_STATES + p])) : 0;
+            t.comp_pf[i] = f < NUM_STATES ? uint8_t(pack_chain_state(h_compose[compose_index(p, f)])) : 0;
         }
     }
     return t;
 }
-constexpr LexerChainTables h_chain_tables = make_lexer_chain_tables();
+LEXER_CX LexerChainTables h_chain_tables = make_lexer_chain_tables();
 
 // alpacc's lexer output (lexerBig MAXADD): per kept token (terminal !=
-// IGNORE_TOKEN) the terminal, its start and its length. Starts come from a
-// max-scan over "last token end + 1" (0 = input start), output slots from an
-// add-scan over kept tokens; both share one look-back round via MaxAdd.
-constexpr token_t IGNORE_TOKEN = 0;   // whitespace in this DFA
+// IGNORE_TOKEN, from the DFA) the terminal, its start and its length. Starts
+// come from a max-scan over "last token end + 1" (0 = input start), output
+// slots from an add-scan over kept tokens; both share one look-back round via
+// MaxAdd.
 struct MaxAdd {
     uint32_t max;   // start of the next token: last token end + 1 (0: none yet)
     uint32_t cnt;   // kept tokens
@@ -196,12 +228,14 @@ struct LexerCtx {
 
     __device__ __host__ __forceinline__
     state_t operator()(const state_t &a, const state_t &b) const {
-        return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+        if constexpr (COMPOSE_LATER_MAJOR) return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+        else                            return d_compose[get_index(a) * NUM_STATES + get_index(b)];
     }
 
     __device__ __host__ __forceinline__
     state_t operator()(const volatile state_t &a, const volatile state_t &b) const {
-        return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+        if constexpr (COMPOSE_LATER_MAJOR) return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+        else                            return d_compose[get_index(a) * NUM_STATES + get_index(b)];
     }
 
     __device__ __host__ __forceinline__
@@ -238,12 +272,14 @@ struct LexerCtxShmem {
 
     __device__ __forceinline__
     state_t operator()(const state_t &a, const state_t &b) const {
-        return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+        if constexpr (COMPOSE_LATER_MAJOR) return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+        else                            return d_compose[get_index(a) * NUM_STATES + get_index(b)];
     }
 
     __device__ __forceinline__
     state_t operator()(const volatile state_t &a, const volatile state_t &b) const {
-        return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+        if constexpr (COMPOSE_LATER_MAJOR) return d_compose[get_index(b) * NUM_STATES + get_index(a)];
+        else                            return d_compose[get_index(a) * NUM_STATES + get_index(b)];
     }
 
     __device__ __forceinline__
@@ -638,7 +674,8 @@ __device__ __forceinline__ bool     chain_accept(uint32_t v)      { return (v >>
 struct ShmemCompose {
     const state_t* table;
     __device__ __forceinline__ state_t operator()(const state_t& a, const state_t& b) const {
-        return table[get_index(b) * NUM_STATES + get_index(a)];
+        if constexpr (COMPOSE_LATER_MAJOR) return table[get_index(b) * NUM_STATES + get_index(a)];
+        else                            return table[get_index(a) * NUM_STATES + get_index(b)];
     }
 };
 
@@ -889,7 +926,11 @@ void lexerBig(
     __shared__ typename PrefixOpIdx::TempStorage    idx_prefix;
     __shared__ typename BlockScanMA::TempStorage    ma_scan;     // MAXADD (unreferenced otherwise)
     __shared__ typename PrefixOpMA::TempStorage     ma_prefix;
-    __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
+    // The compose table in shared memory when it fits (up to 8 KB), else it is
+    // read from global memory through L1/L2 (large DFAs: e.g. JSON, 823
+    // endofunctions, 1.35 MB).
+    constexpr bool COMPOSE_IN_SHMEM = NUM_STATES * NUM_STATES * sizeof(state_t) <= 8192;
+    __shared__ __align__(8) state_t shmem_compose[COMPOSE_IN_SHMEM ? NUM_STATES * NUM_STATES : 4];
     // Derived tables (LexerChainTables, built at compile time from the DFA
     // tables and copied here as 16-byte vectors): one chain step is
     // v = comp[(row_of8[byte] << ROW_SHIFT) + (v & 0x1e)] (bytes; row_of8 is a
@@ -902,7 +943,8 @@ void lexerBig(
     // Generic path: to_state as loaded (unreferenced on the fast path).
     __shared__ __align__(8) state_t shmem_to_state[256];
 
-    copy_states_to_shared<NUM_STATES * NUM_STATES, BLOCK_SIZE>(shmem_compose, ctx.d_compose_glb);
+    if constexpr (COMPOSE_IN_SHMEM)
+        copy_states_to_shared<NUM_STATES * NUM_STATES, BLOCK_SIZE>(shmem_compose, ctx.d_compose_glb);
     if constexpr (!FAST) {
         copy_states_to_shared<256, BLOCK_SIZE>(shmem_to_state, ctx.d_to_state);
     } else {
@@ -910,7 +952,7 @@ void lexerBig(
             reinterpret_cast<uint4*>(&tables)[i] =
                 reinterpret_cast<const uint4*>(ctx.d_chain_tables)[i];
     }
-    const ShmemCompose compose{shmem_compose};
+    const ShmemCompose compose{COMPOSE_IN_SHMEM ? shmem_compose : ctx.d_compose_glb};
     auto step = [&](uint32_t v, uint32_t byte) -> uint32_t {
         return *reinterpret_cast<const uint16_t*>(
             reinterpret_cast<const uint8_t*>(comp) + (uint32_t(row_of8[byte]) << ROW_SHIFT) + (v & 0x1eu));
@@ -1568,7 +1610,10 @@ void testLexerBig(uint8_t* input,
     std::vector<I>       h_index_out(size, 0);
     std::vector<I>       h_len_out(MAXADD ? size : 0, 0);
     std::vector<token_t> ref_t; std::vector<uint32_t> ref_s, ref_l;   // MAXADD reference
-    const size_t out_tokens = MAXADD
+    // No expected output (expected_indices == nullptr): not verified, token
+    // count taken from the kernel.
+    const bool verify = expected_indices != nullptr;
+    size_t out_tokens = MAXADD && verify
         ? maxadd_reference(expected_indices, expected_tokens, expected_size, ref_t, ref_s, ref_l)
         : expected_size;
 
@@ -1640,7 +1685,11 @@ void testLexerBig(uint8_t* input,
         gpuAssert(cudaMemcpy(&temp_size, d_new_size, sizeof(I), cudaMemcpyDeviceToHost));
         gpuAssert(cudaMemcpy(&is_valid,  d_is_valid, sizeof(bool), cudaMemcpyDeviceToHost));
 
-        test_passes = is_valid;
+        if (!verify) {
+            out_tokens = temp_size;
+            printf("[%u tokens, %s] ", temp_size, is_valid ? "accepting" : "not accepting");
+        }
+        test_passes = is_valid || !verify;
         if (!test_passes)
             std::cout << "Lexer Test Failed: The input given to the lexer does not result in an accepting state." << std::endl;
         if (test_passes && temp_size != (I)out_tokens) {
@@ -1657,7 +1706,7 @@ void testLexerBig(uint8_t* input,
                     test_passes = false; break;
                 }
             }
-        } else if (test_passes) {
+        } else if (test_passes && verify) {
             for (I i = 0; i < (I)expected_size; ++i) {
                 if (h_index_out[i] != expected_indices[i]) {
                     printf("Lexer Test Failed: index mismatch at i=%u: expected=%u got=%u\n",
@@ -1693,6 +1742,8 @@ void testLexerBig(uint8_t* input,
     ctx.Cleanup();
 }
 
+// Debug tests (small inputs of the benchmark DFA); not built for other DFAs.
+#ifndef LEXER_DFA_JSON
 #ifdef DEBUG
 #define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
 #else
@@ -2004,6 +2055,8 @@ bool runTest(LexerTest* test) {
     return pass;
 }
 
+#endif  // !LEXER_DFA_JSON (debug tests)
+
 #ifdef DEBUG
 int main() {
     // Indices are the end positions (inclusive, 0-indexed) of each token.
@@ -2058,6 +2111,30 @@ int main() {
 
 #else
 
+#ifdef LEXER_DFA_JSON
+// JSON DFA (dfa/json.h): lexerBig only (the other kernels keep the compose
+// table in shared memory, too small for 823 endofunctions), no expected
+// output (no verification); GB/s counts input + 5 B per token reported by
+// the kernel.
+int main(int32_t argc, char *argv[]) {
+    assert(argc >= 2);
+    size_t input_size;
+    uint8_t* input = read_u8_array(argv[1], &input_size);
+    gpuAssert(cudaMemcpyToSymbol(d_accept, h_accept, sizeof(h_accept)));
+
+    printf("%s (JSON DFA: %u endofunctions, compose table %zu KB; not verified):\n",
+           argv[1], NUM_STATES, (size_t)NUM_STATES * NUM_STATES * sizeof(state_t) / 1024);
+    printf(PAD, "Big tile S1 (load only):"); fflush(stdout);
+    testLexerBig<256, 96, 1>(input, input_size, nullptr, nullptr, 0);
+    printf(PAD, "Big tile S2 (no look-backs):"); fflush(stdout);
+    testLexerBig<256, 96, 2>(input, input_size, nullptr, nullptr, 0);
+    printf(PAD, "Big tile S3 (full) BS256/CHUNK96:"); fflush(stdout);
+    testLexerBig<256, 96, 3>(input, input_size, nullptr, nullptr, 0);
+    free(input);
+    gpuAssert(cudaPeekAtLastError());
+    return 0;
+}
+#else
 int main(int32_t argc, char *argv[]) {
     assert(argc == 4);
     size_t input_size;
@@ -2103,5 +2180,6 @@ int main(int32_t argc, char *argv[]) {
     gpuAssert(cudaPeekAtLastError());
     return 0;
 }
+#endif  // LEXER_DFA_JSON
 
 #endif

@@ -12,7 +12,7 @@ default: bench
 
 P1_BENCH_PROGRAM=p1_bench
 
-.PHONY: clean bench test devinfo profile_p1 bench_p1 profile
+.PHONY: clean bench test devinfo profile_p1 bench_p1 profile bench_json
 
 $(DATA_PATH)/tokens_dense_500MiB.in:
 	(cd $(DATA_PATH) && make)
@@ -73,6 +73,23 @@ bench: $(FUTHARK_PROGRAM) \
 
 $(P1_BENCH_PROGRAM): p1_bench.cu
 	$(COMPILER) $(FLAGS) -o $@ $<
+
+# JSON DFA (alpacc's grammars/json.alp, extracted into dfa/json.h): lexerBig
+# only, on 500 MB of generated JSON; the output is not verified.
+JSON_DATA=$(DATA_PATH)/json_500MiB.in
+$(DATA_PATH)/json_gen: $(DATA_PATH)/json_gen.c
+	$(CC) -O2 -o $@ $<
+
+$(JSON_DATA): $(DATA_PATH)/json_gen
+	$(DATA_PATH)/json_gen 524288000 $@
+
+$(CUDA_PROGRAM)_json: cuda_lexer.cu dfa/json.h $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h
+	$(COMPILER) $(FLAGS) -DLEXER_DFA_JSON -o $@ $<
+
+bench_json: $(CUDA_PROGRAM)_json $(JSON_DATA)
+	@echo -e "$(GREEN)=== CUDA LEXER (JSON DFA) ===$(DEFAULT)"
+	@./$(CUDA_PROGRAM)_json $(JSON_DATA)
+	@echo -e "$(GREEN)============$(DEFAULT)"
 
 bench_p1: $(P1_BENCH_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in
 	@echo -e "$(GREEN)=== P1 BENCH ===$(DEFAULT)"
@@ -162,5 +179,6 @@ devinfo:
 	rm -f devinfo
 
 clean:
-	rm -rf $(CUDA_PROGRAM) $(CUDA_DEBUG_PROGRAM) $(P1_BENCH_PROGRAM) $(P1_BENCH_PROGRAM)_profile $(FUTHARK_PROGRAM) *.out
+	rm -rf $(CUDA_PROGRAM) $(CUDA_PROGRAM)_json $(CUDA_DEBUG_PROGRAM) $(P1_BENCH_PROGRAM) $(P1_BENCH_PROGRAM)_profile $(FUTHARK_PROGRAM) *.out
+	rm -f $(DATA_PATH)/json_gen $(JSON_DATA)
 	rm -f $(DATA_PATH)/tokens_*_1GiB.in

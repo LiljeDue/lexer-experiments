@@ -1541,3 +1541,29 @@ kernel 7072 vs 6148 static instructions; base, generic and other kernels'
 SASS unchanged (up to parameter offsets); debug tests and all three datasets
 pass against `maxadd_reference` (derived from the expected (end, token)
 output). Bench rows `Big S2/S3 max+add` (GB/s counts 9 B per kept token).
+
+## lexerBig with alpacc's JSON DFA (A100 numbers pending)
+
+The benchmark DFA has 12 endofunctions (transition-monoid elements); real
+lexers have far more: alpacc's JSON grammar (`grammars/json.alp`) gives 823
+endofunctions, a 823 × 823 u16 compose table of 1.35 MB (a 26-state JSON
+variant reaches ~4000, 32 MB). All kernels here kept the compose table in
+shared memory, which caps them at ~100 endofunctions.
+
+Changes (the default build's SASS is byte-identical, all kernels):
+- `dfa/json.h`, extracted from alpacc's generated `json.cu` by
+  `dfa/extract_alpacc.sh`, selected with `-DLEXER_DFA_JSON`: terminal bits
+  as TOKEN_*, `IGNORE_TOKEN = 11`, accept as the table `h_accept` (copied to
+  `d_accept` at start; `LEXER_ACCEPT_TABLE`, the accessors then not
+  `constexpr`), and alpacc's earlier-major compose order
+  (`COMPOSE_LATER_MAJOR = false`, used by the compose functors and the
+  fast-path table builder).
+- `lexerBig` keeps the compose table in shared memory only up to 8 KB, else
+  reads it from global memory through L1/L2; `LexerChainTables` is only
+  sized for DFAs that fit the fast path.
+- `data/json_gen.c`: 500 MB of random JSON built from the grammar's tokens
+  (strings of `[a-zA-Z0-9 ]`, numbers, literals, objects/arrays, whitespace
+  runs); `make bench_json` builds `cuda_lexer_json` and runs `lexerBig`
+  S1/S2/S3 (generic path) without verification, reporting the token count
+  and whether the final state accepts (locally: 145.3M tokens, accepting).
+- JSON build: 40 registers, 28–52 B spills, 25.2 KB shared memory.
