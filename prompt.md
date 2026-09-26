@@ -1412,18 +1412,100 @@ blocks, and in S3 the faster tiles wait longer on their predecessors: the
 look-back wait absorbs compute savings on moderate/sparse. Next: hide the
 look-back wait behind other work instead of only cutting instructions.
 
-### More, smaller blocks to absorb the look-back wait (A100 numbers pending)
+### More, smaller blocks to absorb the look-back wait (failed, removed)
 
 The look-back wait is idle time of a whole block (7 warps at the barrier,
 warp 0 spinning); loads already overlap (L2-resident test), so only other
-blocks' compute can fill it. Registers cap 256-thread blocks at 6 per SM
-(40 × 256 × 6); 128-thread blocks (12 KB tiles) fit 11 per SM by shared
-memory (13.4 KB each, 40 registers, no spills; `LB_BIG(128)` =
-`__launch_bounds__(128, 12)`): 44 warps in 11 independent blocks instead of
-48 warps in 6, at twice the tiles and look-backs. Bench rows `Big S2/S3
-BS128`; S3 passes on all three datasets locally.
+blocks' compute can fill it. Registers cap 256-thread blocks at 6 per SM;
+128-thread blocks (12 KB tiles, 13.4 KB shared memory, 40 registers,
+`__launch_bounds__(128, 12)`) run 11 per SM: 44 warps in 11 independent
+blocks instead of 48 in 6, at twice the tiles and look-backs.
 
-Considered and deferred: a warp-specialized persistent kernel (8 compute
-warps + 1 look-back warp, pass A of tile k+1 while tile k's look-back
-resolves, double buffer in dynamic shared memory → 3 blocks/SM); large
-rewrite with occupancy risk, decided on after this test.
+A100 bench (`be684ed`), μs:
+
+| | S2 256 → 128 | S3 256 → 128 | S3 − S2 (look-backs) 256 → 128 |
+|---|---|---|---|
+| dense | 1814 → 1760 (−3.0%) | 1844 → 1863 (+1.0%, noise) | 30 → 103 |
+| moderate | 738 → 715 (−3.1%) | 832 → 861 (+3.5%) | 94 → 146 |
+| sparse | 670 → 650 (−3.0%) | 765 → 797 (+4.2%) | 95 → 147 |
+
+More, smaller blocks make the compute 3% faster (4-warp barriers, more
+independent blocks), but the look-back cost grows with the number of tiles:
++21333 tiles cost +52 μs on moderate/sparse (~2.4 ns of runtime per tile).
+It is a per-tile latency along the chain of tiles, not idle time that other
+blocks can fill. Removed; the warp-specialized persistent kernel was not
+attempted (a dedicated look-back warp already lost for P1: later INCLUSIVE,
+lower occupancy).
+
+## Conclusion — lexer design ceiling
+
+**Final `lexerBig<256, 96>` (`e46e7db` code), A100 S3 over the last two runs:
+dense 1820–1844 μs, moderate 830–832 μs, sparse 764–765 μs — about 51–52%
+of speed of light on all three**
+(1 B read per input byte + 5 B written per token at memcpy bandwidth).
+Against the starting kernels (same run as 1844 / 832 / 765 μs): 1.66×
+(dense), 2.94× (moderate), 3.04× (sparse) faster than `lexerVecPipe`;
+against the first `lexerBig` (3183 / 1258 / 1132 μs), 1.73× / 1.51× / 1.48×.
+The DFA stays runtime data, the fast path works for any `state_t` width
+with ≤ 16 states and ≤ 8 tokens, and larger DFAs take the generic path
+(+14–40%).
+
+### Why we stop here
+
+This design is compute-bound, and the bound is structural:
+
+1. **Two table-driven passes over every byte.** Pass A (a serial chain:
+   per byte a class lookup and a dependent transition lookup) and pass B
+   (one lookup per byte against the incoming state, via PRMT in registers),
+   plus block scans, two look-backs per tile and the emission. Measured
+   (ncu, thread instructions per input byte): 15.4 on sparse (S3,
+   `e46e7db`), 17.0 on moderate and 42.7 on dense (S2, before the
+   compile-time tables; dense: emission ≈ 2/3 of it). A lookup-based pass
+   costs ≥ 4–5 instructions per byte (extract, class lookup, transition
+   lookup, bookkeeping), so two passes plus scans and emission cannot go
+   much below ~10.
+2. **Issue bound on a power-capped GPU.** The benched A100 (PCIe, 250 W)
+   runs every `lexerBig` variant at the software power cap, 1140–1275 MHz
+   sustained on dense and ~1.3 GHz on moderate/sparse (memory-bound kernels
+   are not capped). At ~1.2 GHz and 432 warp schedulers, perfect issue at
+   the measured instructions per byte would reach 80% (sparse, moderate) /
+   70% (dense) of speed of light; at the measured 60–75% issue efficiency,
+   42–60%. We measure 51%.
+3. **Look-back latency per tile.** ~90 μs on moderate/sparse (S3 − S2) that
+   grows with the number of tiles and absorbs part of every compute saving
+   (faster tiles wait longer for their predecessors). Hiding it with more
+   blocks, larger tiles, or shorter delays was measured and lost; the
+   dedicated look-back warp already lost for P1.
+
+What would move the ceiling (not pursued):
+- **Removing pass B** needs each tile's incoming state before it starts:
+  waiting for it serializes tiles; guessing it (DFA convergence) is
+  data-dependent — rejected, since a well-formed worst case (a tile of
+  whitespace) never converges.
+- **Two bytes per dependent lookup in pass A** (a state × class-pair table,
+  ~3.5 KB): about a third of pass A, still two passes — est. +5–8%.
+- **Hardware:** an A100 without the 250 W cap (SXM, 400 W) would run at
+  ~1.41 GHz sustained, ~+15% on dense.
+- **DFA-specific code** (register/ALU compose): excluded by design (the
+  table-driven operator must work for runtime DFAs).
+
+### What helped (A100 S3, cumulative)
+
+| step | dense | moderate | sparse |
+|---|---|---|---|
+| first `lexerBig` (large tiles in shared memory) | 3183 | 1258 | 1132 |
+| `select_bit` instead of `__fns` in the emission | 2055 | 1179 | 1119 |
+| chain tables (packed chain states) in passes A/B | 1959 | 1144 | 1086 |
+| pass B as independent lookups `compose(p, F_i)` | 1844 | 986 | 925 |
+| swizzle + `row_of` u8 + `comp_pf` rows in registers | 1815 | 840 | 769 |
+| derived tables at compile time | 1820 | 830 | 764 |
+
+(Run-to-run drift is ~±10 μs; dense rows ±15 μs.)
+
+### What did not help (details in the sections above)
+
+Staged per-lane emission (+22% instructions, 5 blocks/SM), word-aligned
+emission (3.4× store requests), packed owner search, flagless pass A (before
+the shared-memory fixes), no-barrier next byte, look-back delay 0 / 100 /
+200 ns, 384-thread tiles, 128-thread blocks, and the convergence-based
+look-back skip (data-dependent).
