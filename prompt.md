@@ -1375,7 +1375,7 @@ cost not reduced; an idea not yet investigated: stop a look-back early at a
 predecessor whose aggregate state is a constant function (maps every
 incoming state to the same state), common in lexers.
 
-### Derived tables built at compile time (A100 numbers pending)
+### Derived tables built at compile time (kept)
 
 Sparse S3 per-region profile (adopted kernel): building the derived tables in
 every tile (copy compose, compute `row_of8`, `comp`, `comp_pf` with scalar
@@ -1396,3 +1396,34 @@ SASS: S2/S3 −496 static instructions (setup only: 9 fewer global loads, 9
 fewer shared stores, ~190 fewer IMAD/LOP3/LEA/SHF); hot-loop LDS/PRMT/POPC
 counts unchanged; 40 registers, no spills, same shared memory; other kernels
 unchanged. Debug tests (fast + generic) and all three datasets pass S3.
+
+A100 bench (`e46e7db`) vs the previous run:
+
+| | S2 | S3 | % of speed of light |
+|---|---|---|---|
+| dense | noise (±15 μs) | 1821 → 1820 μs | 51.6% |
+| moderate | 755 → 739 μs (−2.1%) | 848 → 830 μs (−2.1%) | 51.6% |
+| sparse | 690 → 670 μs (−2.9%) | 780 → 764 μs (−2.1%) | 51.2% |
+
+ncu, sparse (real clock): S2 0.596 → 0.586 ms, warp instructions 252M → 239M
+(−5%); S3 0.703 → 0.704 ms with barrier stalls 6.6 → 7.3 per issue. The
+instruction cut is real, but much of the removed setup overlapped with other
+blocks, and in S3 the faster tiles wait longer on their predecessors: the
+look-back wait absorbs compute savings on moderate/sparse. Next: hide the
+look-back wait behind other work instead of only cutting instructions.
+
+### More, smaller blocks to absorb the look-back wait (A100 numbers pending)
+
+The look-back wait is idle time of a whole block (7 warps at the barrier,
+warp 0 spinning); loads already overlap (L2-resident test), so only other
+blocks' compute can fill it. Registers cap 256-thread blocks at 6 per SM
+(40 × 256 × 6); 128-thread blocks (12 KB tiles) fit 11 per SM by shared
+memory (13.4 KB each, 40 registers, no spills; `LB_BIG(128)` =
+`__launch_bounds__(128, 12)`): 44 warps in 11 independent blocks instead of
+48 warps in 6, at twice the tiles and look-backs. Bench rows `Big S2/S3
+BS128`; S3 passes on all three datasets locally.
+
+Considered and deferred: a warp-specialized persistent kernel (8 compute
+warps + 1 look-back warp, pass A of tile k+1 while tile k's look-back
+resolves, double buffer in dynamic shared memory → 3 blocks/SM); large
+rewrite with occupancy risk, decided on after this test.

@@ -1900,6 +1900,12 @@ int main(int32_t argc, char *argv[]) {
     // DFAs that do not fit the packed fast path.
     printf(PAD, "Big S3 generic path (forced):"); fflush(stdout);
     testLexerBig<256, 96, 3, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    // 128-thread blocks (12 KB tiles): more resident blocks per SM (up to 11 by
+    // shared memory, vs 6) to absorb the look-back waits, at twice the tiles.
+    printf(PAD, "Big S2 BS128:"); fflush(stdout);
+    testLexerBig<128, 96, 2>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
+    printf(PAD, "Big S3 BS128:"); fflush(stdout);
+    testLexerBig<128, 96, 3>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     free(input);
     free(expected_indices);
     free(expected_tokens);
