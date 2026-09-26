@@ -1374,3 +1374,25 @@ on all three). The look-backs (~90 μs on moderate/sparse) remain the largest
 cost not reduced; an idea not yet investigated: stop a look-back early at a
 predecessor whose aggregate state is a constant function (maps every
 incoming state to the same state), common in lexers.
+
+### Derived tables built at compile time (A100 numbers pending)
+
+Sparse S3 per-region profile (adopted kernel): building the derived tables in
+every tile (copy compose, compute `row_of8`, `comp`, `comp_pf` with scalar
+global loads and packing) cost ~8% of the warp instructions and ~12% of the
+stall samples (its global-load latency sits at the start of every tile).
+Other regions: pass A chain step 24% / pass A loop 13%, pass B 19%, block
+scans + look-back glue 13%, emission 5%.
+
+Change: `LexerChainTables { row_of8[256]; comp[NS·NS]; comp_pf[NS·16] }`
+(736 B, 16-byte aligned) is computed by `constexpr make_lexer_chain_tables()`
+from `h_to_state` / `h_compose` (now `constexpr`; the state accessors and
+`pack_chain_state` are `constexpr __host__ __device__`), uploaded once by
+`LexerCtxShmem`, and copied per tile as 46 `uint4`s. The tables stay data in
+global memory (loadable at run time in principle); the generator is
+unchanged and the packed formats stay defined next to the kernel.
+
+SASS: S2/S3 −496 static instructions (setup only: 9 fewer global loads, 9
+fewer shared stores, ~190 fewer IMAD/LOP3/LEA/SHF); hot-loop LDS/PRMT/POPC
+counts unchanged; 40 registers, no spills, same shared memory; other kernels
+unchanged. Debug tests (fast + generic) and all three datasets pass S3.

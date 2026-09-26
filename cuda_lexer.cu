@@ -33,7 +33,7 @@ const state_t PRODUCE_MASK = 256;
 const state_t PRODUCE_OFFSET = 8;
 const state_t IDENTITY = 74;
 
-state_t h_to_state[NUM_TRANS] =
+constexpr state_t h_to_state[NUM_TRANS] =
         {75, 75, 75, 75, 75, 75, 75, 75, 75, 128, 128, 75, 75, 128,
          75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75,
          75, 75, 75, 128, 75, 75, 75, 75, 75, 75, 75, 161, 178, 75,
@@ -54,7 +54,7 @@ state_t h_to_state[NUM_TRANS] =
          75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75,
          75, 75, 75, 75};
 
-state_t h_compose[NUM_STATES * NUM_STATES] =
+constexpr state_t h_compose[NUM_STATES * NUM_STATES] =
     {132, 392, 392, 392, 132, 392, 392, 392, 132, 392, 128, 75,
      421, 421, 421, 421, 421, 421, 421, 421, 421, 421, 161, 75,
      438, 438, 438, 438, 438, 438, 438, 438, 438, 438, 178, 75,
@@ -69,19 +69,19 @@ state_t h_compose[NUM_STATES * NUM_STATES] =
      75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75};
 
 
-__device__ __host__ __forceinline__ state_t get_index(state_t state) {
+__device__ __host__ __forceinline__ constexpr state_t get_index(state_t state) {
     return (state & ENDO_MASK) >> ENDO_OFFSET;
 }
 
-__device__ __host__ __forceinline__ token_t get_token(state_t state) {
+__device__ __host__ __forceinline__ constexpr token_t get_token(state_t state) {
     return (state & TOKEN_MASK) >> TOKEN_OFFSET;
 }
 
-__device__ bool is_accept(state_t state) {
+__device__ __host__ __forceinline__ constexpr bool is_accept(state_t state) {
     return (state & ACCEPT_MASK) >> ACCEPT_OFFSET;
 }
 
-__device__ __host__ __forceinline__ bool is_produce(state_t state) {
+__device__ __host__ __forceinline__ constexpr bool is_produce(state_t state) {
     return (state & PRODUCE_MASK) >> PRODUCE_OFFSET;
 }
 
@@ -97,6 +97,52 @@ __device__ __forceinline__ void copy_states_to_shared(state_t* dst, state_t* src
             reinterpret_cast<volatile state_t*>(dst)[i] = src[i];
     }
 }
+
+// Packed chain state for lexerBig's per-byte loop: bit 0 = produce, bits 1-4 =
+// state index * 2 (a byte offset into a u16 compose row), bits 5-7 = token,
+// bit 8 = accept. The low byte is a complete "state byte" (all but accept).
+// Built from the DFA's state encoding, so the tables derived with it stay
+// runtime data.
+__device__ __host__ __forceinline__ constexpr uint16_t pack_chain_state(state_t s) {
+    return uint16_t(uint32_t(is_produce(s)) | (get_index(s) << 1)
+                  | (uint32_t(get_token(s)) << 5) | (uint32_t(is_accept(s)) << 8));
+}
+// The packed chain state / state byte hold the index in 4 bits and the token
+// in 3; DFAs that do not fit use lexerBig's generic path (plain state_t
+// compose chains), whatever the width of state_t.
+constexpr uint32_t popcount_const(uint32_t x) { return x ? (x & 1u) + popcount_const(x >> 1) : 0; }
+constexpr bool LEXER_CHAIN_FITS = NUM_STATES <= 16 && popcount_const(TOKEN_MASK) <= 3;
+
+// Derived tables for lexerBig's fast path, built at compile time from the DFA
+// tables (so the kernel only copies them; they stay data in global memory):
+//   row_of8[byte] = offset of the byte's compose row in (1 << LEXER_ROW_SHIFT)
+//                   byte units (8-byte units when compose rows are a multiple
+//                   of 8 bytes, else 2-byte units: class * NUM_STATES <= 240);
+//   comp[]        = compose results packed by pack_chain_state;
+//   comp_pf[p * 16 + f] = state byte of compose(p, f) (one 16-byte row per p).
+constexpr uint32_t LEXER_ROW_SHIFT = (NUM_STATES * sizeof(uint16_t)) % 8 == 0 ? 3 : 1;
+struct alignas(16) LexerChainTables {
+    uint8_t  row_of8[256];
+    uint16_t comp[NUM_STATES * NUM_STATES];
+    uint8_t  comp_pf[NUM_STATES * 16];
+};
+static_assert(sizeof(LexerChainTables) % 16 == 0, "copied as 16-byte vectors");
+static_assert(offsetof(LexerChainTables, comp_pf) % 16 == 0, "comp_pf rows are read as uint4");
+constexpr LexerChainTables make_lexer_chain_tables() {
+    LexerChainTables t{};
+    if constexpr (LEXER_CHAIN_FITS) {
+        for (uint32_t i = 0; i < 256; i++)
+            t.row_of8[i] = uint8_t(get_index(h_to_state[i]) * ((NUM_STATES * sizeof(uint16_t)) >> LEXER_ROW_SHIFT));
+        for (uint32_t i = 0; i < NUM_STATES * NUM_STATES; i++)
+            t.comp[i] = pack_chain_state(h_compose[i]);
+        for (uint32_t i = 0; i < NUM_STATES * 16; i++) {
+            const uint32_t p = i / 16, f = i % 16;
+            t.comp_pf[i] = f < NUM_STATES ? uint8_t(pack_chain_state(h_compose[f * NUM_STATES + p])) : 0;
+        }
+    }
+    return t;
+}
+constexpr LexerChainTables h_chain_tables = make_lexer_chain_tables();
 
 struct LexerCtx {
     state_t* d_to_state;
@@ -138,19 +184,24 @@ struct LexerCtxShmem {
     state_t* d_to_state;
     state_t* d_compose_glb; // global memory source for the per-block shmem load
     state_t* d_compose;     // set to shared memory inside the kernel
+    LexerChainTables* d_chain_tables;   // lexerBig's derived tables (h_chain_tables)
 
-    LexerCtxShmem() : d_to_state(NULL), d_compose_glb(NULL), d_compose(NULL) {
+    LexerCtxShmem() : d_to_state(NULL), d_compose_glb(NULL), d_compose(NULL), d_chain_tables(NULL) {
         cudaMalloc(&d_to_state, sizeof(h_to_state));
         cudaMemcpy(d_to_state, h_to_state, sizeof(h_to_state),
                 cudaMemcpyHostToDevice);
         cudaMalloc(&d_compose_glb, sizeof(h_compose));
         cudaMemcpy(d_compose_glb, h_compose, sizeof(h_compose),
                 cudaMemcpyHostToDevice);
+        cudaMalloc(&d_chain_tables, sizeof(h_chain_tables));
+        cudaMemcpy(d_chain_tables, &h_chain_tables, sizeof(h_chain_tables),
+                cudaMemcpyHostToDevice);
     }
 
     void Cleanup() {
         if (d_to_state) cudaFree(d_to_state);
         if (d_compose_glb) cudaFree(d_compose_glb);
+        if (d_chain_tables) cudaFree(d_chain_tables);
     }
 
     __device__ __forceinline__
@@ -544,20 +595,6 @@ __device__ __forceinline__ uint32_t select_bit(uint32_t m, uint32_t k) {
     return pos;
 }
 
-// Packed chain state for lexerBig's per-byte loop: bit 0 = produce, bits 1-4 =
-// state index * 2 (a byte offset into a u16 compose row), bits 5-7 = token,
-// bit 8 = accept. The low byte is a complete "state byte" (all but accept).
-// Built from the DFA's state encoding, so the tables derived with it stay
-// runtime data.
-__device__ __forceinline__ uint16_t pack_chain_state(state_t s) {
-    return uint16_t(uint32_t(is_produce(s)) | (get_index(s) << 1)
-                  | (uint32_t(get_token(s)) << 5) | (uint32_t(is_accept(s)) << 8));
-}
-// The packed chain state / state byte hold the index in 4 bits and the token
-// in 3; DFAs that do not fit use lexerBig's generic path (plain state_t
-// compose chains), whatever the width of state_t.
-constexpr uint32_t popcount_const(uint32_t x) { return x ? (x & 1u) + popcount_const(x >> 1) : 0; }
-constexpr bool LEXER_CHAIN_FITS = NUM_STATES <= 16 && popcount_const(TOKEN_MASK) <= 3;
 
 __device__ __forceinline__ state_t  chain_state_index(uint32_t v) { return state_t((v & 0x1eu) >> 1); }
 __device__ __forceinline__ bool     chain_produce(uint32_t v)     { return v & 1u; }
@@ -798,9 +835,7 @@ void lexerBig(
     // FAST: packed chain states and state bytes (needs LEXER_CHAIN_FITS);
     // otherwise the generic path (state_t compose chains in passes A and B).
     constexpr bool FAST = LEXER_CHAIN_FITS && !FORCE_GENERIC;
-    // row_of8 unit: 8 bytes when compose rows are a multiple of 8 bytes, else
-    // 2 bytes (class * NUM_STATES <= 240 still fits a byte).
-    constexpr uint32_t ROW_SHIFT = (NUM_STATES * sizeof(uint16_t)) % 8 == 0 ? 3 : 1;
+    constexpr uint32_t ROW_SHIFT = LEXER_ROW_SHIFT;
     constexpr I VECS       = CHUNK / 16;
     constexpr I WARP_BYTES = WARP * CHUNK;
     constexpr I TILE       = BLOCK_SIZE * CHUNK;
@@ -816,16 +851,15 @@ void lexerBig(
     __shared__ typename BlockScanI::TempStorage     idx_scan;
     __shared__ typename PrefixOpIdx::TempStorage    idx_prefix;
     __shared__ __align__(8) state_t shmem_compose[NUM_STATES * NUM_STATES];
-    // Tables derived from the DFA tables at kernel start (the DFA stays
-    // runtime data): row_of8[byte] = offset of the byte's compose row in
-    // (1 << ROW_SHIFT)-byte units (a byte table: bytes < 128 all fall in
-    // different banks), comp[] = compose results packed by pack_chain_state,
-    // so one chain step is v = comp[(row_of8[byte] << ROW_SHIFT) + (v & 0x1e)]
-    // (bytes); comp_pf[p * 16 + f] = state byte of compose(p, f), read as one
-    // 16-byte row per thread.
-    __shared__ __align__(8)  uint8_t  row_of8[256];
-    __shared__ __align__(8)  uint16_t comp[NUM_STATES * NUM_STATES];
-    __shared__ __align__(16) uint8_t  comp_pf[NUM_STATES * 16];
+    // Derived tables (LexerChainTables, built at compile time from the DFA
+    // tables and copied here as 16-byte vectors): one chain step is
+    // v = comp[(row_of8[byte] << ROW_SHIFT) + (v & 0x1e)] (bytes; row_of8 is a
+    // byte table, so bytes < 128 all fall in different banks); comp_pf is
+    // read as one 16-byte row per thread.
+    __shared__ LexerChainTables tables;
+    auto& row_of8 = tables.row_of8;
+    auto& comp    = tables.comp;
+    auto& comp_pf = tables.comp_pf;
     // Generic path: to_state as loaded (unreferenced on the fast path).
     __shared__ __align__(8) state_t shmem_to_state[256];
 
@@ -833,15 +867,9 @@ void lexerBig(
     if constexpr (!FAST) {
         copy_states_to_shared<256, BLOCK_SIZE>(shmem_to_state, ctx.d_to_state);
     } else {
-        for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_SIZE)
-            row_of8[i] = uint8_t(get_index(ctx.d_to_state[i]) * ((NUM_STATES * sizeof(uint16_t)) >> ROW_SHIFT));
-        for (uint32_t i = threadIdx.x; i < NUM_STATES * NUM_STATES; i += BLOCK_SIZE)
-            comp[i] = pack_chain_state(ctx.d_compose_glb[i]);
-        for (uint32_t i = threadIdx.x; i < NUM_STATES * 16; i += BLOCK_SIZE) {
-            const uint32_t p = i / 16, f = i % 16;
-            comp_pf[i] = f < NUM_STATES
-                ? uint8_t(pack_chain_state(ctx.d_compose_glb[f * NUM_STATES + p])) : 0;
-        }
+        for (uint32_t i = threadIdx.x; i < sizeof(LexerChainTables) / 16; i += BLOCK_SIZE)
+            reinterpret_cast<uint4*>(&tables)[i] =
+                reinterpret_cast<const uint4*>(ctx.d_chain_tables)[i];
     }
     const ShmemCompose compose{shmem_compose};
     auto step = [&](uint32_t v, uint32_t byte) -> uint32_t {
