@@ -1567,3 +1567,27 @@ Changes (the default build's SASS is byte-identical, all kernels):
   S1/S2/S3 (generic path) without verification, reporting the token count
   and whether the final state accepts (locally: 145.3M tokens, accepting).
 - JSON build: 40 registers, 28–52 B spills, 25.2 KB shared memory.
+
+A100 (`f4c870e`), JSON input (500 MB, 145.3M tokens; speed of light 923 μs):
+S1 378 μs, S2 3195 μs, S3 3664 μs (25% of speed of light, 143 GB/s of
+input, 341 GB/s counting 5 B per token): 1.78× the benchmark DFA's generic
+path (dense, 2060 μs). Look-backs (S3 − S2) 469 μs, vs 26–97 μs for the
+benchmark DFA: every compose, per byte and in the look-back chain, is a
+lookup in a 1.35 MB table that lives in L2.
+
+### Step table (endofunction × byte class) for the per-byte step (A100 numbers pending)
+
+The per-byte step only composes with the byte's `to_state` function, and
+JSON has 23 distinct ones (byte classes). `LexerCtxShmem` derives, at run
+time from compose and to_state, `d_byte_class[256]` and
+`d_step[s · C + c] = compose(s, class c)` (823 × 23 × 2 B = 37 KB, L1-sized).
+`lexerBig<..., STEPTBL>` (generic path) steps with
+`__ldg(d_step[index(s) · C + class[byte]])`, the class table in shared
+memory; the block scans and look-backs keep the full compose table.
+
+Checks: existing kernels' SASS unchanged (up to parameter offsets: the
+context struct grew); generic + step table: 40 registers, no spills;
+**verified** on the benchmark DFA (row `Big S3 generic + step table
+(forced)` passes S3 on all three datasets); on JSON it reports the same
+145346550 tokens and an accepting final state as the compose-table path.
+Bench rows: `make bench_json` → `Big S2/S3 step table`.
