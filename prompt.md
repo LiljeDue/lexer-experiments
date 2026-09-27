@@ -1664,7 +1664,7 @@ sectors (compose: 595M sectors / 36.1M requests; step table 586M / 36.1M),
 the L1 data pipe runs at 77–83% of peak; the step table only raised the L1
 hit rate (83% → 89%). More chains in flight cannot raise a throughput limit.
 
-### Step table in shared memory (A100 numbers pending)
+### Step table in shared memory (failed, removed)
 
 `lexerBig<..., STEPTBL, STEPSHM>`: each block copies the step table (JSON:
 823 × 23 u16, 37 KB) into dynamic shared memory and gathers from there
@@ -1676,3 +1676,32 @@ chunks are not possible: the swizzle needs CHUNK % 32 == 0). Verified on the
 benchmark DFA (`Big S3 generic + step shmem (forced)` passes S3 on all three
 datasets); on JSON all three shapes give 145346550 tokens, accepting.
 40 registers, no spills; all other kernels byte-identical to `bbc823a`.
+
+A100 (`f0434b5`), JSON:
+
+| | blocks/SM | S2 | S3 | S3 − S2 |
+|---|---|---|---|---|
+| step table in L1 (kept) | 6 | 3009 μs | **3131 μs** | 122 μs |
+| step table in shared memory 256 × 96 | 2 | 2930 μs (−2.6%) | 3316 μs (+5.9%) | 386 μs |
+| step table in shared memory 256 × 32 | 3 | 3326 μs | 4238 μs | 912 μs |
+| step table in shared memory 128 × 96 | 3 | 3416 μs | 4033 μs | 617 μs |
+
+The gathers got barely cheaper in practice (S2 −2.6% at best): the
+occupancy loss (2–3 blocks/SM instead of 6) removes most latency hiding, and
+each tile copies the 37 KB table from L2. With fewer tiles in flight the
+look-back waits are exposed again (386–912 μs); smaller tiles add copies and
+look-backs. Removed; the L1 step table and the exact S2 stay.
+
+### Conclusion — large DFAs (JSON)
+
+`lexerBig`'s generic path runs alpacc's JSON DFA (823 endofunctions, 1.35 MB
+compose table, tables loaded at run time) at **S3 ≈ 3.1 ms on 500 MB, ~30% of
+speed of light (168 GB/s of input)**, with the endofunction × byte-class step
+table in L1. The look-backs are cheap there (~120 μs). The limit is the
+per-byte table lookups: every step of the per-thread chain is a warp-wide
+gather of random 2-byte entries (~16 L1 sectors per request, L1 data pipe at
+~80%). Neither more independent chains (DUAL: latency is not the limit) nor
+the table in shared memory (occupancy and per-tile copies) moved it. The
+remaining lever is the representation itself — smaller tables per lookup,
+e.g. decomposing the DFA into smaller automata whose tables fit in shared
+memory — which is a lexer-generator question.
