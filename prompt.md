@@ -1731,9 +1731,42 @@ Dataset `data-52428800.inputs`: 110,670,100 bytes, 52,478,799 kept tokens
 read.
 
 One profiled launch (`--clock-control none`, 1.40 GHz): **976 μs** (113 GB/s
-of input). `--benchmark 10` reported 1723 μs with a ±30% CI; the gap to the
-profiled launch is not explained yet. The previous alpacc kernel was reported
-to be about as fast; no numbers were recorded.
+of input).
+
+Old vs new alpacc lexer, per launch under ncu (`gpu__time_duration`,
+`gpc__cycles_elapsed.max`; 5 launches each, same session, spread < 0.5%):
+
+| | cycles | clock | time | at 1.41 GHz |
+|---|---|---|---|---|
+| old (`ae330d4`, alpacc `main`) | 4.60M | 1.11 GHz | 4.15 ms | 3262 μs |
+| new (`8df6d20`, warp-cooperative) | 1.34M | 1.08 GHz | 1.24 ms | 952 μs |
+
+**The new lexer needs 3.43× fewer cycles**; at 1.41 GHz that is 952 μs, 37%
+of this dataset's speed of light (478 MB of traffic at 1356 GB/s = 353 μs).
+
+Measurement lessons from getting there:
+- `--benchmark` timings are not usable here (CIs of ±30–60%, and meaningless
+  under ncu); the earlier "old is about as fast" came from them.
+- The SM clock varied between sessions and even between launches (1.41, 1.08,
+  1.03 GHz; the GPU was otherwise idle, no other processes), probably the
+  250 W power cap: compare cycles, not milliseconds.
+- One comparison ran a stale binary: hendrix's checkout was still at the
+  staged version (`a9f6f6a`), recognisable by its cycle count (2.7M, same as
+  its profile). Check `git log -1` and the cycle count before comparing.
+
+Per-phase stall reasons (share of that phase's samples):
+
+| Phase | Top stalls |
+|---|---|
+| Pass A | long scoreboard 59%, not selected 16%, math 12% |
+| Pass B | long scoreboard 31%, barrier 28%, not selected 13% |
+| Emission | wait 33%, short scoreboard 23%, selected 13% |
+
+Passes A/B wait on the serial chain of step-table loads (15.8 sectors per
+warp request, as on `json_500MiB.in`), plus warps waiting at the barrier for
+the slowest chain; emission waits on dependent shuffle/ALU chains. Occupancy
+(6 blocks/SM, limited by registers and shared memory) and ILP (DUAL, failed
+above) are the usual cures and are used up.
 
 | Phase | Samples | Warp instructions |
 |---|---|---|
@@ -1765,6 +1798,11 @@ A100, per-launch `gpu__time_duration` (ncu, 21 launches each, ±1%):
 |---|---|---|
 | warp-cooperative (`261d773`) | 976 μs (one profiled launch) | — |
 | staged rounds (`a9f6f6a`) | 2490 μs (2.55×) | 1700 μs (1.74×) |
+
+The staged per-launch times were taken at an unrecorded SM clock (later
+sessions showed 1.03–1.41 GHz), so the ratios above are only approximate.
+The clock-independent comparison is the full profiles' cycle counts at the
+same 1.40–1.41 GHz: warp-cooperative 1.37M, staged 2.71M — **1.97× slower**.
 
 ncu, IPT 96 (full profile, 1.92 ms):
 
