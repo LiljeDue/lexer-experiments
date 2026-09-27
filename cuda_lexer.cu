@@ -317,6 +317,7 @@ struct LexerCtxShmem {
                 step[(size_t)s * num_classes + c] = h_compose[compose_index(s, class_endo[c])];
         cudaMalloc(&d_byte_class, 256);
         cudaMemcpy(d_byte_class, byte_class.data(), 256, cudaMemcpyHostToDevice);
+        step.resize((step.size() * sizeof(state_t) + 15) / 16 * 16 / sizeof(state_t));   // copied as uint4
         cudaMalloc(&d_step, step.size() * sizeof(state_t));
         cudaMemcpy(d_step, step.data(), step.size() * sizeof(state_t), cudaMemcpyHostToDevice);
     }
@@ -944,7 +945,7 @@ void lexerVecPipe(
 // outputs to its own region; output is not valid); 3 = full lexer.
 // ---------------------------------------------------------------------------
 template<typename I, I BLOCK_SIZE, I CHUNK, I STEP, bool FORCE_GENERIC = false, bool MAXADD = false,
-         bool STEPTBL = false, bool DUAL = false>
+         bool STEPTBL = false, bool STEPSHM = false>
 __global__ LB_BIG(BLOCK_SIZE)
 void lexerBig(
     LexerCtxShmem ctx,
@@ -972,11 +973,9 @@ void lexerBig(
     // class) instead of compose(s, to_state[byte]); scans and look-backs keep
     // the full compose table.
     static_assert(!STEPTBL || !FAST, "the step table is for the generic path");
-    // DUAL: the generic path runs two interleaved chains per thread (the two
-    // halves of its chunk) in passes A and B, for more independent loads in
-    // flight; the second half starts from compose(prefix, first half).
-    static_assert(!DUAL || !FAST, "DUAL is for the generic path");
-    static_assert(!DUAL || (CHUNK / 16) % 2 == 0, "DUAL splits the chunk's vectors in halves");
+    // STEPSHM: the step table is copied per block into dynamic shared memory
+    // (random gathers: bank conflicts instead of ~16 L1 sectors per request).
+    static_assert(!STEPSHM || STEPTBL, "STEPSHM keeps the step table in shared memory");
     constexpr uint32_t ROW_SHIFT = LEXER_ROW_SHIFT;
     constexpr I VECS       = CHUNK / 16;
     constexpr I WARP_BYTES = WARP * CHUNK;
@@ -1014,6 +1013,7 @@ void lexerBig(
     // (unreferenced otherwise).
     __shared__ __align__(8) state_t shmem_to_state[256];
     __shared__ __align__(16) uint8_t shmem_class[256];
+    extern __shared__ uint4 lexer_dyn_smem[];   // STEPSHM: the step table
 
     if constexpr (COMPOSE_IN_SHMEM)
         copy_states_to_shared<NUM_STATES * NUM_STATES, BLOCK_SIZE>(shmem_compose, ctx.d_compose_glb);
@@ -1022,6 +1022,11 @@ void lexerBig(
             for (uint32_t i = threadIdx.x; i < 256 / 16; i += BLOCK_SIZE)
                 reinterpret_cast<uint4*>(shmem_class)[i] =
                     reinterpret_cast<const uint4*>(ctx.d_byte_class)[i];
+            if constexpr (STEPSHM) {
+                const uint32_t n16 = (NUM_STATES * ctx.num_classes * sizeof(state_t) + 15) / 16;
+                for (uint32_t i = threadIdx.x; i < n16; i += BLOCK_SIZE)
+                    lexer_dyn_smem[i] = reinterpret_cast<const uint4*>(ctx.d_step)[i];
+            }
         } else {
             copy_states_to_shared<256, BLOCK_SIZE>(shmem_to_state, ctx.d_to_state);
         }
@@ -1033,7 +1038,9 @@ void lexerBig(
     const ShmemCompose compose{COMPOSE_IN_SHMEM ? shmem_compose : ctx.d_compose_glb};
     // Generic path: one byte step from state s.
     auto gstep = [&](state_t s, uint32_t byte) -> state_t {
-        if constexpr (STEPTBL)
+        if constexpr (STEPSHM)
+            return reinterpret_cast<const state_t*>(lexer_dyn_smem)[get_index(s) * ctx.num_classes + shmem_class[byte]];
+        else if constexpr (STEPTBL)
             return __ldg(&ctx.d_step[get_index(s) * ctx.num_classes + shmem_class[byte]]);
         else
             return compose(s, shmem_to_state[byte]);
@@ -1097,7 +1104,6 @@ void lexerBig(
         uint4* my = reinterpret_cast<uint4*>(my_bytes);
         uint32_t va = pack_chain_state(state_t(IDENTITY));
         state_t  ga = IDENTITY;
-        state_t  ga_half = IDENTITY;   // DUAL: aggregate of the first half
         if constexpr (FAST) {
             #pragma unroll
             for (I k = 0; k < VECS; k++) {
@@ -1114,26 +1120,6 @@ void lexerBig(
                 }
                 my[k ^ sw] = make_uint4(tw[0], tw[1], tw[2], tw[3]);
             }
-        } else if constexpr (DUAL) {
-            // Two chains, one per half of the chunk, interleaved.
-            constexpr I HV = VECS / 2;   // vectors per half
-            state_t gb = IDENTITY;
-            #pragma unroll
-            for (I k = 0; k < HV; k++) {
-                const uint4 v0 = my[k ^ sw];
-                const uint4 v1 = my[(k + HV) ^ sw];
-                #pragma unroll
-                for (I b = 0; b < 16; b++) {
-                    const uint32_t w0 = b < 4 ? v0.x : b < 8 ? v0.y : b < 12 ? v0.z : v0.w;
-                    const uint32_t w1 = b < 4 ? v1.x : b < 8 ? v1.y : b < 12 ? v1.z : v1.w;
-                    if (full || 16 * k + b < valid)
-                        ga = gstep(ga, (w0 >> (8 * (b % 4))) & 0xffu);
-                    if (full || 16 * (k + HV) + b < valid)
-                        gb = gstep(gb, (w1 >> (8 * (b % 4))) & 0xffu);
-                }
-            }
-            ga_half = ga;
-            ga = compose(ga, gb);
         } else {
             #pragma unroll
             for (I k = 0; k < VECS; k++) {
@@ -1172,48 +1158,7 @@ void lexerBig(
         uint32_t m0, m1, m2;
         uint32_t n0 = 0, n1 = 0, n2 = 0;   // MAXADD: bit j = token of state j != IGNORE_TOKEN
         state_t  last_g = prefix;   // generic: state after my last valid byte
-        if constexpr (!FAST && DUAL) {
-            // Two chains: the first half from prefix, the second from
-            // compose(prefix, first half's aggregate), interleaved.
-            m0 = m1 = m2 = 0;
-            constexpr I HV = VECS / 2;   // vectors per half
-            constexpr I H  = 16 * HV;    // bytes per half
-            auto set_m = [&](I j) {
-                if (j < 32)      m0 |= 1u << j;
-                else if (j < 64) m1 |= 1u << (j - 32);
-                else             m2 |= 1u << (j - 64);
-            };
-            state_t st0 = prefix;
-            state_t st1 = compose(prefix, ga_half);
-            #pragma unroll
-            for (I k = 0; k < HV; k++) {
-                const uint4 v0 = my[k ^ sw];
-                const uint4 v1 = my[(k + HV) ^ sw];
-                uint32_t t0[4] = {0, 0, 0, 0}, t1[4] = {0, 0, 0, 0};
-                #pragma unroll
-                for (I b = 0; b < 16; b++) {
-                    const I i0 = 16 * k + b, i1 = H + 16 * k + b;
-                    const uint32_t w0 = b < 4 ? v0.x : b < 8 ? v0.y : b < 12 ? v0.z : v0.w;
-                    const uint32_t w1 = b < 4 ? v1.x : b < 8 ? v1.y : b < 12 ? v1.z : v1.w;
-                    if (full || i0 < valid) {
-                        st0 = gstep(st0, (w0 >> (8 * (b % 4))) & 0xffu);
-                        // element i-1 produces if the state after it does
-                        if (i0 > 0 && is_produce(st0))
-                            set_m(i0 - 1);
-                        t0[b / 4] |= uint32_t(uint8_t(get_token(st0))) << (8 * (b % 4));
-                    }
-                    if (full || i1 < valid) {
-                        st1 = gstep(st1, (w1 >> (8 * (b % 4))) & 0xffu);
-                        if (is_produce(st1))
-                            set_m(i1 - 1);
-                        t1[b / 4] |= uint32_t(uint8_t(get_token(st1))) << (8 * (b % 4));
-                    }
-                }
-                my[k ^ sw]        = make_uint4(t0[0], t0[1], t0[2], t0[3]);
-                my[(k + HV) ^ sw] = make_uint4(t1[0], t1[1], t1[2], t1[3]);
-            }
-            last_g = valid > H ? st1 : st0;
-        } else if constexpr (!FAST) {
+        if constexpr (!FAST) {
             m0 = m1 = m2 = 0;
             state_t st = prefix;
             #pragma unroll
@@ -1710,13 +1655,15 @@ void testLexerVecPipe(uint8_t* input,
 // Requests the maximum shared memory carveout for lexerBig (~26 KB per block;
 // 6 blocks/SM exceed the default configuration) and returns blocks/SM.
 template<typename I, I BS, I CHUNK, I STEP, bool FORCE_GENERIC = false, bool MAXADD = false,
-         bool STEPTBL = false, bool DUAL = false>
-static int lexerBigBlocksPerSM() {
-    auto kernel = lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC, MAXADD, STEPTBL, DUAL>;
+         bool STEPTBL = false, bool STEPSHM = false>
+static int lexerBigBlocksPerSM(size_t dyn_smem = 0) {
+    auto kernel = lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC, MAXADD, STEPTBL, STEPSHM>;
     gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                    (int)cudaSharedmemCarveoutMaxShared));
+    if (dyn_smem)   // STEPSHM: allow more than 48 KB per block
+        gpuAssert(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn_smem));
     int bps = 0;
-    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, BS, 0));
+    gpuAssert(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, kernel, BS, dyn_smem));
     return bps;
 }
 
@@ -1757,7 +1704,7 @@ static size_t maxadd_reference(const uint32_t* ends, const token_t* toks, size_t
 // against the expected output (MAXADD: against maxadd_reference). GB/s always
 // counts the full lexer's traffic.
 template<uint32_t BS, uint32_t CHUNK, uint32_t STEP, bool FORCE_GENERIC = false, bool MAXADD = false,
-         bool STEPTBL = false, bool DUAL = false>
+         bool STEPTBL = false, bool STEPSHM = false>
 void testLexerBig(uint8_t* input,
                   size_t input_size,
                   uint32_t* expected_indices,
@@ -1814,7 +1761,9 @@ void testLexerBig(uint8_t* input,
     }
 
     LexerCtxShmem ctx = LexerCtxShmem();
-    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, FORCE_GENERIC, MAXADD, STEPTBL, DUAL>());
+    // STEPSHM: the step table in dynamic shared memory
+    const size_t dyn_smem = STEPSHM ? (NUM_STATES * ctx.num_classes * sizeof(state_t) + 15) / 16 * 16 : 0;
+    printf("[%d/SM] ", lexerBigBlocksPerSM<I, BS, CHUNK, STEP, FORCE_GENERIC, MAXADD, STEPTBL, STEPSHM>(dyn_smem));
     fflush(stdout);
 
     auto reset = [&]() {
@@ -1823,7 +1772,7 @@ void testLexerBig(uint8_t* input,
         initScanTileState(d_index_states, (int)NLB);
     };
     auto launch = [&]() {
-        lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC, MAXADD, STEPTBL, DUAL><<<NLB, BS>>>(
+        lexerBig<I, BS, CHUNK, STEP, FORCE_GENERIC, MAXADD, STEPTBL, STEPSHM><<<NLB, BS, dyn_smem>>>(
             ctx, d_in, d_index_out, d_token_out, d_len_out,
             d_state_states, d_index_states, size, NLB, d_new_size, d_is_valid, d_tile_in);
     };
@@ -2313,11 +2262,20 @@ int main(int32_t argc, char *argv[]) {
     testLexerBig<256, 96, 2, false, false, true>(input, input_size, nullptr, nullptr, 0);
     printf(PAD, "Big S3 step table:"); fflush(stdout);
     testLexerBig<256, 96, 3, false, false, true>(input, input_size, nullptr, nullptr, 0);
-    // Two interleaved chains per thread (DUAL) with the step table.
-    printf(PAD, "Big S2 step table + dual:"); fflush(stdout);
+    // Step table in shared memory (STEPSHM), in three tile shapes (37 KB per
+    // block limits the blocks per SM; smaller tiles reload the table more often).
+    printf(PAD, "Big S2 step shmem 256x96:"); fflush(stdout);
     testLexerBig<256, 96, 2, false, false, true, true>(input, input_size, nullptr, nullptr, 0);
-    printf(PAD, "Big S3 step table + dual:"); fflush(stdout);
+    printf(PAD, "Big S3 step shmem 256x96:"); fflush(stdout);
     testLexerBig<256, 96, 3, false, false, true, true>(input, input_size, nullptr, nullptr, 0);
+    printf(PAD, "Big S2 step shmem 256x32:"); fflush(stdout);
+    testLexerBig<256, 32, 2, false, false, true, true>(input, input_size, nullptr, nullptr, 0);
+    printf(PAD, "Big S3 step shmem 256x32:"); fflush(stdout);
+    testLexerBig<256, 32, 3, false, false, true, true>(input, input_size, nullptr, nullptr, 0);
+    printf(PAD, "Big S2 step shmem 128x96:"); fflush(stdout);
+    testLexerBig<128, 96, 2, false, false, true, true>(input, input_size, nullptr, nullptr, 0);
+    printf(PAD, "Big S3 step shmem 128x96:"); fflush(stdout);
+    testLexerBig<128, 96, 3, false, false, true, true>(input, input_size, nullptr, nullptr, 0);
     free(input);
     gpuAssert(cudaPeekAtLastError());
     return 0;
@@ -2358,7 +2316,7 @@ int main(int32_t argc, char *argv[]) {
     testLexerBig<256, 96, 3, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     printf(PAD, "Big S3 generic + step table (forced):"); fflush(stdout);
     testLexerBig<256, 96, 3, true, false, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
-    printf(PAD, "Big S3 generic + step + dual (forced):"); fflush(stdout);
+    printf(PAD, "Big S3 generic + step shmem (forced):"); fflush(stdout);
     testLexerBig<256, 96, 3, true, false, true, true>(input, input_size, expected_indices, expected_tokens, expected_indices_size);
     // alpacc's output semantics (terminal, start, length of tokens != IGNORE_TOKEN)
     // with one (max, add) look-back round.

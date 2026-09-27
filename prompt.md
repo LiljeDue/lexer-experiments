@@ -1618,7 +1618,7 @@ target builds for sm_80 only (`JSON_ARCH`). Local build: 22 s → 10.9 s;
 same token count and acceptance as before; default build unchanged.
 `make profile_json` profiles all JSON `lexerBig` launches at the real clock.
 
-### JSON profile: S2 was not comparable; two chains per thread (A100 numbers pending)
+### JSON profile: S2 was not comparable; two chains per thread (failed, removed)
 
 Profile of `make profile_json` (real clock, `1024a99`), step-table path: S2
 issue 46%, top stall long scoreboard (14.6 per issue; 31% of the samples on
@@ -1646,3 +1646,33 @@ Changes:
   `Big S3 generic + step + dual (forced)` passes S3 on all three datasets);
   on JSON the same token count and acceptance.
 - JSON bench rows `Big S2/S3 step table + dual`.
+
+A100 (`bbc823a`), JSON, with the exact S2:
+
+| | S2 | S3 | S3 − S2 (look-backs) |
+|---|---|---|---|
+| compose table | 3627 μs | 3632 μs | ~5 μs |
+| step table | 3006 μs | 3114 μs | ~108 μs |
+| step table + DUAL | 3097 μs | 3101 μs | ~4 μs |
+
+The ~520 μs look-back cost measured before was the S2 artifact: on JSON the
+look-backs are cheap and the time is the per-byte work and the emission.
+**DUAL gained nothing** (S3 −0.4%, S2 +3%) and was removed. Cause (profile,
+`1024a99`): the per-byte lookups are bound by L1 throughput, not latency —
+each warp-wide lookup is a gather of 32 random 2-byte entries touching ~16
+sectors (compose: 595M sectors / 36.1M requests; step table 586M / 36.1M),
+the L1 data pipe runs at 77–83% of peak; the step table only raised the L1
+hit rate (83% → 89%). More chains in flight cannot raise a throughput limit.
+
+### Step table in shared memory (A100 numbers pending)
+
+`lexerBig<..., STEPTBL, STEPSHM>`: each block copies the step table (JSON:
+823 × 23 u16, 37 KB) into dynamic shared memory and gathers from there
+(bank conflicts, ~3–4 passes for 32 random reads, instead of ~16 L1
+sectors). Costs: ~62 KB per block at 256 × 96 (2 blocks/SM instead of 6),
+and a 37 KB copy from L2 per tile (~0.8 GB per run at 24 KB tiles; 3× at
+8 KB tiles). Rows `Big S2/S3 step shmem 256x96 | 256x32 | 128x96` (48-byte
+chunks are not possible: the swizzle needs CHUNK % 32 == 0). Verified on the
+benchmark DFA (`Big S3 generic + step shmem (forced)` passes S3 on all three
+datasets); on JSON all three shapes give 145346550 tokens, accepting.
+40 registers, no spills; all other kernels byte-identical to `bbc823a`.
