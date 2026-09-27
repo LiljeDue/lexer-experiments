@@ -1575,7 +1575,7 @@ path (dense, 2060 μs). Look-backs (S3 − S2) 469 μs, vs 26–97 μs for the
 benchmark DFA: every compose, per byte and in the look-back chain, is a
 lookup in a 1.35 MB table that lives in L2.
 
-### Step table (endofunction × byte class) for the per-byte step (A100 numbers pending)
+### Step table (endofunction × byte class) for the per-byte step
 
 The per-byte step only composes with the byte's `to_state` function, and
 JSON has 23 distinct ones (byte classes). `LexerCtxShmem` derives, at run
@@ -1591,3 +1591,29 @@ context struct grew); generic + step table: 40 registers, no spills;
 (forced)` passes S3 on all three datasets); on JSON it reports the same
 145346550 tokens and an accepting final state as the compose-table path.
 Bench rows: `make bench_json` → `Big S2/S3 step table`.
+
+A100 (`dcb88ad`), JSON:
+
+| | compose table (1.35 MB) | step table (37 KB) | change |
+|---|---|---|---|
+| S2 | 3195 μs | 2602 μs | −18.6% |
+| S3 | 3668 μs | 3125 μs | −14.8% |
+| S3 − S2 (look-backs) | 473 μs | 523 μs | |
+| % of speed of light (923 μs) | 25.2% | 29.5% | |
+| input rate | 143 GB/s | 168 GB/s | |
+
+The per-byte steps now hit an L1-sized table. The look-backs and block scans
+(~520 μs, vs 26–97 μs for the benchmark DFA) still compose arbitrary pairs
+through the 1.35 MB table in L2 along their dependent chains.
+
+### JSON build time
+
+On the cluster's login node the JSON build (tables compiled from a 4.7 MB
+header, for sm_75 and sm_80) took minutes. The tables now live in
+`dfa/json.bin` (1.36 MB: to_state, compose, accept; written by
+`dfa/pack_tables.c` via `dfa/extract_alpacc.sh`, verified entry by entry
+against the old header) and are loaded at start by `load_dfa_tables()`;
+`dfa/json.h` only holds the constants and table declarations. The JSON
+target builds for sm_80 only (`JSON_ARCH`). Local build: 22 s → 10.9 s;
+same token count and acceptance as before; default build unchanged.
+`make profile_json` profiles all JSON `lexerBig` launches at the real clock.

@@ -7,6 +7,8 @@
 #include "common/util.cu.h"
 #include "common/data.h"
 #include <math.h>
+#include <cstdio>
+#include <cstring>
 #define PAD "%-38s "
 // Apply minnctapersm=6 only on sm_80+ (A100). sm_75 has fewer registers
 // and the hint would be out of range, producing a ptxas warning.
@@ -75,6 +77,33 @@ constexpr state_t h_compose[NUM_STATES * NUM_STATES] =
      75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75, 75};
 constexpr token_t IGNORE_TOKEN = 0;          // whitespace
 constexpr bool COMPOSE_LATER_MAJOR = true;   // compose(a, b) = h_compose[b * N + a]
+#endif
+
+#ifdef LEXER_DFA_TABLES_FROM_FILE
+// Loads h_to_state, h_compose and h_accept from a table file written by
+// dfa/pack_tables.c (see dfa/extract_alpacc.sh): the tables are run-time data,
+// not compiled into the program.
+static void load_dfa_tables(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { perror(path); exit(1); }
+    char magic[8]; uint32_t hdr[2];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "LXDFA1", 6) != 0 || fread(hdr, 4, 2, f) != 2
+        || hdr[0] != NUM_STATES || hdr[1] != NUM_TRANS) {
+        fprintf(stderr, "%s: not a table file for this DFA (%u states, %u transitions)\n",
+                path, NUM_STATES, NUM_TRANS);
+        exit(1);
+    }
+    std::vector<uint8_t> accept(NUM_STATES);
+    const size_t nc = (size_t)NUM_STATES * NUM_STATES;
+    if (fread(h_to_state, sizeof(state_t), NUM_TRANS, f) != NUM_TRANS
+        || fread(h_compose, sizeof(state_t), nc, f) != nc
+        || fread(accept.data(), 1, NUM_STATES, f) != NUM_STATES) {
+        fprintf(stderr, "%s: truncated\n", path);
+        exit(1);
+    }
+    fclose(f);
+    for (uint32_t i = 0; i < NUM_STATES; i++) h_accept[i] = accept[i] != 0;
+}
 #endif
 
 // compose(a, b) (a then b) as an index into the compose table, in the DFA's
@@ -2172,6 +2201,7 @@ int main(int32_t argc, char *argv[]) {
     assert(argc >= 2);
     size_t input_size;
     uint8_t* input = read_u8_array(argv[1], &input_size);
+    load_dfa_tables(argc >= 3 ? argv[2] : "dfa/json.bin");
     gpuAssert(cudaMemcpyToSymbol(d_accept, h_accept, sizeof(h_accept)));
 
     printf("%s (JSON DFA: %u endofunctions, compose table %zu KB; not verified):\n",

@@ -12,7 +12,7 @@ default: bench
 
 P1_BENCH_PROGRAM=p1_bench
 
-.PHONY: clean bench test devinfo profile_p1 bench_p1 profile bench_json
+.PHONY: clean bench test devinfo profile_p1 bench_p1 profile bench_json profile_json
 
 $(DATA_PATH)/tokens_dense_500MiB.in:
 	(cd $(DATA_PATH) && make)
@@ -83,13 +83,28 @@ $(DATA_PATH)/json_gen: $(DATA_PATH)/json_gen.c
 $(JSON_DATA): $(DATA_PATH)/json_gen
 	$(DATA_PATH)/json_gen 524288000 $@
 
+# The JSON tables are loaded at run time from dfa/json.bin (not compiled in);
+# built for the A100 only (JSON_ARCH) to keep the build short.
+JSON_ARCH?=-gencode arch=compute_80,code=sm_80
 $(CUDA_PROGRAM)_json: cuda_lexer.cu dfa/json.h $(COMMON_PATH)/sps.cu.h $(COMMON_PATH)/util.cu.h $(COMMON_PATH)/data.h
-	$(COMPILER) $(FLAGS) -DLEXER_DFA_JSON -o $@ $<
+	$(COMPILER) -O3 --std=c++17 -diag-suppress 550 $(JSON_ARCH) -DLEXER_DFA_JSON -o $@ $<
 
-bench_json: $(CUDA_PROGRAM)_json $(JSON_DATA)
+bench_json: $(CUDA_PROGRAM)_json $(JSON_DATA) dfa/json.bin
 	@echo -e "$(GREEN)=== CUDA LEXER (JSON DFA) ===$(DEFAULT)"
-	@./$(CUDA_PROGRAM)_json $(JSON_DATA)
+	@./$(CUDA_PROGRAM)_json $(JSON_DATA) dfa/json.bin
 	@echo -e "$(GREEN)============$(DEFAULT)"
+
+# Profile the JSON lexer (all lexerBig launches, real clock).
+profile_json: $(JSON_DATA) dfa/json.bin
+	$(COMPILER) -O3 --std=c++17 -diag-suppress 550 $(JSON_ARCH) -DLEXER_DFA_JSON -DPROFILE -lineinfo -o $(CUDA_PROGRAM)_json_profile cuda_lexer.cu
+	-ncu --set full -f \
+	    --clock-control none \
+	    --import-source 1 \
+	    --source-folders . \
+	    --target-processes all \
+	    --export profile_lexer_json \
+	    ./$(CUDA_PROGRAM)_json_profile $(JSON_DATA) dfa/json.bin 2>&1
+	-ncu --import profile_lexer_json.ncu-rep > profile_lexer_json.txt 2>&1
 
 bench_p1: $(P1_BENCH_PROGRAM) $(DATA_PATH)/tokens_dense_500MiB.in
 	@echo -e "$(GREEN)=== P1 BENCH ===$(DEFAULT)"
@@ -179,6 +194,6 @@ devinfo:
 	rm -f devinfo
 
 clean:
-	rm -rf $(CUDA_PROGRAM) $(CUDA_PROGRAM)_json $(CUDA_DEBUG_PROGRAM) $(P1_BENCH_PROGRAM) $(P1_BENCH_PROGRAM)_profile $(FUTHARK_PROGRAM) *.out
+	rm -rf $(CUDA_PROGRAM) $(CUDA_PROGRAM)_json $(CUDA_PROGRAM)_json_profile $(CUDA_DEBUG_PROGRAM) $(P1_BENCH_PROGRAM) $(P1_BENCH_PROGRAM)_profile $(FUTHARK_PROGRAM) *.out
 	rm -f $(DATA_PATH)/json_gen $(JSON_DATA)
 	rm -f $(DATA_PATH)/tokens_*_1GiB.in
