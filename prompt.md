@@ -1705,3 +1705,95 @@ the table in shared memory (occupancy and per-tile copies) moved it. The
 remaining lever is the representation itself — smaller tables per lookup,
 e.g. decomposing the DFA into smaller automata whose tables fit in shared
 memory — which is a lexer-generator question.
+
+## lexerBig in alpacc (CoderDue/alpacc, branch `lexer-big`)
+
+`backends/cuda/lexer.cu` was replaced by `lexerBig`'s generic path (`18e7505`):
+256 × 96-byte tiles, step table (endofunction × byte class) derived in the
+`LexerCtx` constructor, static `blockIdx.x` with one-word relaxed look-back
+descriptors, alpacc's output (terminal, start, length of tokens whose terminal
+is not `IGNORE_TOKEN`), warp-cooperative emission (owner binary search +
+`select_bit`, start from the owner's previous token end). `cli.cu` and the
+`LexerCtx` / `lexer<I, J, BS, IPT>` API are unchanged. Limits: IPT ∈ {32, 64,
+96}, terminals fit in 8 bits, chunks < 2^31 bytes. `tests/testcuda.sh` still
+sweeps IPT {2, 4, 8} (all skipped) and needs updating. `make -C
+benchmarks/json profile-lexer-cuda` (`261d773`) writes a full ncu profile.
+
+Local tests pass: JSON long input (default and 5M tokens, `--index32`; lexer,
+parser, combined), 10 random grammars × BS {128, 256} × IPT {32, 64, 96} +
+server mode, 3 random grammars with 200 KB inputs.
+
+### A100 profile, alpacc JSON benchmark (`261d773`)
+
+Dataset `data-52428800.inputs`: 110,670,100 bytes, 52,478,799 kept tokens
+(0.474 per byte — denser than `json_500MiB.in`'s 0.28), 4504 tiles. Output is
+7 bytes per token (terminal 1, start 4, length 2): 367 MB written vs 111 MB
+read.
+
+One profiled launch (`--clock-control none`, 1.40 GHz): **976 μs** (113 GB/s
+of input). `--benchmark 10` reported 1723 μs with a ±30% CI; the gap to the
+profiled launch is not explained yet. The previous alpacc kernel was reported
+to be about as fast; no numbers were recorded.
+
+| Phase | Samples | Warp instructions |
+|---|---|---|
+| Emission | 34% | 68% (149.5 per 32 tokens) |
+| Pass A | 28% | 9% |
+| Pass B | 26% | 17% |
+| Both scans + look-backs | 6% | 5% |
+
+6 blocks/SM (driver picks the large carveout by itself), 70% warps active;
+DRAM 31%, L1 63%, ALU 62%; top stall long scoreboard. The non-emission part
+runs at 5.81 ps/byte, the same rate as `lexerBig` on `json_500MiB.in`
+(5.91 ps/byte): the difference to the earlier JSON numbers is the token
+density and the third output, not the byte passes.
+
+### Staged emission in block rounds (failed, reverted)
+
+Tried in `a9f6f6a`, reverted (revert of `a9f6f6a`, back to `261d773`'s
+kernel). Each thread walked its own kept tokens (`__ffs` on its mask, start
+from its previous token end) and staged (end, start) as tile-local u16
+positions in a 7 KB shared buffer, in rounds of 1792 tokens (contiguous
+output slots); the block then wrote each round out coalesced, reading
+terminals from the tile. Launch-bound block count derived from the shared
+memory footprint (IPT 96: 5 blocks/SM, 48 registers; IPT 64: 6 blocks/SM,
+40 registers).
+
+A100, per-launch `gpu__time_duration` (ncu, 21 launches each, ±1%):
+
+| | IPT 96 | IPT 64 |
+|---|---|---|
+| warp-cooperative (`261d773`) | 976 μs (one profiled launch) | — |
+| staged rounds (`a9f6f6a`) | 2490 μs (2.55×) | 1700 μs (1.74×) |
+
+ncu, IPT 96 (full profile, 1.92 ms):
+
+| | warp-cooperative | staged |
+|---|---|---|
+| blocks/SM | 6 | 5 |
+| warps active | 70.0% | 57.8% |
+| issue active | 61.5% | 38.4% |
+| warp instructions | 353M | 402M |
+| top stall (cycles per issue) | long scoreboard 5.08 | **barrier 14.45** |
+
+Causes:
+1. *Rounds serialize the walk.* A thread's tokens are contiguous in output
+   order (~46 per thread here), so a round of 1792 contiguous slots covers
+   only ~39 of 256 threads; they walk their tokens serially while the rest of
+   the block waits at the round barrier (7.2 rounds per tile). 54.1% of all
+   samples sit on the instruction after that barrier.
+2. *More instructions, not fewer.* The walk alone is 228M warp instructions
+   (56.7%), more than the whole warp-cooperative emission (248M): in each
+   round most lanes of the active warps are idle, and a warp runs as many
+   iterations as its busiest lane.
+3. *Occupancy.* The 7 KB buffer drops IPT 96 to 5 blocks/SM (warps active
+   70% → 58%). IPT 64 keeps 6 blocks/SM and loses less, but is still 1.74×
+   slower.
+
+This repeats the failure of the earlier per-warp staged emission ("Chain
+tables (kept) and per-lane staged emission (failed)" above): causes 2 and 3
+were already measured there, and the block-level rounds added cause 1. I
+should have checked that section before proposing it. Any staged scheme
+needs every thread active in every round (e.g. each thread stages its next
+few tokens per round) and then loses the contiguous output range that makes
+the copy-out coalesced; not pursued.
