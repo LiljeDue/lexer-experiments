@@ -1617,3 +1617,32 @@ against the old header) and are loaded at start by `load_dfa_tables()`;
 target builds for sm_80 only (`JSON_ARCH`). Local build: 22 s → 10.9 s;
 same token count and acceptance as before; default build unchanged.
 `make profile_json` profiles all JSON `lexerBig` launches at the real clock.
+
+### JSON profile: S2 was not comparable; two chains per thread (A100 numbers pending)
+
+Profile of `make profile_json` (real clock, `1024a99`), step-table path: S2
+issue 46%, top stall long scoreboard (14.6 per issue; 31% of the samples on
+`get_index`, the first use of each loaded step result): passes A/B are bound
+by the latency of the serial per-byte chain (L1 hit rate 87–89%). S3 had 210M
+more warp instructions than S2 and twice its global stores (9.33M vs 4.47M
+requests): **S2 emitted only 70.2M of 145.3M tokens.** Cause: S2 starts every
+tile from IDENTITY; a JSON tile that starts inside a string or number reads
+that fragment as invalid (e.g. `bc"` outside a string), falls into the dead
+state and stays there. The benchmark DFA has no dead state, so its S2 was
+fine. S3 is correct: a sequential host lexer with the same tables
+(`seqcount`) gives exactly 145346550 tokens, accepting. So the JSON
+"look-back cost" S3 − S2 (≈ 520 μs) was overstated by about half the emission.
+
+Changes:
+- **Exact S2:** `host_tile_states()` computes each tile's true incoming
+  state sequentially on the host; S2's tile-local state scan starts from it
+  (`tile_in`). S2 now does S3's work minus the look-backs for any DFA (JSON:
+  S2 writes 145346550 tokens). S1/S3 SASS unchanged (up to parameter offsets).
+- **Two chains per thread (`DUAL`, generic path):** each chunk's two 48-byte
+  halves run interleaved chains in pass A (aggregate = compose(half 0,
+  half 1)) and pass B (the second half starts from compose(prefix, half 0's
+  aggregate)): twice the independent loads in flight for the latency-bound
+  chain. 40 registers, no spills. **Verified** on the benchmark DFA (row
+  `Big S3 generic + step + dual (forced)` passes S3 on all three datasets);
+  on JSON the same token count and acceptance.
+- JSON bench rows `Big S2/S3 step table + dual`.
